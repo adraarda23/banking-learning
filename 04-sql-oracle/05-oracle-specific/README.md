@@ -1,12 +1,20 @@
 # Topic 4.5 — Oracle-Specific Features
 
+```admonish info title="Bu bölümde"
+- Sequence, IDENTITY ve `SYS_GUID()` ile Oracle ID üretimi — `CACHE`'in performans etkisi ve `NOCYCLE`'ın banking zorunluluğu
+- Partitioning üç stratejisi (RANGE / LIST / HASH) + `INTERVAL` otomasyonu, partition pruning ve aylık archive-drop akışı
+- Materialized view ile pre-computed reporting: `FAST` vs `COMPLETE`, `ON COMMIT` vs `ON DEMAND` refresh — bilinçli seçim
+- Oracle MVCC'nin undo segment mantığı, `AS OF TIMESTAMP` time travel ve klasik ORA-01555 "snapshot too old" incident'i
+- Tablespace, redo/archivelog, ROWID/ROWNUM tuzakları ve production banking anti-pattern'leri
+```
+
 ## Hedef
 
 Oracle DB'nin **kendine özgü özelliklerini** banking-grade seviyede öğrenmek: sequences, partitioning (range/list/hash), materialized views, MVCC ve undo segments, ORA-01555 hatası, tablespaces, archivelog mode. Production banking Oracle ortamında DBA ile aynı dili konuşabilmek.
 
 ## Süre
 
-Okuma: 2 saat • Mini task: 2 saat • Test: 45 dk • Toplam: ~4.5 saat
+Okuma: 2 saat • Kendini Sına: 45 dk • Pratik (opsiyonel): 2-3 saat • Toplam: ~3 saat (+ pratik)
 
 ## Önbilgi
 
@@ -19,6 +27,8 @@ Okuma: 2 saat • Mini task: 2 saat • Test: 45 dk • Toplam: ~4.5 saat
 ## Kavramlar
 
 ### 1. Sequences — Oracle ID üretimi
+
+`transactions` tablosuna saniyede binlerce satır giriyorsun; her birine çakışmayan bir ID lazım. Oracle'da bunu üreten yapı **sequence**'tir — thread-safe, gap'e izin veren bir sayaç.
 
 ```sql
 CREATE SEQUENCE seq_account_id
@@ -36,13 +46,13 @@ SELECT seq_account_id.NEXTVAL FROM dual;   -- artırır
 SELECT seq_account_id.CURRVAL FROM dual;   -- current (aynı session'da NEXTVAL sonrası)
 ```
 
-**`CACHE 50`:** Oracle 50 değeri memory'de tutar, her INSERT için disk roundtrip yok. **Production'da minimum 20-50.**
+Üç parametre production'da fark yaratır. **`CACHE 50`** 50 değeri memory'de tutar, her INSERT için disk roundtrip'i keser — banking'de minimum 20-50. **`NOORDER`**, RAC (Real Application Clusters) node'ları arası sıralama garantisi gerekmiyorsa default `ORDER`'dan hızlıdır.
 
-**`NOORDER`:** RAC (Real Application Clusters) ortamında node'lar arası sequence sıralama garantisi gerekmiyorsa. Default `ORDER` daha yavaş.
-
-**`NOCYCLE`:** Banking için zorunlu. Cycle yaparsan ID collision olur.
+<mark>Banking için NOCYCLE zorunludur — cycle yapan bir sequence er ya da geç ID collision üretir.</mark>
 
 #### Oracle 12c+: IDENTITY column
+
+Sequence'i elle yönetmek yerine kolonu doğrudan otomatik doldurabilirsin — PostgreSQL `SERIAL` benzeri:
 
 ```sql
 CREATE TABLE accounts(
@@ -52,31 +62,52 @@ CREATE TABLE accounts(
 );
 ```
 
-Sequence'i implicit yönetir. PostgreSQL `SERIAL` benzeri.
+Arkada yine bir sequence vardır ama Oracle onu implicit yönetir.
 
-#### `gen_random_uuid()` alternatif
+#### `SYS_GUID()` — distributed alternatif
 
-UUID daha iyi distributed scenarios için. Oracle 12c+:
+Sıralı ID yerine global benzersizlik istiyorsan (multi-region, offline üretim) UUID daha iyidir:
 
 ```sql
 SELECT SYS_GUID() FROM dual;   -- 16-byte RAW UUID
 ```
 
-PostgreSQL ile karşılaştırma — PostgreSQL `gen_random_uuid()` extension.
+PostgreSQL karşılığı `gen_random_uuid()` extension'ıdır.
 
 ### 2. Partitioning — büyük tablolar için
 
-Partitioning **bir mantıksal tabloyu fiziksel olarak birden fazla parçaya** böler. Her partition kendi I/O, kendi index'i olabilir.
+Partitioning **bir mantıksal tabloyu fiziksel olarak birden fazla parçaya** böler; her partition kendi I/O ve index'ine sahip olabilir. <mark>100M+ satırlık bir transactions tablosu partition'sız pratikte yönetilemez.</mark>
 
-**Faydalar:**
-- Partition pruning: Sorgu sadece ilgili partition'ları okur
-- Backup/archive: Eski partition'ları drop edebilir (saniyeler)
-- Maintenance: Partition bazlı rebuild, gather stats
-- Parallel processing: Partition başına paralel worker
+Faydası dört başlıkta toplanır: partition pruning (sorgu sadece ilgili partition'ları okur), archive (eski partition'ı saniyeler içinde drop), maintenance (partition bazlı rebuild/stats), parallel processing (partition başına worker).
 
-**Banking örneği:** `transactions` tablosu — 10 yıl boyunca her gün yeni veri, milyarlarca satır. Partition'lasız yönetilemez.
+Üç temel strateji ile bir tabloyu farklı eksenlerde bölebilirsin:
+
+```mermaid
+flowchart LR
+    T["transactions tablosu"]
+    subgraph RANGE["RANGE tarih"]
+        R1["p_2024_01"]
+        R2["p_2024_02"]
+        R3["p_2024_03"]
+    end
+    subgraph LIST["LIST currency"]
+        L1["p_try"]
+        L2["p_usd"]
+        L3["p_eur"]
+    end
+    subgraph HASH["HASH account_id"]
+        H1["bucket 0"]
+        H2["bucket 1"]
+        H3["bucket 15"]
+    end
+    T --> RANGE
+    T --> LIST
+    T --> HASH
+```
 
 #### RANGE partitioning — tarih için
+
+Zaman serisi verisinin doğal bölümü tarihtir; her ay ayrı bir partition olur:
 
 ```sql
 CREATE TABLE transactions(
@@ -95,14 +126,14 @@ PARTITION BY RANGE (occurred_at) (
 );
 ```
 
-Sorgu:
+Kazanç sorguda görünür: bir aylık aralık istediğinde Oracle sadece o partition'ı tarar (partition pruning).
 
 ```sql
 SELECT * FROM transactions WHERE occurred_at BETWEEN '2024-02-01' AND '2024-02-28';
 -- Oracle SADECE p_2024_02'yi okur (partition pruning)
 ```
 
-**Interval partitioning** (Oracle 11g+) — otomatik partition yarat:
+Partition'ları elle eklemek istemezsin. **Interval partitioning** (11g+) yeni ay geldiğinde partition'ı otomatik yaratır — banking standardı:
 
 ```sql
 CREATE TABLE transactions(...)
@@ -111,9 +142,9 @@ INTERVAL (NUMTOYMINTERVAL(1, 'MONTH'))   -- her ay yeni partition
 (PARTITION p_initial VALUES LESS THAN (TIMESTAMP '2024-01-01 00:00:00 UTC'));
 ```
 
-Yeni transaction insert edilince Oracle otomatik partition yaratır. **Banking standardı.**
-
 #### LIST partitioning — kategori için
+
+Bölümleme ekseni sürekli değil, sonlu bir kategori kümesiyse LIST kullanılır:
 
 ```sql
 CREATE TABLE accounts(...)
@@ -125,20 +156,22 @@ PARTITION BY LIST (currency) (
 );
 ```
 
-Currency'e göre fiziksel ayrım. Sadece TRY transaction'ları arıyorsan p_try'i okur.
+Sadece TRY hesaplarını arayan sorgu yalnızca `p_try`'yi okur.
 
 #### HASH partitioning — dağıtım için
+
+Doğal bir tarih/kategori ekseni yoksa ama yükü eşit dağıtmak istiyorsan hash kullanılır:
 
 ```sql
 CREATE TABLE journal_lines(...)
 PARTITION BY HASH (account_id) PARTITIONS 16;
 ```
 
-`account_id`'in hash'ine göre 16 partition'a dağıt. Eşit dağılım — paralel I/O.
-
-**Banking:** Hot spot (popüler account'lar) varsa hash partitioning dağıtır.
+`account_id`'nin hash'ine göre 16 partition'a eşit dağıtır — hot spot (popüler account) yükünü paralelize eder.
 
 #### Composite partitioning — RANGE + HASH
+
+En güçlüsü ikisini birleştirir: dış eksende tarih, iç eksende hash dağıtımı:
 
 ```sql
 CREATE TABLE transactions(...)
@@ -148,9 +181,11 @@ SUBPARTITION BY HASH (account_id) SUBPARTITIONS 8
  PARTITION p_2024_02 VALUES LESS THAN (TIMESTAMP '2024-03-01 UTC'));
 ```
 
-Her aylık partition içinde 8 hash subpartition. **Time-based query + account-based dağıtım = ideal banking.**
+Her aylık partition içinde 8 hash subpartition — time-based query + account-based dağıtım, ideal banking kombinasyonu.
 
 ### 3. Partition operations
+
+Partitioning'in asıl banking değeri operasyonlarda ortaya çıkar: eski veriyi milyonlarca satır silmeden, tek DDL ile boşaltmak.
 
 ```sql
 -- Eski partition'ı drop et (archive sonrası)
@@ -169,11 +204,11 @@ EXEC DBMS_STATS.GATHER_TABLE_STATS('SCHEMA', 'TRANSACTIONS', PARTNAME => 'P_2024
 SELECT * FROM transactions PARTITION (p_2024_02);
 ```
 
-**Banking pattern:** Aylık rolling archive — 24 aydan eski partition'ları S3'e export et, sonra drop.
+Banking pattern'i aylık rolling archive'dır: 24 aydan eski partition'ları S3'e export et, sonra `DROP PARTITION` ile saniyeler içinde temizle.
 
 ### 4. Materialized Views — pre-computed aggregate
 
-Bir view normal sorgu shortcut'ıdır — her çağrıda yeniden hesaplar. **Materialized view** sonucu **disk'te** tutar.
+Bir ekran "müşterinin son 12 ayı" için her açılışta 10M satır aggregate ederse yavaştır. Normal bir view her çağrıda yeniden hesaplar; **materialized view** sonucu **disk'te** tutar ve hazır okutur.
 
 ```sql
 CREATE MATERIALIZED VIEW mv_daily_summary
@@ -189,24 +224,38 @@ FROM transactions
 GROUP BY TRUNC(occurred_at), account_id;
 ```
 
-**Parameter'lar:**
+Parametrelerin her biri refresh davranışını belirler:
 
-- `BUILD IMMEDIATE`: Yarat hemen doldur. Alternatif: `DEFERRED` (yaratır, doldurmaz)
-- `REFRESH FAST ON DEMAND`: Manuel refresh, sadece değişen satırlar (materialized view log gerekir)
-- `REFRESH COMPLETE`: Tüm view'i yeniden hesapla
-- `REFRESH ON COMMIT`: Underlying tabloya her commit'te güncellenir (yavaşlatır)
-- `ENABLE QUERY REWRITE`: Oracle uygun query'leri otomatik mv'ye yönlendirsin
+- `BUILD IMMEDIATE`: yarat ve hemen doldur. Alternatif `DEFERRED` — yaratır, doldurmaz
+- `REFRESH FAST ON DEMAND`: manuel refresh, sadece değişen satırlar (MV log gerekir)
+- `REFRESH COMPLETE`: tüm view'i sıfırdan hesapla
+- `REFRESH ON COMMIT`: underlying tabloya her commit'te güncellenir (yazmaları yavaşlatır)
+- `ENABLE QUERY REWRITE`: Oracle uygun query'leri otomatik MV'ye yönlendirir
 
-**Refresh:**
+Refresh modu iki eksende karar verilir — ne zaman (`ON COMMIT` / `ON DEMAND`) ve ne kadar (`FAST` / `COMPLETE`):
+
+```mermaid
+flowchart LR
+    Base["Underlying tablo değişti"] --> Q{"Refresh modu"}
+    Q -->|"ON COMMIT"| C["Her commit'te MV güncellenir"]
+    Q -->|"ON DEMAND"| D["Manuel veya scheduled job"]
+    C --> Slow["Yazma yolu yavaşlar"]
+    D --> Fast["FAST log'dan artımlı"]
+    D --> Complete["COMPLETE sıfırdan hesap"]
+```
+
+Manuel refresh iki harfle tetiklenir:
 
 ```sql
 EXEC DBMS_MVIEW.REFRESH('mv_daily_summary', 'F');   -- F = fast
 EXEC DBMS_MVIEW.REFRESH('mv_daily_summary', 'C');   -- C = complete
 ```
 
-**Banking örneği:** Daily/monthly reporting. Bir banka ekran açıyor "müşterinin son 12 ayının özeti" — her seferinde 10M satır aggregate yapmak yerine materialized view'den oku.
+Banking örneği daily/monthly reporting'dir: EOD job MV'yi refresh eder, gün boyu reporting endpoint'i hazır aggregate'ten okur.
 
 ### 5. Materialized view log — fast refresh için
+
+`REFRESH FAST` sıfırdan hesaplamaz, sadece **değişen satırları** uygular — ama bunun için değişiklikleri bir yerde biriktirmesi gerekir. O yer materialized view log'dur:
 
 ```sql
 CREATE MATERIALIZED VIEW LOG ON transactions
@@ -214,23 +263,34 @@ WITH ROWID, SEQUENCE (account_id, amount, occurred_at)
 INCLUDING NEW VALUES;
 ```
 
-Underlying tablonun her değişikliği log'a yazılır. MV refresh sadece **log'daki değişiklikleri** uygular. **Sıfırdan yeniden hesaplamaz.**
+Underlying tablonun her değişikliği log'a yazılır; refresh yalnızca **log'daki delta'yı** MV'ye taşır.
 
-**Tehlike:** Çok sık yazılan tablolarda log büyük olur, disk yer. İzlemek gerek.
+```admonish warning title="MV log disk tuzağı"
+Çok sık yazılan bir tabloda MV log hızla büyür ve disk yer. Log boyutunu ve refresh sıklığını izlemeyen bir kurulum, fark etmeden tablespace doldurur. FAST refresh'in bedeli her zaman bu log'un maliyetidir.
+```
 
 ### 6. Oracle MVCC — undo segments
 
-PostgreSQL'in MVCC'si row-versioning ile (her satırın geçmişi). **Oracle MVCC undo segment'lerini kullanır.**
+Reader'ların writer'ları, writer'ların reader'ları bloklamaması banking concurrency'sinin temelidir. PostgreSQL bunu satır versiyonlarını tabloda tutarak yapar; **Oracle MVCC undo segment'lerini kullanır**.
 
-**Nasıl çalışır:**
+Mekanizma üç adımdır. UPDATE yaptığında Oracle eski değeri önce **undo segment**'e yazar. Senin commit'inden önce aynı satırı okuyan başka bir transaction, blok değişmiş görünse bile undo'dan commit-öncesi tutarlı değeri okur — buna read consistency denir. Commit ettiğinde undo'nun o kısmı serbest kalır.
 
-1. UPDATE yaparsın → Oracle eski değeri **undo segment**'e yazar
-2. Başka transaction senin update'ini commit'ten önce sorguluyorsa → undo segment'ten eski değeri okur ("read consistency")
-3. Commit → undo segment'in o kısmı serbest kalır
+```mermaid
+sequenceDiagram
+    participant W as Writer TX
+    participant B as Data Block
+    participant U as Undo Segment
+    participant R as Reader TX
+    W->>U: eski değeri undo'ya yaz
+    W->>B: bloğu yeni değerle güncelle
+    Note over W: henüz commit yok
+    R->>B: satırı okumak ister
+    Note over R: blok değişmiş ama commit görünmüyor
+    B->>U: eski versiyonu iste
+    U-->>R: commit öncesi tutarlı değer
+```
 
-**Faydalar:**
-- Reader'lar writer'ları **bloklamaz**, writer'lar reader'ları **bloklamaz**
-- Time travel (`AS OF TIMESTAMP`)
+Aynı undo mekanizması **time travel**'i de mümkün kılar — geçmiş bir andaki snapshot'ı sorgulayabilirsin:
 
 ```sql
 SELECT * FROM accounts AS OF TIMESTAMP (SYSTIMESTAMP - INTERVAL '1' HOUR);
@@ -239,31 +299,39 @@ SELECT * FROM accounts AS OF TIMESTAMP (SYSTIMESTAMP - INTERVAL '1' HOUR);
 
 ### 7. ORA-01555 — "snapshot too old"
 
-**Klasik banking incident.** Uzun süren bir query başlar, eski satır versiyonu lazım, ama undo segment **overwrite** olmuş.
+Klasik banking incident'i: saatlerce süren bir rapor sorgusu eski bir satır versiyonuna ihtiyaç duyar, ama o versiyonu tutan undo alanı bu arada **overwrite** edilmiştir.
 
 ```
 ORA-01555: snapshot too old: rollback segment number XX with name "..." too small
 ```
 
-**Sebepler:**
-1. Uzun süren query (saatlerce çalışan rapor)
-2. Aktif yazma yükü (undo segment hızla doluyor)
-3. UNDO_RETENTION yetmiyor
+Üç faktör bir araya gelir: uzun süren query, yüksek yazma yükü (undo hızla dolar), yetersiz `UNDO_RETENTION`. Sorgu başladığındaki SCN'e sabitlenmiş snapshot'a artık ulaşılamaz.
 
-**Önlem:**
+```mermaid
+sequenceDiagram
+    participant Q as Uzun Rapor Sorgusu
+    participant U as Undo Segment
+    participant W as Yazma Yuku
+    Q->>U: sorgu basladi, snapshot SCN sabit
+    Note over Q: saatlerce suren tarama
+    W->>U: surekli commit, undo alani dolu
+    U->>U: eski undo overwrite edilir
+    Q->>U: eski versiyon lazim
+    U-->>Q: ORA-01555 snapshot too old
+```
+
+Birincil önlem retention süresini uzatmaktır:
 
 ```sql
 -- Production tipik:
 ALTER SYSTEM SET UNDO_RETENTION = 21600;   -- 6 saat
 ```
 
-`UNDO_RETENTION` retentionsız değildir — sadece **hint**. Yer yoksa Oracle ihlal eder.
-
-**Banking pratiği:** Long-running query'leri (raporlama) **read-only replica**'da çalıştır. Production transactional DB'de uzun query'den kaçın.
+Ama `UNDO_RETENTION` bir garanti değil, sadece **hint**'tir — yer yoksa Oracle yine de overwrite eder. <mark>Uzun raporlama sorgularını asla production transactional DB'de değil, read-only replica'da çalıştır.</mark>
 
 ### 8. Tablespaces
 
-Tablespace = veri dosyalarının mantıksal grubu. Tablolar tablespace'lerde yaşar.
+Bir tablo fiziksel olarak nerede yaşar? **Tablespace** = veri dosyalarının mantıksal grubu; tablolar tablespace'lerde durur.
 
 ```sql
 CREATE TABLESPACE banking_data 
@@ -273,48 +341,34 @@ CREATE TABLESPACE banking_data
 CREATE TABLE accounts(...) TABLESPACE banking_data;
 ```
 
-**Banking pratiği:**
-- Hot data (transactions) → fast SSD tablespace
-- Cold data (archive) → slower disk
-- Index → ayrı tablespace (I/O paralelize)
-- Temp → ayrı (sort/aggregate)
+Banking'de tablespace ayrımı I/O stratejisidir: hot data (transactions) fast SSD'ye, cold data (archive) yavaş diske, index'ler ayrı tablespace'e (I/O paralelize), temp ayrı (sort/aggregate).
 
 ### 9. Redo log ve archivelog
 
-**Redo log:** Her DML değişikliği önce **redo log**'a yazılır (sıralı, çok hızlı), sonra data file'a (random I/O).
+Durability'nin kalbi redo log'dur. Her DML değişikliği önce **redo log**'a yazılır (sıralı, çok hızlı), data file'a yazma (random I/O) sonra gelir:
 
 ```
 COMMIT → log buffer flush → redo log write → ACK to caller
 ```
 
-**Crash recovery:** Server çakılırsa, restart'ta redo log'dan committed transaction'lar replay edilir.
-
-**Archivelog mode:** Eski redo log'ları silinmeden arşivlenir. **Point-in-time recovery** için gerekli.
+Server çakılırsa restart'ta redo log'dan committed transaction'lar replay edilir — crash recovery budur. **Archivelog mode** ise eski redo log'ları silmeden arşivler; point-in-time recovery için şarttır:
 
 ```sql
 SELECT log_mode FROM v$database;   -- ARCHIVELOG veya NOARCHIVELOG
 ```
 
-**Banking pratiği:** Production'da **mutlaka ARCHIVELOG mode**. "Saat 10:23'teki yedek + 10:23-12:45 redo log'ları → 12:45'e geri dön."
+<mark>Production banking'de ARCHIVELOG mode olmadan point-in-time recovery imkânsızdır.</mark> Senaryo: "Saat 10:23'teki yedek + 10:23-12:45 redo log'ları → 12:45'e geri dön."
 
 ### 10. ROWID & ROWNUM
 
-**ROWID:** Bir satırın **fiziksel adresi** (datafile, block, row). Sabit, biricik (satır taşınana kadar).
+İkisi de junior'ı karıştırır ama tamamen farklıdır. **ROWID** bir satırın **fiziksel adresidir** (datafile, block, row); satır taşınana kadar sabit ve biriciktir — aynı satırı tekrar fetch etmenin en hızlı yolu.
 
 ```sql
 SELECT ROWID, id FROM accounts WHERE owner_id = '...';
 -- ROWID: AAAVAVAAEAAAB7CAAA
 ```
 
-Banking kullanımı: Aynı satırı tekrar fetch etmek için en hızlı yol.
-
-**ROWNUM:** Sorgu sonucundaki **sıra numarası** (1, 2, 3, ...).
-
-```sql
-SELECT * FROM accounts WHERE ROWNUM <= 10;   -- ilk 10
-```
-
-**Tuzak:** ROWNUM `WHERE` sonrasında, ORDER BY öncesinde değerlendirilir.
+**ROWNUM** ise sorgu sonucundaki **sıra numarasıdır** (1, 2, 3, ...) ve tuzak buradadır: `WHERE`'den sonra, `ORDER BY`'dan önce değerlendirilir.
 
 ```sql
 -- ❌ Yanlış: random 10 satır, sorted değil
@@ -329,7 +383,13 @@ SELECT * FROM (
 SELECT * FROM accounts ORDER BY balance_amount DESC FETCH FIRST 10 ROWS ONLY;
 ```
 
+```admonish tip title="Top-N için 12c+ syntax'ı tercih et"
+Oracle 12c ve sonrasında `OFFSET ... FETCH` sadece pagination'ı değil, top-N sorgularını da temizler: niyet doğrudan okunur, iç içe subquery'ye gerek kalmaz ve optimizer'a "sadece ilk N satır lazım" bilgisini net verir. Eski `WHERE ROWNUM` kalıbını yalnızca 11g ve öncesiyle uğraşırken kullan.
+```
+
 ### 11. Optimizer hints (kısa)
+
+Optimizer nadiren yanılır; yanıldığında ona parmakla yol gösterebilirsin:
 
 ```sql
 SELECT /*+ INDEX(a idx_acc_owner) */ * FROM accounts a WHERE owner_id = '...';
@@ -341,9 +401,11 @@ SELECT /*+ NO_INDEX(a) */ * FROM accounts a WHERE ...;
 SELECT /*+ FIRST_ROWS(10) */ ...;   -- ilk 10 satır için optimize
 ```
 
-Topic 4.2'de detaylandırıldı. Production'da **son çare**.
+Topic 4.2'de detaylandırıldı. Production'da hint **son çaredir** — önce stats ve index'i düzelt.
 
-### 12. Oracle text data types
+### 12. Oracle text ve number data types
+
+Banking'de tip seçimi para ve zaman doğruluğu demektir:
 
 | Type | Açıklama |
 |---|---|
@@ -358,14 +420,11 @@ Topic 4.2'de detaylandırıldı. Production'da **son çare**.
 | TIMESTAMP | Microsecond precision |
 | TIMESTAMP WITH TIME ZONE | TZ aware |
 
-**Banking pratiği:**
-- Money: `NUMBER(19, 4)` (PostgreSQL `NUMERIC(19, 4)` ile aynı)
-- Date'ler: `TIMESTAMP WITH TIME ZONE` (multi-region banking)
-- ID: `RAW(16)` (UUID için) veya `NUMBER` (sequence ile)
+Pratik kararlar: money için `NUMBER(19, 4)` (PostgreSQL `NUMERIC(19, 4)` ile aynı), tarihler için `TIMESTAMP WITH TIME ZONE` (multi-region banking), ID için `RAW(16)` (UUID) veya `NUMBER` (sequence).
 
 ### 13. AWR ve ASH report (DBA dünyası, junior'a tanıtım)
 
-**AWR (Automatic Workload Repository):** Her saat snapshot alır. Performans analizi için altın madeni.
+Performans problemi çıktığında "ne oldu" sorusunun cevabı bu iki repository'dedir. **AWR (Automatic Workload Repository)** her saat snapshot alır — performans analizinin altın madeni:
 
 ```sql
 -- AWR snapshot al
@@ -375,17 +434,17 @@ EXEC DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT();
 @?/rdbms/admin/awrrpt.sql
 ```
 
-**ASH (Active Session History):** Saniye-bazlı session aktivitesi.
+**ASH (Active Session History)** ise saniye-bazlı session aktivitesini tutar:
 
 ```sql
 SELECT * FROM v$active_session_history WHERE sample_time > SYSDATE - 1/24;
 ```
 
-**Banking gerçeği:** AWR/ASH'i DBA çalıştırır. Sen ürettiği raporu okuyabilmen yeterli. Senior dev'lik için tanıman iyi.
+Banking gerçeği: AWR/ASH'i DBA çalıştırır; senin ürettiği raporu okuyabilmen yeterlidir, ama senior dev'lik için tanıman gerekir.
 
-### 14. Banking örnekleri — Production scenarios
+### 14. Banking örnekleri — production scenarios
 
-#### Senaryo 1: Yıllar boyu büyüyen transactions
+Öğrendiğin parçaları iki gerçek senaryoda birleştirelim. Önce yıllar boyu büyüyen transactions tablosu — interval partitioning + local index:
 
 ```sql
 CREATE TABLE transactions(
@@ -402,9 +461,7 @@ INTERVAL (NUMTOYMINTERVAL(1, 'MONTH'));
 CREATE INDEX idx_tx_account ON transactions(account_id) LOCAL;
 ```
 
-Otomatik aylık partition. 24 aydan eski partition'lar archive job ile S3'e + drop.
-
-#### Senaryo 2: Daily reporting MV
+Otomatik aylık partition oluşur; 24 aydan eski partition'lar archive job ile S3'e gider ve drop edilir. İkinci senaryo daily reporting MV'sidir:
 
 ```sql
 CREATE MATERIALIZED VIEW mv_daily_balance_summary
@@ -422,43 +479,33 @@ JOIN accounts a ON a.id = jl.account_id
 GROUP BY TRUNC(je.occurred_at), a.currency;
 ```
 
-EOD job sonrası refresh. Reporting endpoint'i mv'den okur.
+EOD job sonrası refresh edilir; reporting endpoint'i doğrudan MV'den okur.
 
 ### 15. Anti-pattern'ler
 
-**Anti-pattern 1: Partitioning'siz büyük tablo**
+Mülakatta "bu tasarımda ne yanlış" sorusunun cephaneliği:
 
-Banking transaction'ları aylık partition'lasız, tek tabloda saklamak. Bir gün sonra `archive` veya `drop` imkânsız.
+**Partitioning'siz büyük tablo:** transaction'ları aylık partition'sız tek tabloda tutmak. Bir gün archive/drop imkânsız hale gelir.
 
-**Anti-pattern 2: ROWNUM ile pagination**
+**ROWNUM ile pagination:** aşağıdaki kod hiç satır döndürmez, çünkü ROWNUM `WHERE` ile incremental atanır ve `>` kontrolü hep false olur:
 
 ```sql
 -- ❌ Yanlış pagination
 SELECT * FROM accounts WHERE ROWNUM > 100 AND ROWNUM <= 200;
 ```
 
-ROWNUM `WHERE` ile incremental atanır, `>` kontrolü hep false. **Çözüm:** subquery veya Oracle 12c+ `OFFSET ... FETCH`.
+Çözüm subquery veya 12c+ `OFFSET ... FETCH`:
 
 ```sql
 SELECT * FROM accounts ORDER BY id 
 OFFSET 100 ROWS FETCH NEXT 100 ROWS ONLY;
 ```
 
-**Anti-pattern 3: Materialized view refresh on commit ağır query**
-
-Her commit'te refresh = production yavaşlar. **Çözüm:** Refresh on demand + scheduled job.
-
-**Anti-pattern 4: NOARCHIVELOG production**
-
-Sıfır recovery imkânı. **Mutlaka ARCHIVELOG.**
-
-**Anti-pattern 5: Sequence CACHE 0 veya çok küçük**
+**MV refresh ON COMMIT ağır query:** her commit'te refresh production'ı yavaşlatır — çözüm `ON DEMAND` + scheduled job. **NOARCHIVELOG production:** sıfır recovery imkânı, mutlaka ARCHIVELOG. **Sequence CACHE 0 veya çok küçük:** `CACHE 1` high-volume INSERT'te bottleneck yaratır; banking standardı 20-100.
 
 ```sql
-CREATE SEQUENCE seq_x CACHE 1;   -- her INSERT'te disk
+CREATE SEQUENCE seq_x CACHE 1;   -- her INSERT'te disk, bottleneck
 ```
-
-High-volume INSERT'te bottleneck. CACHE 20-100 banking standardı.
 
 ---
 
@@ -475,62 +522,134 @@ High-volume INSERT'te bottleneck. CACHE 20-100 banking standardı.
 
 ---
 
-## Mini task'ler
+## Kendini Sına
 
-### Task 4.5.1 — Sequence (15 dk)
+Aşağıdaki soruları önce **cevaba bakmadan** kendi cümlelerinle yanıtlamayı dene — hepsi Oracle çalışan bir banking ekibinin mülakatında karşına çıkabilir. Takıldığın soruda ilgili Kavramlar başlığına dön, sonra tekrar dene.
 
-`seq_account_id` yarat `CACHE 50`. Bir INSERT yaparken `NEXTVAL` kullan, `CURRVAL` ile son ID'i al.
+**S1. ORA-01555 "snapshot too old" hatasının kök nedeni nedir ve nasıl çözersin?**
 
-### Task 4.5.2 — RANGE partitioning (30 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-`transactions` tablosunu aylık `INTERVAL` ile partition'la. 3 ay verisi insert et. Partition'ları sorgula:
+Uzun süren bir sorgu, başladığı andaki SCN'e sabitlenmiş bir snapshot ister. Bu sırada yoğun yazma yükü undo segment'i sürekli doldurur ve sorgunun ihtiyaç duyduğu eski satır versiyonları `UNDO_RETENTION` yetmediği için overwrite edilir — Oracle tutarlı okumayı sağlayamayınca ORA-01555 fırlatır.
 
-```sql
-SELECT partition_name, num_rows FROM user_tab_partitions WHERE table_name = 'TRANSACTIONS';
-```
+Çözüm iki katmanlıdır. Birincisi `UNDO_RETENTION`'ı production'da 6 saat gibi bir değere çıkarmak, ama bu bir hint'tir, yer yoksa Oracle yine ihlal eder. Asıl doğru pratik uzun raporlama sorgularını production transactional DB yerine read-only replica'da çalıştırmaktır; böylece uzun sorgu ile yazma yükü aynı undo'yu paylaşmaz.
 
-### Task 4.5.3 — Partition pruning gör (15 dk)
+</details>
 
-```sql
-EXPLAIN PLAN FOR
-SELECT * FROM transactions WHERE occurred_at BETWEEN '2024-02-01' AND '2024-02-28';
+**S2. Partitioning'i ne zaman kullanırsın ve RANGE / LIST / HASH arasında nasıl seçersin?**
 
-SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
-```
+<details>
+<summary>Cevabı göster</summary>
 
-Plan'da "PARTITION RANGE SINGLE" veya benzeri pruning evidence görmeli.
+Tablo o kadar büyüdüğünde (transaction'larda milyonlarca-milyarlarca satır) tek parça yönetim, archive ve sorgu performansı zorlaştığında kullanırsın. Kazanç partition pruning (sorgu tek partition okur), saniyeler süren `DROP PARTITION` archive'ı ve partition bazlı maintenance'tır.
 
-### Task 4.5.4 — Materialized view (45 dk)
+Seçim bölme eksenine bağlıdır: sürekli bir değer, özellikle tarih varsa RANGE (interval ile otomatik aylık partition — banking standardı); sonlu bir kategori kümesi varsa LIST (currency gibi); doğal eksen yok ama yükü eşit dağıtmak ve hot spot'u kırmak istiyorsan HASH. En güçlüsü composite'tir: dış RANGE (tarih) + iç HASH (account_id).
 
-`mv_daily_balance_summary`'i yarat. Initial data load. 10 yeni transaction insert et. `REFRESH FAST` ile güncelle (MV LOG gerekir).
+</details>
 
-### Task 4.5.5 — ORA-01555 reproduction (30 dk)
+**S3. Oracle MVCC nasıl çalışır? PostgreSQL'den farkı nedir?**
 
-`UNDO_RETENTION` çok düşük tut (60 saniye). Bir cursor aç (`OPEN c FOR SELECT * FROM accounts`), 2 dakika bekle, fetch'le. ORA-01555 görmen lazım.
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 4.5.6 — Time travel query (15 dk)
+Oracle bir satırı UPDATE ettiğinde eski değeri önce undo segment'e yazar, sonra bloğu günceller. Senin commit'inden önce aynı satırı okuyan başka bir transaction, blok değişmiş görünse bile undo'dan commit-öncesi tutarlı değeri okur — read consistency. Sonuç: reader writer'ı, writer reader'ı bloklamaz; ayrıca `AS OF TIMESTAMP` ile geçmiş snapshot'a time travel yapılabilir.
 
-```sql
-UPDATE accounts SET balance_amount = 0 WHERE id = '...';
-COMMIT;
+Fark: PostgreSQL satır versiyonlarını tablonun içinde tutar (her satırın eski kopyaları tabloda kalır, VACUUM temizler); Oracle ise eski versiyonları ayrı bir undo segment'te tutar. Oracle'ın modeli tabloyu şişirmez ama undo'nun taşması ORA-01555'e yol açar.
 
--- 1 dakika sonra
-SELECT balance_amount FROM accounts AS OF TIMESTAMP (SYSTIMESTAMP - INTERVAL '1' MINUTE) WHERE id = '...';
-```
+</details>
 
-Eski değeri okur.
+**S4. Materialized view refresh stratejisini nasıl seçersin? FAST vs COMPLETE, ON COMMIT vs ON DEMAND ne zaman?**
 
-### Task 4.5.7 — Drop old partition (15 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-```sql
-ALTER TABLE transactions DROP PARTITION p_2020_01;
-```
+İki bağımsız eksen var. Zaman ekseni: `ON COMMIT` MV'yi underlying tablonun her commit'inde günceller — anlık tutarlılık verir ama yazma yolunu yavaşlatır, yüksek-volume banking tablolarında anti-pattern'dir. `ON DEMAND` refresh'i manuel veya scheduled job'a bırakır; reporting için doğru tercih budur (örneğin EOD job).
 
-Saniyeler içinde milyonlarca satır gider. Banking'de aylık archive job mantığı.
+Miktar ekseni: `FAST` sadece MV log'daki delta'yı uygular, hızlıdır ama MV log gerektirir ve log'un disk maliyeti vardır. `COMPLETE` view'i sıfırdan hesaplar, log gerektirmez ama pahalıdır. Banking pratiği genelde `REFRESH FAST ON DEMAND` + scheduled job; log yönetilemiyorsa `COMPLETE`.
+
+</details>
+
+**S5. Sequence tanımlarken `CACHE` ve `NOCYCLE` neden önemli? IDENTITY column ne getirir?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+`CACHE`, sequence değerlerini memory'de tutarak her `NEXTVAL` için disk roundtrip'ini keser; `CACHE 1` veya `NOCACHE` high-volume INSERT'te ciddi bir bottleneck olur, banking standardı 20-100'dür. Bedeli: instance crash'te cache'teki değerler kaybolur, yani ID'lerde gap oluşabilir — banking'de gap sorun değildir, çakışma sorundur.
+
+`NOCYCLE` zorunludur çünkü cycle yapan sequence maksimuma ulaşınca başa döner ve ID collision üretir. Oracle 12c+ `GENERATED ALWAYS AS IDENTITY` ise arkada bir sequence'i implicit yönetir — PostgreSQL `SERIAL` gibi, elle `NEXTVAL` yazmadan otomatik ID.
+
+</details>
+
+**S6. `SELECT * FROM accounts WHERE ROWNUM > 100` neden hiç satır döndürmez? Doğru pagination nasıl yapılır?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+ROWNUM, sonuç kümesine satır eklendikçe artan bir sayaçtır ve ilk satıra 1 atanır. Ama `WHERE ROWNUM > 100` ilk satırı ele alırken ROWNUM henüz 1'dir, koşul false olur, satır elenir — dolayısıyla ROWNUM asla 1'in ötesine geçemez ve sorgu hep boş döner. ROWNUM `WHERE`'de değerlendirilir, `ORDER BY`'dan önce atanır; bu yüzden `WHERE ROWNUM <= 10 ORDER BY ...` da yanlıştır (önce rastgele 10, sonra sıralama).
+
+Doğrusu ya sıralamayı bir subquery içinde yapıp dışarıda ROWNUM ile sınırlamak, ya da Oracle 12c+ `OFFSET 100 ROWS FETCH NEXT 100 ROWS ONLY` kullanmaktır — okunur ve doğru pagination sağlar.
+
+</details>
+
+**S7. Production banking'de ARCHIVELOG mode neden zorunludur? NOARCHIVELOG ile ne kaybedersin?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Her DML önce redo log'a yazılır; crash olduğunda restart'ta committed transaction'lar redo'dan replay edilir (crash recovery). ARCHIVELOG mode, dolan redo log'ları silmeden arşivler ve böylece point-in-time recovery'yi mümkün kılar: "saat 10:23'teki full backup + 10:23-12:45 arası arşivlenmiş redo → tam 12:45'e geri dön".
+
+NOARCHIVELOG'da eski redo log'lar üzerine yazılır; elinde sadece son full backup kalır, iki backup arasındaki committed işlemleri kurtaramazsın. Banking'de bu kabul edilemez bir veri kaybı riskidir, bu yüzden production'da ARCHIVELOG mutlaka açıktır.
+
+</details>
 
 ---
 
-## Test yazma rehberi
+## Tamamlama kriterleri
+
+- [ ] Sequence `CACHE` değerinin performans etkisini ve `NOCYCLE`'ın neden zorunlu olduğunu açıklayabiliyorum
+- [ ] RANGE / LIST / HASH partitioning arasında bir banking senaryosuna göre seçim yapabiliyorum
+- [ ] `INTERVAL` partitioning'in ve local index'in neden standart olduğunu anlatabiliyorum
+- [ ] Partition pruning'i ve `DROP PARTITION` archive akışını açıklayabiliyorum
+- [ ] Materialized view refresh stratejisini (FAST/COMPLETE, ON COMMIT/ON DEMAND) bilinçli seçebiliyorum
+- [ ] Oracle MVCC'nin undo segment mantığını ve PostgreSQL'den farkını anlatabiliyorum
+- [ ] ORA-01555'in kök nedenini ve iki katmanlı çözümünü söyleyebiliyorum
+- [ ] `AS OF TIMESTAMP` time travel'ın hangi senaryoda işe yaradığını biliyorum
+- [ ] ROWNUM pagination tuzağını ve 12c+ `OFFSET ... FETCH` alternatifini biliyorum
+- [ ] ARCHIVELOG mode'un production zorunluluğunu ve point-in-time recovery'yi anlıyorum
+
+---
+
+## Defter notları
+
+1. "Sequence CACHE değerinin performans etkisi: ____."
+2. "RANGE INTERVAL partitioning'in banking'de neden standart: ____."
+3. "Partition pruning'i EXPLAIN PLAN'de nasıl tanırım: ____."
+4. "Materialized view fast refresh ile complete refresh farkı: ____."
+5. "ORA-01555 hatasının kök nedeni (undo + uzun query): ____."
+6. "UNDO_RETENTION ne işe yarar, banking için ideal değer: ____."
+7. "AS OF TIMESTAMP time travel kullanım senaryosu: ____."
+8. "ARCHIVELOG mode olmadan recovery imkânı: ____."
+9. "ROWNUM `WHERE ROWNUM > 100` neden çalışmaz: ____."
+10. "Oracle 12c+ OFFSET ... FETCH alternatifi neden tercih: ____."
+
+```admonish success title="Bölüm Özeti"
+- Sequence ID üretiminde `CACHE 20-100` ve `NOCYCLE` banking standardıdır; 12c+ `IDENTITY` column arkadaki sequence'i implicit yönetir, `SYS_GUID()` distributed alternatiftir
+- Büyük transactions tablosu `RANGE INTERVAL` ile aylık otomatik partition'lanır; partition pruning sorguyu tek partition'a indirir, eski partition drop saniyeler sürer — RANGE/LIST/HASH ekseni veriye göre seçilir
+- Materialized view reporting aggregate'ini disk'te tutar; `REFRESH FAST` MV log ile artımlıdır, `ON DEMAND` + scheduled job production tercihidir, `ON COMMIT` yüksek-volume'da anti-pattern
+- Oracle MVCC eski satır versiyonlarını undo segment'te tutar; reader writer'ı bloklamaz, `AS OF TIMESTAMP` time travel sağlar — undo taşması ORA-01555'e yol açar
+- ORA-01555 uzun sorgu + undo overwrite çakışmasıdır; çözüm `UNDO_RETENTION` artırmak ve uzun raporları read-only replica'ya taşımaktır
+- Production'da ARCHIVELOG mode point-in-time recovery için zorunludur; ROWNUM pagination tuzağına karşı 12c+ `OFFSET ... FETCH` kullan
+```
+
+---
+
+## Pratik yapmak istersen
+
+Kavramları Oracle üzerinde çalıştırmak istersen aşağıdaki iki ek hazır: test yazma rehberi partition pruning ve materialized view refresh için örnek testler içerir; Claude-verify prompt'u ile yazdığın Oracle şemasını banking-grade perspektiften denetletebilirsin. Küçük bir laboratuvar akışı olarak şunları da sırayla deneyebilirsin — `seq_account_id` yarat `CACHE 50` ile ve `NEXTVAL`/`CURRVAL` kullan; `transactions`'ı aylık `INTERVAL` ile partition'la ve `user_tab_partitions`'tan partition'ları listele; `EXPLAIN PLAN` + `DBMS_XPLAN.DISPLAY` ile pruning kanıtını gör; bir MV yaratıp `REFRESH FAST` dene; `UNDO_RETENTION`'ı 60 saniyeye çekip uzun bir cursor ile ORA-01555'i canlı reproduce et; `AS OF TIMESTAMP` ile time travel sorgusu çalıştır; son olarak bir aylık partition'ı `DROP PARTITION` ile saniyeler içinde sil.
+
+<details>
+<summary>Test yazma rehberi</summary>
 
 ### Test 4.5.1 — Partition pruning verification
 
@@ -572,12 +691,37 @@ void mvShouldUpdateOnRefresh() {
 }
 ```
 
----
+### Test 4.5.3 — ORA-01555 reproduction
 
-## Claude-verify prompt
+> `UNDO_RETENTION`'ı çok düşük tut (60 saniye). Bir cursor aç (`OPEN c FOR SELECT * FROM accounts`), arka planda yoğun UPDATE + COMMIT yükü çalıştırırken 2 dakika bekle, sonra fetch'le. Undo overwrite edildiği için `ORA-01555` görmen gerekir. Bu testi asla shared bir ortamda çalıştırma; izole bir XE instance'ında dene.
+
+### Test 4.5.4 — Time travel query
+
+```java
+@Test
+void asOfTimestampShouldReturnOldValue() {
+    jdbc.update("UPDATE accounts SET balance_amount = 0 WHERE id = ?", accountId);
+    jdbc.execute("COMMIT");
+    
+    BigDecimal past = jdbc.queryForObject("""
+        SELECT balance_amount FROM accounts
+        AS OF TIMESTAMP (SYSTIMESTAMP - INTERVAL '1' MINUTE)
+        WHERE id = ?
+        """, BigDecimal.class, accountId);
+    
+    // Güncellemeden önceki değer okunur
+    assertThat(past).isNotEqualByComparingTo(BigDecimal.ZERO);
+}
+```
+
+</details>
+
+<details>
+<summary>Claude-verify prompt</summary>
 
 ```
-Oracle-specific çalışmamı banking-grade kriterlere göre değerlendir:
+Oracle-specific çalışmamı banking-grade kriterlere göre değerlendir. 
+Eksikleri işaretle, kod yazma:
 
 1. Sequence:
    - CACHE değeri 1'den büyük mü (20-100 banking standardı)?
@@ -618,35 +762,7 @@ Oracle-specific çalışmamı banking-grade kriterlere göre değerlendir:
    - CACHE 0 sequence?
    - MV refresh ON COMMIT yüksek-volume tabloda?
 
-Her madde için PASS / FAIL / EKSIK işaretle.
+Her madde için PASS / FAIL / EKSIK işaretle, kanıt göster, kod yazma.
 ```
 
----
-
-## Tamamlama kriterleri
-
-- [ ] Sequence yarattım `CACHE 50` ile
-- [ ] RANGE INTERVAL partitioning ile transactions tablosu
-- [ ] Partition pruning'i EXPLAIN PLAN ile gözlemledim
-- [ ] Materialized view yarattım + manuel refresh denedim
-- [ ] ORA-01555 hatasını **canlı** reproduction yaptım
-- [ ] `AS OF TIMESTAMP` ile time travel sorgu denedim
-- [ ] DROP PARTITION ile bir aylık veriyi sildim (saniyeler)
-- [ ] ROWNUM yanlış pagination tuzağını biliyorum
-- [ ] FETCH FIRST ... ROWS ONLY pattern'ini kullanıyorum
-- [ ] ARCHIVELOG mode'un production zorunluluğunu anlıyorum
-
----
-
-## Defter notları
-
-1. "Sequence CACHE değerinin performans etkisi: ____."
-2. "RANGE INTERVAL partitioning'in banking'de neden standart: ____."
-3. "Partition pruning'i EXPLAIN PLAN'de nasıl tanırım: ____."
-4. "Materialized view fast refresh ile complete refresh farkı: ____."
-5. "ORA-01555 hatasının kök nedeni (undo + uzun query): ____."
-6. "UNDO_RETENTION ne işe yarar, banking için ideal değer: ____."
-7. "AS OF TIMESTAMP time travel kullanım senaryosu: ____."
-8. "ARCHIVELOG mode olmadan recovery imkânı: ____."
-9. "ROWNUM `WHERE ROWNUM > 100` neden çalışmaz: ____."
-10. "Oracle 12c+ OFFSET ... FETCH alternatifi neden tercih: ____."
+</details>

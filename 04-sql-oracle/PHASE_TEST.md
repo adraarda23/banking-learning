@@ -1,6 +1,10 @@
 # Faz 4 — PHASE TEST
 
-Faz 5'e geçmeden önce kendini sına.
+```admonish question title="Bu test ne işe yarar?"
+Faz 5'e geçmeden önce kendini sına. Bu bir sınav değil, **dürüstlük kontrolü**:
+işaretleyemediğin her madde, hangi topic'e geri döneceğini gösterir.
+Hepsine "evet" diyebiliyorsan hazırsın.
+```
 
 ## Pratik test
 
@@ -81,4 +85,7 @@ Phase 4'ü bitirdiğinde:
 - "Deadlock'u yakalayıp lock ordering ile çözebilirim."
 - "DBA ile aynı dili konuşabilirim (AWR, v$session, undo segments, redo log)."
 
+```admonish success title="Sonraki durak: Faz 5"
 TR bank mülakatında Oracle/SQL detayları kritik. Phase 4'ten sonra bu kısımda **rahatsın**.
+→ [Faz 5 — Spring Batch](../05-batch/index.md)
+```

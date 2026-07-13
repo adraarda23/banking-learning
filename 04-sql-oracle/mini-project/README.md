@@ -1,26 +1,72 @@
 # Phase 4 Mini-Project — `core-banking` Oracle Migration & PL/SQL
 
+```admonish info title="Bu projede"
+- Phase 1-3'ten gelen `core-banking` projesini PostgreSQL'den **Oracle**'a taşıyor, Flyway ile 5 Oracle-native migration yazıyorsun
+- 3 production-grade PL/SQL package (interest, EOD reconciliation, fraud check) yazıp Java'dan `SimpleJdbcCall` ile çağırıyorsun
+- 1M-satır raporlama sorgusunu partition + composite index + materialized view ile **50x+** hızlandırıyorsun
+- SKIP LOCKED ile distributed job worker queue kurup 10 worker × 100 job fair distribution'ı doğruluyorsun
+- Deadlock ve ORA-01555 hatalarını **canlı reproduce** edip fix ediyorsun
+```
+
 ## Hedef
 
-`core-banking` projesini PostgreSQL'den **Oracle**'a migrate et. 3 production-grade PL/SQL package yaz (interest, EOD reconciliation, fraud check). 1M-satır raporlama query'sini partition + materialized view + index ile **50x+ hızlandır**. SKIP LOCKED ile distributed job worker pattern uygula. Deadlock + ORA-01555 hatasını **canlı reproduction** + fix.
+Phase 4'ün 6 topic'inde index, EXPLAIN, window functions, PL/SQL, Oracle-specific feature'lar ve locking çalıştın. Bu projede hepsini tek serviste birleştirip `core-banking`'i Postgres'ten Oracle'a taşıyorsun. Bu mini-project Phase 4'ün **synthesis**'i — yeni teori yok, **uygulama** var; bir adımda takılırsan ilgili topic'e dön, oku, düzelt.
 
-Sonunda elinde: Oracle XE Docker'da çalışan, PL/SQL ile business logic'in bir kısmı DB'de yaşayan, partitioned + materialized view + optimized index'li tam Oracle banking servisi. JaCoCo coverage Phase 1'deki seviyenin altına düşmemiş.
+Projenin sonunda elinde şunlar olacak:
 
-## Süre
+- Oracle XE Docker'da çalışan, Flyway migration'lı tam Oracle banking servisi
+- Business logic'in bir kısmı DB'de yaşayan 3 PL/SQL package
+- Partitioned + materialized view + optimize index'li raporlama katmanı
+- SKIP LOCKED job queue, canlı deadlock + ORA-01555 reproduction'ları
+- JaCoCo coverage Phase 1 seviyesinin altına düşmemiş test seti
 
-7-10 gün (günde 2-3 saat ciddi çalışma).
+```admonish tip title="Süre ve önbilgi"
+7-10 gün ayır (günde 2-3 saat ciddi çalışma). Başlamadan önce: Phase 4'ün 6 topic'i (4.1-4.6) bitmiş, Phase 1-2-3'teki `core-banking` projen Postgres'te çalışıyor ve `mvn test` yeşil olmalı. Buradaki işin çoğu **migrasyon + birleştirme** + birkaç kasten kırma görevi.
+```
 
-## Önbilgi
+Migrasyonun büyük resmi: mevcut Postgres projeni Flyway'in Oracle dialect'iyle yeniden şemalaştırıp, business logic'in bir kısmını PL/SQL'e taşıyor, üstüne performans ve dayanıklılık katmanı ekliyorsun.
 
-Phase 4'ün 6 topic'i bitti. Index, EXPLAIN, window functions, PL/SQL, Oracle-specific, locking biliyorsun. Phase 1-2-3'teki `core-banking` projen Postgres'te çalışıyor.
+```mermaid
+flowchart LR
+    PG["PostgreSQL<br/>core-banking v1-3"] --> M["Flyway oracle<br/>V1-V5 migration"]
+    M --> OR["Oracle XE<br/>Docker"]
+    OR --> PL["PL/SQL katmani<br/>3 package"]
+    OR --> PERF["Index ve MV<br/>optimizasyon"]
+```
+
+---
+
+## Build plan
+
+Sekiz görev var: ilk ikisi Oracle'ı ve şemayı kuruyor, ortadaki üçü PL/SQL paketlerini yazıyor, son üçü ölçek ve dayanıklılığı ekliyor.
+
+```mermaid
+flowchart LR
+    subgraph Kurulum["Kurulum ve sema"]
+        direction LR
+        G1["Gorev 1<br/>Oracle XE setup"] --> G2["Gorev 2<br/>Flyway migration"]
+    end
+    subgraph Paketler["PL/SQL paketleri"]
+        direction LR
+        G3["Gorev 3<br/>interest_pkg"] --> G4["Gorev 4<br/>eod_recon_pkg"] --> G5["Gorev 5<br/>fraud_check_pkg"]
+    end
+    subgraph Olcek["Olcek ve dayaniklilik"]
+        direction LR
+        G6["Gorev 6<br/>1M-row tuning"] --> G7["Gorev 7<br/>SKIP LOCKED queue"] --> G8["Gorev 8<br/>Deadlock ve ORA-01555"]
+    end
+    G2 --> G3
+    G5 --> G6
+```
 
 ---
 
 ## Görev 1 — Oracle XE Docker setup (yarım gün)
 
+**Ne yapacaksın:** Oracle XE'yi Docker'da ayağa kaldırıp `banking_dev` schema'sını yaratacak, Spring Boot'u `oracle` profile ile bağlayacaksın. **Neden:** Sonraki her görev çalışan bir Oracle instance'ına yaslanıyor — önce zemin, sonra bina.
+
 ### 1.1 Docker compose
 
-`core-banking/docker-compose.oracle.yml`:
+Container image'ı, healthcheck ve persistent volume ile `core-banking/docker-compose.oracle.yml` içine tanımla. Healthcheck `sqlplus` ile `select 1 from dual` çalıştırıp instance'ın hazır olduğunu doğrular:
 
 ```yaml
 services:
@@ -44,6 +90,8 @@ volumes:
   oracle_data:
 ```
 
+Ayağa kaldır ve bağlantıyı test et:
+
 ```bash
 docker compose -f docker-compose.oracle.yml up -d
 
@@ -53,7 +101,7 @@ docker exec -it banking-oracle bash -c "sqlplus sys/BankingDev2024!@//localhost:
 
 ### 1.2 Banking schema yaratma
 
-İlk girişte:
+İlk girişte `sys` olarak pluggable database'e geçip `banking_dev` kullanıcısını gerekli grant'larla yarat. Materialized view ve `DBMS_LOCK` grant'ları ilerideki görevler için şart:
 
 ```sql
 -- as sys
@@ -69,7 +117,7 @@ GRANT EXECUTE ON DBMS_MVIEW TO banking_dev;
 
 ### 1.3 Spring Boot config
 
-`pom.xml`'a Oracle JDBC driver:
+Oracle JDBC driver'ı `pom.xml`'a ekle, ardından `application-oracle.yml`'da datasource + JPA + Flyway'i Oracle'a göre ayarla. Kritik noktalar: `OracleDialect`, `default_schema: BANKING_DEV` ve Flyway'in Oracle migration klasörünü göstermesi.
 
 ```xml
 <dependency>
@@ -79,7 +127,8 @@ GRANT EXECUTE ON DBMS_MVIEW TO banking_dev;
 </dependency>
 ```
 
-`application-oracle.yml`:
+<details>
+<summary>Tam kod: application-oracle.yml (~25 satır)</summary>
 
 ```yaml
 spring:
@@ -105,20 +154,43 @@ spring:
     default-schema: BANKING_DEV
 ```
 
-### 1.4 Deliverables
+</details>
 
-- [ ] `docker-compose.oracle.yml` çalışıyor
-- [ ] `banking_dev` schema oluşturuldu
-- [ ] Spring Boot `oracle` profile ile bağlanıyor
-- [ ] Defterine: Oracle XE versiyonu, ek konfigürasyon notları, ilk girişte yaptığın PROBLEM ÇÖZÜMLERİ
+```admonish warning title="Oracle XE ilk giriş tuzakları"
+Oracle XE'de servis adı önemli: `sys` bağlantısı `XE` (CDB) üzerinden, uygulama bağlantısı `XEPDB1` (PDB) üzerinden gider. Kullanıcıyı yanlış container'da yaratırsan Spring Boot bağlanamaz. Şifreyi çift tırnakla (`"BankingDev2024!"`) yaz — ünlem işareti aksi halde shell/SQL tarafından yorumlanır.
+```
+
+**Kontrol noktası:** `docker-compose.oracle.yml` çalışıyor, `banking_dev` schema oluştu, Spring Boot `oracle` profile ile bağlanıyor. Defterine: Oracle XE versiyonu, ek konfigürasyon notları ve ilk girişte çözdüğün problemleri yaz.
 
 ---
 
 ## Görev 2 — Flyway Oracle migrations (1 gün)
 
+**Ne yapacaksın:** 5 Flyway migration ile şemayı Oracle-native olarak yeniden kuracaksın — RAW(16) UUID, INTERVAL partitioning, sequence ve IDENTITY dahil. **Neden:** PostgreSQL DDL'i Oracle'da birebir çalışmaz; migrasyonun asıl öğretici kısmı iki veritabanının feature farklarını satır satır görmek.
+
 ### 2.1 V1: accounts table
 
-`src/main/resources/db/migration/oracle/V1__create_accounts_table.sql`:
+`V1__create_accounts_table.sql`'in kalbi: UUID'i `RAW(16) DEFAULT SYS_GUID()` ile sakla, para/durum invariant'larını CHECK constraint'lerle garanti et. `chk_acc_balance` bakiyenin negatif olmasını yalnızca kapalı hesapta serbest bırakır:
+
+```sql
+CREATE TABLE accounts (
+    id              RAW(16) DEFAULT SYS_GUID() PRIMARY KEY,
+    owner_id        RAW(16) NOT NULL,
+    currency        CHAR(3) NOT NULL,
+    balance_amount  NUMBER(19, 4) DEFAULT 0 NOT NULL,
+    status          VARCHAR2(20) DEFAULT 'ACTIVE' NOT NULL,
+    version         NUMBER(19) DEFAULT 0 NOT NULL,
+    -- ... audit kolonları
+    CONSTRAINT chk_acc_status CHECK (status IN ('ACTIVE', 'FROZEN', 'CLOSED')),
+    CONSTRAINT chk_acc_currency CHECK (REGEXP_LIKE(currency, '^[A-Z]{3}$')),
+    CONSTRAINT chk_acc_balance CHECK (balance_amount >= 0 OR status = 'CLOSED')
+);
+```
+
+Account ID sequence'i `CACHE 50` ile yaratılır (banking standardı — allocation overhead'ini düşürür), status için partial index ile kapalı hesaplar dışarıda tutulur.
+
+<details>
+<summary>Tam kod: V1__create_accounts_table.sql (~30 satır)</summary>
 
 ```sql
 -- Account ID için sequence (CACHE 50 banking standardı)
@@ -152,9 +224,29 @@ COMMENT ON COLUMN accounts.balance_amount IS 'Maintained balance, authoritative 
 COMMENT ON COLUMN accounts.version IS 'Optimistic locking via @Version';
 ```
 
+</details>
+
 ### 2.2 V2: journal tables (partitioned)
 
-`V2__create_journal_tables.sql`:
+`journal_entries` ve `journal_lines` aya göre **INTERVAL partitioning** kullanır — Oracle her yeni ay için partition'ı otomatik yaratır, elle bakım gerekmez. Partition key'i primary key'e dahil etmek zorundasın:
+
+```sql
+CREATE TABLE journal_entries (
+    id              RAW(16) DEFAULT SYS_GUID() NOT NULL,
+    transaction_id  RAW(16) NOT NULL,
+    occurred_at     TIMESTAMP WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL,
+    -- ...
+    CONSTRAINT pk_journal_entries PRIMARY KEY (id, occurred_at)
+)
+PARTITION BY RANGE (occurred_at)
+INTERVAL (NUMTOYMINTERVAL(1, 'MONTH'))
+(PARTITION p_initial VALUES LESS THAN (TIMESTAMP '2024-01-01 00:00:00 UTC'));
+```
+
+`journal_lines` aynı partition stratejisini taşır, index'leri `LOCAL` (her partition kendi index'i) tanımlanır ve fast refresh için materialized view log kurulur.
+
+<details>
+<summary>Tam kod: V2__create_journal_tables.sql (~44 satır)</summary>
 
 ```sql
 -- Journal entries — INTERVAL partitioned by month
@@ -200,9 +292,17 @@ CREATE MATERIALIZED VIEW LOG ON journal_lines
     INCLUDING NEW VALUES;
 ```
 
-### 2.3 V3: idempotency keys
+</details>
+
+### 2.3 V3-V5: idempotency, reconciliation, fraud tabloları
+
+Kalan üç migration destekleyici tabloları kurar: idempotency key'ler (CLOB response body + 24 saatlik expiry), reconciliation/interest/audit tabloları ve fraud alert tablosu. Audit tablosu Oracle 12c+ `IDENTITY` kolonu kullanır (sequence yerine).
+
+<details>
+<summary>Tam kod: V3-V5 migration'lar (~55 satır)</summary>
 
 ```sql
+-- V3__create_idempotency_keys.sql
 CREATE TABLE idempotency_keys (
     key             RAW(16) PRIMARY KEY,
     transfer_id     RAW(16) NOT NULL,
@@ -214,11 +314,8 @@ CREATE TABLE idempotency_keys (
 );
 
 CREATE INDEX idx_idempotency_expires ON idempotency_keys(expires_at);
-```
 
-### 2.4 V4: reconciliation tables
-
-```sql
+-- V4__create_reconciliation_tables.sql
 CREATE TABLE reconciliation_mismatches (
     id                  RAW(16) DEFAULT SYS_GUID() PRIMARY KEY,
     business_date       DATE NOT NULL,
@@ -257,11 +354,8 @@ CREATE TABLE audit_log (
 );
 
 CREATE INDEX idx_audit_logged_at ON audit_log(logged_at);
-```
 
-### 2.5 V5: fraud detection tables
-
-```sql
+-- V5__create_fraud_tables.sql
 CREATE TABLE fraud_alerts (
     id              RAW(16) DEFAULT SYS_GUID() PRIMARY KEY,
     transaction_id  RAW(16) NOT NULL,
@@ -278,32 +372,70 @@ CREATE TABLE fraud_alerts (
 CREATE INDEX idx_fraud_account ON fraud_alerts(account_id, detected_at);
 ```
 
-### 2.6 Validation: Flyway başarılı çalıştı mı?
+</details>
+
+### 2.4 Validation
+
+Uygulamayı `oracle` profile ile çalıştırıp `flyway_schema_history` tablosunda 5 başarılı kayıt olduğunu doğrula:
 
 ```bash
 mvn spring-boot:run -Dspring.profiles.active=oracle
 
-# Check
 docker exec -it banking-oracle sqlplus banking_dev/BankingDev2024!@//localhost:1521/XEPDB1
 SQL> SELECT version, description, success FROM flyway_schema_history ORDER BY installed_rank;
 ```
 
-5 migration başarılı olmalı.
+**Kontrol noktası:** V1-V5 dosyaları yazıldı, hepsi Flyway tarafından uygulandı, `flyway_schema_history`'de 5 success kaydı var. Defterine: PostgreSQL → Oracle'da değişen 8+ şeyi yaz (UUID handling, currency CHECK, INTERVAL partitioning, sequence vs IDENTITY vs SYS_GUID, vb.).
 
-### 2.7 Deliverables
+---
 
-- [ ] V1-V5 migration dosyaları yazıldı
-- [ ] Tüm migration'lar Flyway tarafından başarıyla uygulandı
-- [ ] `flyway_schema_history` tablosunda 5 success kaydı
-- [ ] Defterine: PostgreSQL → Oracle değişen 8+ şey (UUID handling, currency CHECK, INTERVAL partitioning, sequence vs IDENTITY vs SYS_GUID, vb.)
+## PL/SQL paketlerinin rolü
+
+Sonraki üç görevde business logic'in bir kısmını DB'ye taşıyorsun. Java tarafı `SimpleJdbcCall` ile package procedure'larını çağırır; paketler tablolar üzerinde çalışıp audit log yazar.
+
+```mermaid
+flowchart LR
+    APP["Spring Boot<br/>SimpleJdbcCall"] --> IP["interest_pkg<br/>faiz tahakkuk"]
+    APP --> EP["eod_recon_pkg<br/>mutabakat"]
+    APP --> FP["fraud_check_pkg<br/>fraud kurallari"]
+    IP --> DB["banking_dev<br/>tablolar ve audit"]
+    EP --> DB
+    FP --> DB
+```
+
+```admonish warning title="FORALL şart, WHEN OTHERS THEN NULL yasak"
+Üç paketin de iki demir kuralı var: <mark>bulk DML'i FORALL ile yaz, döngü içinde tek-satır INSERT/UPDATE yazma</mark> — aksi halde her satır ayrı SQL round-trip olur. Ve <mark>`WHEN OTHERS THEN NULL` asla yazma</mark>; her handler hatayı audit'e loglayıp `RAISE` etmeli, yoksa hatalar sessizce yutulur.
+```
 
 ---
 
 ## Görev 3 — `interest_pkg` PL/SQL package (1 gün)
 
+**Ne yapacaksın:** Günlük faiz tahakkukunu BULK COLLECT + FORALL pattern'iyle yapan bir package yazacaksın; compound + simple interest fonksiyonları ve idempotency içerir. **Neden:** EOD faiz milyonlarca hesapta koşar — satır satır DML kabul edilemez; bulk pattern Topic 4.4'ün merkezi tekniği.
+
 ### 3.1 Package specification
 
-`src/main/resources/db/plsql/interest_pkg_spec.sql`:
+Spec, public arayüzü tanımlar: sabitler, custom exception'lar (`PRAGMA EXCEPTION_INIT` ile ORA koduna bağlanır), record type'lar ve procedure/function imzaları.
+
+```sql
+CREATE OR REPLACE PACKAGE banking_dev.interest_pkg AS
+    DEFAULT_RATE CONSTANT NUMBER := 8.5;  -- Default annual rate
+    MIN_BALANCE_FOR_ACCRUAL CONSTANT NUMBER := 100;
+    
+    insufficient_balance EXCEPTION;
+    PRAGMA EXCEPTION_INIT(insufficient_balance, -20100);
+    
+    PROCEDURE accrue_daily(p_business_date IN DATE);
+    FUNCTION calculate_compound_interest(
+        p_balance NUMBER, p_rate NUMBER DEFAULT DEFAULT_RATE, p_days NUMBER DEFAULT 1
+    ) RETURN NUMBER;
+    -- ... simple_interest, get_accrual_summary
+END interest_pkg;
+/
+```
+
+<details>
+<summary>Tam kod: interest_pkg_spec.sql (~40 satır)</summary>
 
 ```sql
 CREATE OR REPLACE PACKAGE banking_dev.interest_pkg AS
@@ -348,9 +480,32 @@ END interest_pkg;
 /
 ```
 
-### 3.2 Package body
+</details>
 
-`interest_pkg_body.sql`:
+### 3.2 Package body — BULK COLLECT + FORALL
+
+Body'nin öğretici çekirdeği `accrue_daily`: cursor'ı `BULK COLLECT ... LIMIT 1000` ile parça parça çeker (memory kontrolü), her batch'i FORALL ile toplu insert/update eder. `LIMIT 1000` olmadan 1M satır tek seferde PGA'yı şişirir:
+
+```sql
+OPEN c;
+LOOP
+    FETCH c BULK COLLECT INTO v_accounts LIMIT 1000;
+    EXIT WHEN v_accounts.COUNT = 0;
+
+    -- Bulk insert interest postings (loop değil, FORALL)
+    FORALL i IN 1 .. v_accounts.COUNT
+        INSERT INTO interest_postings(account_id, business_date, amount, rate, days)
+        VALUES (v_accounts(i).id, p_business_date,
+                calculate_compound_interest(v_accounts(i).balance, DEFAULT_RATE, 1),
+                DEFAULT_RATE, 1);
+END LOOP;
+CLOSE c;
+```
+
+İki koruma kritik: future date reddi (`RAISE_APPLICATION_ERROR -20101`) ve <mark>aynı business_date için accrual yalnızca bir kez çalışır</mark> — mevcut posting varsa `-20102` fırlatır. Exception handler hatayı audit'e yazıp `RAISE` eder.
+
+<details>
+<summary>Tam kod: interest_pkg_body.sql (~170 satır)</summary>
 
 ```sql
 CREATE OR REPLACE PACKAGE BODY banking_dev.interest_pkg AS
@@ -525,9 +680,25 @@ END interest_pkg;
 /
 ```
 
+</details>
+
 ### 3.3 Java entegrasyonu
 
-`InterestRepository.java`:
+Java tarafı package'i `SimpleJdbcCall` ile çağırır. Kritik detay: ORA-20102'yi yakalayıp domain exception'a (`AlreadyProcessedException`) çevirmek — böylece idempotency ihlali temiz bir tipe map olur:
+
+```java
+try {
+    call.execute(params);
+} catch (DataAccessException e) {
+    if (e.getMessage().contains("ORA-20102")) {
+        throw new AlreadyProcessedException("Accrual already done for " + businessDate);
+    }
+    throw e;
+}
+```
+
+<details>
+<summary>Tam kod: InterestRepository.java (~50 satır)</summary>
 
 ```java
 @Repository
@@ -581,9 +752,14 @@ public class InterestRepository {
 }
 ```
 
+</details>
+
 ### 3.4 Test
 
-`InterestRepositoryIT.java`:
+4 integration test yaz: happy path (100 hesap tahakkuk), duplicate reddi, compound formül doğruluğu ve future date reddi. Compound testi SQL fonksiyonunun sonucunu bilinen bir değerle (10000 @ %8.5, 30 gün ≈ 70.04) karşılaştırır.
+
+<details>
+<summary>Tam kod: InterestRepositoryIT.java (~54 satır)</summary>
 
 ```java
 @SpringBootTest
@@ -641,20 +817,35 @@ class InterestRepositoryIT {
 }
 ```
 
-### 3.5 Deliverables
+</details>
 
-- [ ] `interest_pkg` spec + body deploy edildi
-- [ ] Java tarafından `SimpleJdbcCall` ile çağrılabiliyor
-- [ ] Idempotency: aynı businessDate'te iki kere çağrım → exception
-- [ ] Bulk insert + update FORALL ile (loop+DML değil)
-- [ ] 4 integration test geçiyor
-- [ ] Defterine: BULK COLLECT LIMIT 1000 ile memory yönetimi, autonomous transaction kararı (audit için kullansam mı?)
+**Kontrol noktası:** `interest_pkg` spec + body deploy edildi, Java'dan `SimpleJdbcCall` ile çağrılıyor, aynı businessDate iki kere → exception, bulk DML FORALL ile yapılıyor, 4 test geçiyor. Defterine: BULK COLLECT LIMIT 1000 ile memory yönetimi ve audit için autonomous transaction kullanıp kullanmama kararını yaz.
 
 ---
 
 ## Görev 4 — `eod_reconciliation_pkg` (1 gün)
 
-Topic 4.4'teki tam package'i implement et. Mismatch detection + bulk insert + audit pattern.
+**Ne yapacaksın:** Gün sonu mutabakat package'ini yazacaksın: her hesabın stored balance'ını `journal_lines`'tan hesaplanan authoritative balance ile karşılaştırıp mismatch'leri toplu kaydeder. **Neden:** Bankada "kayıtlı bakiye" ile "hareketlerden hesaplanan bakiye" ayrışabilir; mutabakat bu farkı yakalayan güvenlik ağıdır.
+
+Reconcile procedure'ün özü: bir subquery `journal_lines`'tan CREDIT-DEBIT toplamını hesaplar, stored balance ile eşitsizleri `BULK COLLECT` eder, ardından FORALL ile `reconciliation_mismatches`'e yazar. `DUP_VAL_ON_INDEX` handler'ı aynı günün iki kez reconcile edilmesini idempotent kılar.
+
+```sql
+SELECT account_id, stored_balance, calculated_balance
+BULK COLLECT INTO v_mismatches
+FROM ( /* stored vs SUM(CASE direction) from journal_lines */ )
+WHERE stored_balance != calculated_balance;
+
+FORALL i IN 1 .. v_mismatches.COUNT
+    INSERT INTO reconciliation_mismatches(business_date, account_id, ...)
+    VALUES (p_business_date, v_mismatches(i).account_id, ...);
+```
+
+```admonish tip title="Authoritative source kararı senin"
+Mutabakatta sormanı istediğim asıl soru: hangisi doğru — `accounts.balance_amount` mı yoksa `SUM(journal_lines)` mı? Double-entry sistemde journal genelde authoritative'dir (append-only, düzeltilmez); stored balance ise performans için tutulan türevdir. Kararını ve gerekçeni defterine yaz — mülakatta bu tartışma sorulur.
+```
+
+<details>
+<summary>Tam kod: eod_reconciliation_pkg (spec + body, ~113 satır)</summary>
 
 ```sql
 CREATE OR REPLACE PACKAGE banking_dev.eod_reconciliation_pkg AS
@@ -772,7 +963,14 @@ END eod_reconciliation_pkg;
 /
 ```
 
-### Test: Kasten boz, yakala
+</details>
+
+### Test: kasten boz, yakala
+
+Testin fikri basit ve güçlü: 5 hesabın stored balance'ını manuel boz, EOD recon çalıştır, tam 5 mismatch beklendiğini doğrula.
+
+<details>
+<summary>Tam kod: reconciliation testi (~20 satır)</summary>
 
 ```java
 @Test
@@ -797,19 +995,30 @@ void shouldDetectIntentionalBalanceMismatch() {
 }
 ```
 
-### Deliverables
+</details>
 
-- [ ] `eod_reconciliation_pkg` deploy
-- [ ] Kasten 5 mismatch yarat → package 5'ini de yakaladı mı?
-- [ ] Bulk insert FORALL pattern
-- [ ] Resolve workflow (operator manual fix)
-- [ ] Defterine: Authoritative source — accounts.balance_amount mı, SUM(journal_lines) mı? Senin kararın, gerekçesi
+**Kontrol noktası:** `eod_reconciliation_pkg` deploy edildi, kasten yaratılan 5 mismatch'in 5'i de yakalandı, bulk insert FORALL ile yapılıyor, resolve workflow (operator manuel fix) çalışıyor. Defterine: authoritative source kararını (stored vs calculated) gerekçesiyle yaz.
 
 ---
 
 ## Görev 5 — `fraud_check_pkg` (1 gün)
 
-4 fraud rule + window function pattern.
+**Ne yapacaksın:** Window/aggregate function pattern'iyle çalışan fraud kuralları yazacaksın — en az 2 kural: aynı hesaptan 1 dakikada 5+ işlem (high frequency) ve 24 saatte 10000+ kümülatif debit (large cumulative). **Neden:** Fraud detection Topic 4.3'teki aggregate + window function'ların gerçek dünya uygulaması; kurallar SQL'de en verimli ifade edilir.
+
+`rule_high_frequency` dakika penceresine göre grupla-say yapar, `HAVING COUNT(*) >= 5` ile tetiklenir ve severity'i işlem sayısına göre CASE ile derecelendirir. `NOT EXISTS` bloğu aynı alert'in tekrar üretilmesini engeller (idempotency):
+
+```sql
+INSERT INTO fraud_alerts(...)
+SELECT SYS_GUID(), account_id, 'HIGH_FREQUENCY',
+       CASE WHEN tx_count >= 10 THEN 'CRITICAL'
+            WHEN tx_count >= 7 THEN 'HIGH' ELSE 'MEDIUM' END,
+       LEAST(tx_count * 10, 100), 'Tx count: ' || tx_count
+FROM ( /* GROUP BY account_id, TRUNC(occurred_at,'MI') HAVING COUNT(*)>=5 */ )
+WHERE NOT EXISTS ( /* aynı hesapta zaten aktif HIGH_FREQUENCY alert */ );
+```
+
+<details>
+<summary>Tam kod: fraud_check_pkg (spec + body, ~100 satır)</summary>
 
 ```sql
 CREATE OR REPLACE PACKAGE banking_dev.fraud_check_pkg AS
@@ -914,23 +1123,26 @@ END;
 /
 ```
 
-### Test
+</details>
 
-100 transaction kasten yarat aynı karttan 1 dk içinde → rule_high_frequency yakalamalı.
+```admonish tip title="Fraud kuralının kaçınılmaz gerilimi"
+Fraud kuralını ne kadar agresif ayarlarsan false positive ↑ (masum müşteri bloklanır), ne kadar gevşetirsen kaçırılan dolandırıcılık ↑. Sihirli bir eşik yok; bu bir risk iştahı kararı. Kendi eşiklerinin (5 işlem/dk, 10000/24h) neden o değerde olduğunu defterine gerekçelendir.
+```
 
-### Deliverables
-
-- [ ] 2 rule implement (high frequency, large cumulative)
-- [ ] Window function pattern (Topic 4.3)
-- [ ] Idempotency NOT EXISTS check
-- [ ] Test: 100 tx 1dk → HIGH_FREQUENCY alert
-- [ ] Defterine: Banking fraud rules — kuralı ne kadar agresif ayarlarsan false positive ↑, kaçırılan dolandırıcılık ↓
+**Kontrol noktası:** 2 kural (high frequency + large cumulative) implement edildi, window/aggregate function pattern kullanıldı, `NOT EXISTS` idempotency check var. Test: aynı karttan 1 dakikada 100 işlem yarat → `HIGH_FREQUENCY` alert tetiklenmeli. Defterine: false positive vs missed fraud trade-off'unu yaz.
 
 ---
 
 ## Görev 6 — 1M-row reporting optimization (1 gün)
 
-### 6.1 Test data yükle
+**Ne yapacaksın:** 1M satırlık test verisi yükleyip yavaş bir raporlama sorgusunu üç adımda hızlandıracaksın: baseline (index'siz) → composite index → materialized view. **Neden:** "50x hızlanma" lafla değil, EXPLAIN PLAN + timing ile kanıtlanır; bu görev optimizasyonun ölçülebilir olduğunu öğretir.
+
+### 6.1 Test data + yavaş sorgu
+
+`CONNECT BY LEVEL` ile 100 hesap ve 1M journal line üret, `DBMS_STATS.GATHER_TABLE_STATS` ile istatistik topla (CBO'nun doğru plan üretmesi için şart). Hedef sorgu: müşterilerin son 30 günlük net hareketi.
+
+<details>
+<summary>Tam kod: test data yükleme + yavaş sorgu (~35 satır)</summary>
 
 ```sql
 -- 100 owner, 10000 transaction her birinde
@@ -952,12 +1164,8 @@ FROM DUAL CONNECT BY LEVEL <= 1000000;
 COMMIT;
 
 EXEC DBMS_STATS.GATHER_TABLE_STATS('BANKING_DEV', 'JOURNAL_LINES', cascade => TRUE);
-```
 
-### 6.2 Yavaş sorgu
-
-```sql
--- Müşterilerin son 30 günlük net hareketi
+-- Yavaş sorgu: müşterilerin son 30 günlük net hareketi
 SELECT 
     a.owner_id,
     SUM(CASE WHEN jl.direction = 'CREDIT' THEN jl.amount ELSE -jl.amount END) AS net_movement
@@ -968,30 +1176,15 @@ WHERE je.occurred_at > SYSDATE - 30
 GROUP BY a.owner_id;
 ```
 
-### 6.3 Adım 1: Baseline (index'siz)
+</details>
 
-```sql
-EXPLAIN PLAN FOR ... ;
-SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+### 6.2 Üç adımda hızlandır
 
-SET TIMING ON
--- run query
-SET TIMING OFF
-```
+Her adımda `EXPLAIN PLAN FOR ...` + `DBMS_XPLAN.DISPLAY` ile planı, `SET TIMING ON` ile süreyi ölç:
 
-**Bekle:** Full table scan, ~30-60 sn.
-
-### 6.4 Adım 2: Composite index
-
-```sql
-CREATE INDEX idx_jl_acc_date ON journal_lines(account_id, journal_occurred_at) LOCAL;
-```
-
-EXPLAIN PLAN tekrar. Plan'da `INDEX RANGE SCAN` görmeli. Sürede ölç.
-
-**Bekle:** 5-10 sn.
-
-### 6.5 Adım 3: Materialized view
+- **Adım 1 — Baseline:** Index yok. Plan'da **Full Table Scan** görürsün, ~30-60 sn.
+- **Adım 2 — Composite index:** `CREATE INDEX idx_jl_acc_date ON journal_lines(account_id, journal_occurred_at) LOCAL;` → plan'da **INDEX RANGE SCAN**, ~5-10 sn.
+- **Adım 3 — Materialized view:** `BUILD IMMEDIATE + REFRESH FAST ON DEMAND + ENABLE QUERY REWRITE` ile aylık özeti önceden hesapla; reporting endpoint MV'den okur, **<100ms**.
 
 ```sql
 CREATE MATERIALIZED VIEW mv_owner_monthly_summary
@@ -999,11 +1192,9 @@ BUILD IMMEDIATE
 REFRESH FAST ON DEMAND
 ENABLE QUERY REWRITE
 AS
-SELECT 
-    a.owner_id,
-    TRUNC(je.occurred_at, 'MONTH') AS month,
-    SUM(CASE WHEN jl.direction = 'CREDIT' THEN jl.amount ELSE -jl.amount END) AS net_amount,
-    COUNT(*) AS tx_count
+SELECT a.owner_id, TRUNC(je.occurred_at, 'MONTH') AS month,
+       SUM(CASE WHEN jl.direction = 'CREDIT' THEN jl.amount ELSE -jl.amount END) AS net_amount,
+       COUNT(*) AS tx_count
 FROM accounts a
 JOIN journal_lines jl ON jl.account_id = a.id
 JOIN journal_entries je ON je.id = jl.journal_entry_id
@@ -1012,9 +1203,7 @@ GROUP BY a.owner_id, TRUNC(je.occurred_at, 'MONTH');
 EXEC DBMS_MVIEW.REFRESH('mv_owner_monthly_summary', 'C');
 ```
 
-Reporting endpoint MV'den okur. **Bekle:** <100ms.
-
-### 6.6 Defterine — comparison table
+Defterine karşılaştırma tablosunu kendi ölçümlerinle doldur:
 
 | Adım | Plan | Süre |
 |---|---|---|
@@ -1022,11 +1211,48 @@ Reporting endpoint MV'den okur. **Bekle:** <100ms.
 | +Index | Index Range Scan | __ sn |
 | +MV | MView Query Rewrite | __ ms |
 
-Hızlanma çarpanı: ?x
+**Kontrol noktası:** Üç adımın da EXPLAIN PLAN'ı incelendi, tablo kendi ölçümlerinle dolu, hızlanma çarpanı 50x+. Defterine: en şaşırtıcı EXPLAIN bulgunu ve fast refresh için MV log'unun neden gerektiğini yaz.
 
 ---
 
 ## Görev 7 — SKIP LOCKED job worker (1 gün)
+
+**Ne yapacaksın:** `FOR UPDATE SKIP LOCKED` ile distributed job queue kuracak, 10 worker'ın 100 job'ı çakışmadan fair paylaştığını doğrulayacaksın. **Neden:** SKIP LOCKED, kilitli satırları atlayıp bir sonrakine geçerek worker'ların birbirini beklemeden aynı kuyruğu tüketmesini sağlar — modern job queue'ların temeli.
+
+Her worker aynı kuyruğa bakar ama farklı satırları kilitler; kimse kimseyi beklemez:
+
+```mermaid
+flowchart LR
+    Q["transfer_jobs<br/>PENDING kayitlar"] --> W1["Worker 1<br/>SKIP LOCKED"]
+    Q --> W2["Worker 2<br/>SKIP LOCKED"]
+    Q --> W3["Worker N<br/>SKIP LOCKED"]
+    W1 --> D["Farkli satirlar<br/>cakisma yok"]
+    W2 --> D
+    W3 --> D
+```
+
+Önce `transfer_jobs` tablosu (status + priority + partial index), sonra Java worker. Worker'ın kalbi: pending job'u `FOR UPDATE SKIP LOCKED FETCH FIRST 1 ROW ONLY` ile al, hemen `PROCESSING`'e çevir. <mark>SKIP LOCKED olmadan worker'lar aynı satırı işler</mark> ve duplicate processing doğar:
+
+```sql
+CREATE INDEX idx_jobs_pending 
+    ON BANKING_DEV.transfer_jobs(status, priority DESC, created_at) 
+    WHERE status = 'PENDING';
+```
+
+```java
+jdbc.query("""
+    SELECT id, payload FROM BANKING_DEV.transfer_jobs 
+    WHERE status = 'PENDING'
+    ORDER BY priority DESC, created_at
+    FOR UPDATE SKIP LOCKED 
+    FETCH FIRST 1 ROWS ONLY
+    """, rs -> { /* PROCESSING'e çevir, worker_id yaz */ });
+```
+
+Worker `REQUIRES_NEW` propagation kullanır — her job kendi transaction'ında alınıp işaretlenir, biri hata alsa diğerlerini etkilemez.
+
+<details>
+<summary>Tam kod: transfer_jobs tablosu + TransferJobWorker.java (~70 satır)</summary>
 
 ```sql
 CREATE TABLE BANKING_DEV.transfer_jobs (
@@ -1046,8 +1272,6 @@ CREATE INDEX idx_jobs_pending
     ON BANKING_DEV.transfer_jobs(status, priority DESC, created_at) 
     WHERE status = 'PENDING';
 ```
-
-Java worker:
 
 ```java
 @Component
@@ -1099,7 +1323,14 @@ public class TransferJobWorker {
 }
 ```
 
+</details>
+
 ### Test: 100 job + 10 worker
+
+10 worker thread aynı kuyruğu tüketir; test 100 job'ın hepsinin işlendiğini ve her worker'ın yaklaşık eşit pay (5-20 job) aldığını doğrular.
+
+<details>
+<summary>Tam kod: fair distribution testi (~40 satır)</summary>
 
 ```java
 @Test
@@ -1144,34 +1375,40 @@ void tenWorkersShouldDistributeJobsFairly() throws InterruptedException {
 }
 ```
 
+</details>
+
+**Kontrol noktası:** SKIP LOCKED job queue çalışıyor, 10 worker × 100 job fair distribute ediliyor, `REQUIRES_NEW` propagation kullanılıyor. Defterine: SKIP LOCKED ile distributed lock (`DBMS_LOCK`) arasındaki farkı yaz.
+
 ---
 
 ## Görev 8 — Kasten kırma: Deadlock + ORA-01555 (yarım gün)
 
-### Deadlock reproduction
+**Ne yapacaksın:** İki klasik Oracle hatasını kontrollü ortamda canlı reproduce edip fix edeceksin. **Neden:** Bankada deneyim = bug'la dans; production'da göreceğin bu hataları önce güvenli ortamda üretip teşhis etmek en hızlı öğrenme yolu.
 
-İki SQL session:
-
-```sql
--- Session 1
-SET AUTOCOMMIT OFF;
-SELECT * FROM accounts WHERE id = (SELECT id FROM accounts WHERE ROWNUM = 1) FOR UPDATE;
-
--- Session 2 (parallel)
-SELECT * FROM accounts WHERE id = (SELECT id FROM accounts WHERE ROWNUM = 2) FOR UPDATE;
-
--- Session 1
-SELECT * FROM accounts WHERE id = (SELECT id FROM accounts WHERE ROWNUM = 2) FOR UPDATE;
--- waits...
-
--- Session 2
-SELECT * FROM accounts WHERE id = (SELECT id FROM accounts WHERE ROWNUM = 1) FOR UPDATE;
--- ORA-00060: deadlock detected
+```admonish warning title="Bu görevleri izole ortamda koştur"
+Deadlock ve ORA-01555 reproduction'ları shared DB'de değil, kendi Docker XE instance'ında çalıştır. `ALTER SYSTEM SET UNDO_RETENTION` gibi sistem seviyesi değişiklikleri paylaşımlı ortamda yaparsan başkalarının işini bozarsın.
 ```
 
-**Defterine:** Hangi session ölür? Lock graph nasıl çözüldü?
+### Deadlock reproduction
+
+İki SQL session ters kilit sırasıyla döngüsel bekleme yaratır — Oracle bunu tespit edip bir kurbanı `ORA-00060` ile iptal eder. Kilit sırasını ters kur:
+
+```sql
+-- Session 1: A'yı kilitle, sonra B iste
+SELECT * FROM accounts WHERE id = (SELECT id FROM accounts WHERE ROWNUM = 1) FOR UPDATE;
+-- Session 2: B'yi kilitle, sonra A iste
+SELECT * FROM accounts WHERE id = (SELECT id FROM accounts WHERE ROWNUM = 2) FOR UPDATE;
+-- Session 1: B iste → bekler; Session 2: A iste → ORA-00060 deadlock detected
+```
+
+Defterine: hangi session ölür (Oracle kurbanı hangi kritere göre seçer) ve lock graph nasıl çözüldü? Fix: lock ordering — iki hesabı her zaman ID sırasıyla kilitle (Phase 2 mini-project'teki pattern).
 
 ### ORA-01555 reproduction
+
+`UNDO_RETENTION`'ı çok kısa ayarla, uzun bir cursor aç, paralel bir massive update ile undo segment'i overwrite ettir; cursor'ın sonraki fetch'i `ORA-01555 snapshot too old` atar:
+
+<details>
+<summary>Tam kod: ORA-01555 reproduction (~25 satır)</summary>
 
 ```sql
 -- as sys
@@ -1192,42 +1429,58 @@ BEGIN
 END;
 /
 
--- Session 2: massive update
+-- Session 2: massive update (undo segment doluyor)
 UPDATE journal_lines SET amount = amount + 1;
 COMMIT;
--- undo segment doluyor
 
 -- Session 1 fetch'i ORA-01555 atar
 ```
+
+</details>
+
+Defterine: ORA-01555'i önlemek için `UNDO_RETENTION` banking için ne kadar olmalı ve long-running query'lerle nasıl başa çıkılır?
+
+**Kontrol noktası:** Deadlock canlı görüldü (Oracle `v$lock` veya jstack ile), lock ordering fix uygulandı; ORA-01555 canlı reproduce edildi, `UNDO_RETENTION` ayarı düzeltildi.
+
+---
+
+## Kasten kırma görevleri özeti
+
+Bu beş görev bilerek bug'lı durum üretip düzelttiğini ispatlar:
+
+1. **Index'siz 1M-row scan** → süreyi ölç → index + MV ekle → 50x+ (Görev 6)
+2. **Deadlock** → ters lock order ile zorla → lock ordering fix (Görev 8)
+3. **ORA-01555** → kısa UNDO_RETENTION + long cursor → retention fix (Görev 8)
+4. **Worker race** → SKIP LOCKED olmadan duplicate processing reproduce → SKIP LOCKED fix (Görev 7)
+5. **MV refresh skip** → uzun query açıkken STALE behavior gör → fast refresh doğrula (Görev 6)
 
 ---
 
 ## Acceptance criteria
 
-- [ ] Oracle XE çalışıyor, Flyway migrations uygulandı
+Başlamadan bir kez oku, bitince tek tek işaretle.
+
+- [ ] Oracle XE çalışıyor, Flyway migration'lar uygulandı
 - [ ] `interest_pkg`, `eod_reconciliation_pkg`, `fraud_check_pkg` implement edildi
-- [ ] Java tarafı 3 package'i çağırıyor
+- [ ] Java tarafı 3 package'i `SimpleJdbcCall` ile çağırıyor
 - [ ] Idempotency: aynı businessDate iki kere accrual → exception
 - [ ] Reconciliation: kasten 5 mismatch → 5/5 detect
-- [ ] Fraud: 100 tx 1 dk → HIGH_FREQUENCY alert
-- [ ] 1M-row query optimization: baseline → +index → +MV (defterimde tablo)
+- [ ] Fraud: 100 tx 1 dk → `HIGH_FREQUENCY` alert
+- [ ] 1M-row query optimization: baseline → +index → +MV (defterde tablo)
 - [ ] SKIP LOCKED job queue: 10 worker × 100 job fair distribute
 - [ ] Deadlock canlı reproduction + jstack/Oracle session view'lar
 - [ ] ORA-01555 canlı reproduction + UNDO_RETENTION fix
-- [ ] Integration test'ler %95+ geçiyor
-- [ ] Defterimde 50+ defter notu
-
-## Kasten kırma görevleri özeti
-
-1. **Index'siz 1M-row** scan time ölç → index ekle → 50x+
-2. **Deadlock** ters lock order ile zorla → lock ordering fix
-3. **ORA-01555** kısa UNDO_RETENTION + long cursor → fix
-4. **Worker race** SKIP LOCKED olmadan → duplicate processing reproduce
-5. **MV refresh skip** uzun query açıkken → STALE behavior gör
+- [ ] Integration test'ler %95+ geçiyor, JaCoCo Phase 1 seviyesinin altında değil
+- [ ] Defterde 50+ not (aşağıdaki 15 soru dahil)
 
 ---
 
-## Claude-verify prompt
+## Pratik desteği
+
+Projeyi bitirdiğin an, aşağıdaki prompt'la Claude'a kapsamlı bir audit yaptır — kör noktalarını böyle yakalarsın.
+
+<details>
+<summary>Claude-verify prompt (mini-project bütünü için)</summary>
 
 ```
 Phase 4 mini-project'imi banking-grade kriterlere göre değerlendir. Eksiklerimi 
@@ -1283,22 +1536,38 @@ söyle, kod yazma:
 Her madde için PASS / FAIL / EKSIK işaretle.
 ```
 
+</details>
+
+<details>
+<summary>Defter notları (15 soru — kendi cümlelerinle cevapla)</summary>
+
+> 1. Oracle XE + Spring Boot bağlantısında karşılaştığım 3 sorun ve çözümler.
+> 2. PostgreSQL → Oracle migration: değişen 5+ syntax/feature.
+> 3. RAW(16) UUID vs SYS_GUID() vs sequence: hangi senaryoda hangisi.
+> 4. INTERVAL partitioning yokken vs varken accounts/journal tablosunun yıllık büyümesi.
+> 5. BULK COLLECT LIMIT 1000 ile loop+single DML arasındaki performans farkı (rakam).
+> 6. Autonomous transaction `interest_pkg`'de audit için kullansaydım hangi sorunu çözerdim.
+> 7. Compound interest formülünün SQL vs Java implementasyonu farkı.
+> 8. EOD reconciliation: authoritative source kararı (stored vs calculated) + sebep.
+> 9. Fraud rule false positive vs missed fraud trade-off banking için.
+> 10. 1M-row sorgusunda baseline → index → MV speedup factor (rakam).
+> 11. Materialized view fast refresh için log neden gerekli.
+> 12. SKIP LOCKED job queue ile distributed lock (DBMS_LOCK) farkı.
+> 13. Deadlock reproduction sırasında Oracle hangi session'ı öldürür ve kriterler.
+> 14. ORA-01555 önleme: UNDO_RETENTION ne kadar olmalı banking için.
+> 15. Çalıştırdığım EXPLAIN PLAN'da en şaşırtıcı bulgu.
+
+</details>
+
 ---
 
-## Defter notları (kendi cümlelerinle)
+```admonish success title="Proje Tamamlama Kriterleri"
+- Oracle XE Docker'da çalışıyor; Flyway 5 migration uygulandı; Spring Boot `oracle` profile ile bağlanıyor
+- `interest_pkg`, `eod_reconciliation_pkg`, `fraud_check_pkg` deploy edildi ve Java'dan `SimpleJdbcCall` ile çağrılıyor; idempotency (duplicate accrual → exception) ve kasten 5 mismatch → 5/5 detect doğrulandı
+- Fraud kuralı 100 tx / 1 dk senaryosunda `HIGH_FREQUENCY` alert üretiyor; tüm paketlerde exception handler + audit var, `WHEN OTHERS THEN NULL` yok
+- 1M-row sorgusu baseline → composite index → materialized view ile 50x+ hızlandı; timing tablosu defterde
+- SKIP LOCKED job queue 10 worker × 100 job'ı fair distribute ediyor; deadlock ve ORA-01555 canlı reproduce edilip fix edildi
+- Integration test'ler %95+ geçiyor, JaCoCo Phase 1 seviyesinin altına düşmedi; defterde 50+ not (15 soru dahil)
+```
 
-1. "Oracle XE + Spring Boot bağlantısında karşılaştığım 3 sorun ve çözümler: ____."
-2. "PostgreSQL → Oracle migration: değişen 5+ syntax/feature: ____."
-3. "RAW(16) UUID vs SYS_GUID() vs sequence: hangi senaryoda hangisi: ____."
-4. "INTERVAL partitioning yokken vs varken accounts/journal tablosunun yıllık büyümesi: ____."
-5. "BULK COLLECT LIMIT 1000 ile loop+single DML arasındaki performans farkı (rakam): ____."
-6. "Autonomous transaction `interest_pkg`'de audit için kullansaydım hangi sorunu çözerdim: ____."
-7. "Compound interest formülünün doğrulanmasında SQL formülün Java implementasyonu ile farkı: ____."
-8. "EOD reconciliation: authoritative source kararı (stored vs calculated) + sebep: ____."
-9. "Fraud rule false positive vs missed fraud trade-off banking için: ____."
-10. "1M-row sorgusunda baseline → index → MV speedup factor (rakam): ____."
-11. "Materialized view fast refresh için log neden gerekli: ____."
-12. "SKIP LOCKED job queue ile distributed lock (DBMS_LOCK) farkı: ____."
-13. "Deadlock reproduction sırasında Oracle hangi session'ı öldürür ve kriterler: ____."
-14. "ORA-01555 önleme: UNDO_RETENTION ne kadar olmalı banking için: ____."
-15. "Çalıştırdığım EXPLAIN PLAN'da en şaşırtıcı bulgu: ____."
+Hepsi onaylı → Faz 4 PHASE_TEST'e geç → [PHASE_TEST.md](../PHASE_TEST.md)

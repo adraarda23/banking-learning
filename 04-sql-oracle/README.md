@@ -1,4 +1,35 @@
+<div class="phase-cover-kicker">Dördüncü Bölüm</div>
+
 # Faz 4 — SQL & Oracle
+
+<div class="phase-cover-meta">
+<div><strong>Süre</strong> 3 hafta</div>
+<div><strong>Topic</strong> 6 konu + mini proje</div>
+<div><strong>Çıktı</strong> core-banking Oracle</div>
+<div><strong>Ön koşul</strong> Faz 1-3 tamamlandı</div>
+</div>
+
+```admonish info title="Bu fazda ne öğreneceksin?"
+TR bankalarının çekirdek sistemi Oracle üzerinde koşar; bu faz o dünyayı **banking-grade**
+seviyede öğretir: index internals, execution plan tuning, ileri SQL (window function, CTE,
+MERGE), PL/SQL, Oracle-specific özellikler (partitioning, MVCC, ORA-01555) ve DB concurrency.
+Mini projede `core-banking`'i PostgreSQL'den Oracle'a migrate edeceksin.
+```
+
+## Fazın haritası
+
+```mermaid
+flowchart TD
+    subgraph Temel["Hafta 1 — Sorgu Motoru"]
+        direction LR
+        A["4.1 Index Internals"] --> B["4.2 Execution Plan"] --> C["4.3 İleri SQL"]
+    end
+    subgraph Oracle["Hafta 2 — Oracle Dünyası"]
+        direction LR
+        D["4.4 PL/SQL"] --> E["4.5 Oracle-Specific"] --> F["4.6 DB Concurrency"]
+    end
+    Temel --> Oracle --> MP(["Mini Proje: Oracle Migration + Faz Testi"])
+```
 
 ## Bu fazın hedefi
 
@@ -97,4 +128,7 @@ Bu fazda iki paralel okuma yap:
 
 Topic 4.1 ve 4.2 (index + execution plan) **tüm fazın temeli**. Onları sıkı çalış. PL/SQL (4.4) **en uzun** topic, sabırlı ol — bankada bu tek başına bir lisans değeri taşıyor.
 
-→ Başla: [01-index-internals/README.md](01-index-internals/index.md)
+```admonish success title="Başla"
+İlk durak: [Topic 4.1 — Index Internals](01-index-internals/index.md).
+Bu faz sabırla derinleşilen bir dünya; index ve execution plan'ı sağlam atmadan PL/SQL'e koşma.
+```
