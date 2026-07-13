@@ -1,6 +1,10 @@
 # Faz 2 — PHASE TEST
 
-Faz 3'e geçmeden önce kendini sına. Hepsine "evet" diyebiliyorsan hazırsın.
+```admonish question title="Bu test ne işe yarar?"
+Faz 3'e geçmeden önce kendini sına. Bu bir sınav değil, **dürüstlük kontrolü**:
+işaretleyemediğin her madde, hangi topic'e geri döneceğini gösterir.
+Hepsine "evet" diyebiliyorsan hazırsın.
+```
 
 Faz 2 derindi: JPA internals, transactions, locking, N+1, connection pool, Hibernate performance. Bu konular **junior'dan mid-junior'a geçişin** ana göstergesi. Burayı sağlam atarsan Faz 3-9 arası çok daha hızlı geçer.
 
@@ -215,6 +219,8 @@ Faz 3 = **JVM-level concurrency**. Şu ana kadar DB-level concurrency (locking, 
 - Reactive intro (Project Reactor) — Phase 4'te detay
 - Banking pattern'ler: rate limiter, circuit breaker pattern (Resilience4j)
 
-İyi şanslar. Phase 2'nin temeli sağlam ise Faz 3 ufkunu çok genişletecek — banking'de high-throughput sistem nasıl yazılır soruya cevap verecek.
-
-**Faz 3'e geç** → [`../03-concurrency/`](../03-concurrency/)
+```admonish success title="Sonraki durak: Faz 3"
+İyi şanslar. Phase 2'nin temeli sağlam ise Faz 3 ufkunu çok genişletecek —
+banking'de high-throughput sistem nasıl yazılır sorusuna cevap verecek.
+→ [Faz 3 — Concurrency & JVM](../03-concurrency/index.md)
+```

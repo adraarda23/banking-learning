@@ -28,7 +28,15 @@
 - [x] Faz 1 metinleri pedagojik yeniden yazım (8 dosya, paralel agent): öğretmen akışı, wall-of-text yok, ~%20-30 kısalma, teknik içerik korundu
 - [x] Bonus düzeltmeler: mini-project ve error-handling'de iç içe fence hataları, geçersiz MockMvc assertion, typo
 
+## Revizyon turu 2 (format kararları, 2026-07-13)
+- [x] Vurgu katmanı: ilk tanımda kalın terim + bölüm başına ≤4 <mark>
+- [x] Mini task'ler → "Kendini Sına" Soru-Cevap (56 soru, katlanır cevaplar)
+- [x] >25 satır kod → öğreten parçalar + katlanır tam listing
+- [x] Test rehberi + Claude-verify → "Pratik yapmak istersen" katlanır eki
+- [x] Mini-project istisnası: proje karakteri korundu, sadece kod düzeni/katlama
+
 ## Review
-- Faz 1 pilot tamam: 34 diyagram, 70 kutu, tüm QA kontrolleri temiz (fence dengesi, mermaid etiket kuralları, link taraması)
-- Kullanıcı incelemesi bekleniyor → onay sonrası kalan 11 faza yayılım
+- Faz 1 pilot tamam: 34 diyagram, ~70 kutu, 56 soru, 93 katlanır kutu; QA temiz
+- Format standardı tasks/lessons.md + hafızada — kalan 11 faza aynı şablonla yayılacak
+- Kullanıcı incelemesi bekleniyor → onay sonrası yayılım
 - Canlı önizleme: `mdbook serve --port 3000` çalışıyor

@@ -1,12 +1,20 @@
 # Topic 2.3 — Transaction Management
 
+```admonish info title="Bu bölümde"
+- `@Transactional`'ın altındaki proxy mekanizması (JDK vs CGLIB) ve mülakat klasiği self-invocation tuzağı
+- 7 propagation davranışı — ezber değil, banking senaryolarıyla sebep-sonuç
+- 4 isolation level ve 3 read anomalisi: dirty read, non-repeatable read, phantom read
+- Rollback kuralları: checked vs unchecked exception, `rollbackFor`, `readOnly`, `timeout`
+- TR bank mülakatlarının bel kemiği: debit + credit + audit log + notification transfer tasarımı
+```
+
 ## Hedef
 
 `@Transactional` annotation'ının **iç mekanizmasını** (Spring proxy, AOP, advisor) öğrenmek. 7 propagation davranışını ve 4 isolation level'ı banking senaryoları üzerinden ezberlemeden — sebep–sonuç olarak kavramak. Self-invocation problemini, rollback default davranışını (checked vs unchecked), readOnly, timeout, rollbackFor / noRollbackFor parametrelerini hatasız anlatabilmek. Banking'in en sık mülakat sorusu olan "para transferi transaction tasarımı"nı (debit + credit + audit log, mixed propagation ile) hatasız çizebilmek.
 
 ## Süre
 
-Okuma: 2-2.5 saat • Mini task: 3 saat • Test: 1.5 saat • Toplam: ~7 saat
+Okuma: 2-2.5 saat • Kendini Sına: 45 dk • Pratik (opsiyonel): 3-4 saat • Toplam: ~3 saat (+ pratik)
 
 ## Önbilgi
 
@@ -21,42 +29,28 @@ Okuma: 2-2.5 saat • Mini task: 3 saat • Test: 1.5 saat • Toplam: ~7 saat
 
 ### 1. ACID — banking için ne demek
 
-Klasik tanımlar ezberlenir, banking pratiğine düşmez. Her birini somut bir senaryo ile zihne çakalım:
+Klasik ACID tanımları ezberlenir ama banking pratiğine düşmez; her harfi somut bir senaryoya bağlayalım.
 
-**Atomicity (atomik olma):** Bir işlem ya **tamamen** olur, ya **hiç** olmaz. Yarım kalmaz.
-
-Banking: Müşteri 100 TL'yi A hesabından B'ye gönderiyor. SQL açısından bu işlem **iki UPDATE'tir**:
+**Atomicity (atomik olma):** Bir işlem ya **tamamen** olur, ya hiç olmaz. Müşteri 100 TL'yi A hesabından B'ye gönderiyor — SQL açısından bu iki UPDATE'tir:
 
 ```sql
 UPDATE accounts SET balance = balance - 100 WHERE id = 'A';
 UPDATE accounts SET balance = balance + 100 WHERE id = 'B';
 ```
 
-İlk UPDATE çalıştı, ikincide DB bağlantısı koptu. Atomicity yoksa: A'dan 100 düştü, B'ye geçmedi → **100 TL buharlaştı**. Bu bir bankada **dakikalar içinde regülatör cezası**.
+İlk UPDATE çalıştı, ikincide DB bağlantısı koptu. Atomicity yoksa A'dan 100 düştü, B'ye geçmedi — 100 TL buharlaştı. Bu bir bankada dakikalar içinde regülatör cezası demektir; transaction ile ya iki UPDATE de commit olur, ya ikisi de rollback.
 
-Atomicity transaction ile sağlanır: ya iki UPDATE de commit, ya ikisi de rollback.
+**Consistency (tutarlılık):** Transaction veritabanını bir geçerli state'ten başka bir geçerli state'e götürür — tüm constraint'ler, foreign key'ler ve business invariant'lar yerinde kalır. Banking'deki karşılığı "toplam debit = toplam credit" double-entry invariant'ı: commit anında bu eşitlik bozulamaz. Consistency'i DB tek başına sağlamaz; CHECK constraint (DB) + domain logic (uygulama) + transaction (atomicity) birlikte çalışır.
 
-**Consistency (tutarlılık):** Transaction veritabanını **bir geçerli state'ten başka bir geçerli state'e** götürür. "Geçerli" = tüm constraint'ler, foreign key'ler, CHECK kuralları, business invariant'lar yerinde.
+**Isolation (yalıtım):** Eşzamanlı transaction'lar birbirini karıştırmaz; bir transaction'ın yarım kalmış değişiklikleri başkasına görünmez. A'nın bakiyesi 1000, aynı anda iki çekme talebi: T1 "800 çek", T2 "500 çek". Isolation yoksa ikisi de "1000 var" der, ikisi de geçer, bakiye -300'e düşer; isolation varsa biri "200 kaldı" görür ve reddeder.
 
-Banking: "Toplam debit = toplam credit" double-entry invariant'ı. Transaction commit ettiğinde bu eşitlik bozulamaz.
+**Durability (kalıcılık):** Commit edildi → diske yazıldı → güç gitse bile kayıp yok. WAL (write-ahead log) ile sağlanır — sistem 2 saat aşağıda kalsa bile commit ettiğin transfer hâlâ orada.
 
-Consistency'i DB tek başına sağlamaz — uygulama da yardım eder. CHECK constraint (DB) + domain logic (uygulama) + transaction (atomicity).
-
-**Isolation (yalıtım):** Eşzamanlı transaction'lar birbirini **karıştırmaz**. Bir transaction'ın yarım kalmış değişiklikleri başkasına görünmez (en azından dirty read yok).
-
-Banking: A'nın bakiyesi 1000. Aynı anda iki çekme talebi: T1 "800 çek", T2 "500 çek". Isolation yoksa: ikisi de "1000 var" der, ikisi de geçer, bakiye -300'e düşer. Isolation: biri görür "200 kaldı", reddeder.
-
-**Durability (kalıcılık):** Commit edildi → diske yazıldı → güç gitse bile **kayıp yok**. WAL (write-ahead log) ile sağlanır.
-
-Banking: Sistem 2 saat aşağıdaydı, ama commit ettiğin transfer hâlâ orada. Aksi halde "transfer attım ama yok!" şikayetleri.
-
-**Banking pratiği:** Atomicity ve Isolation günlük tasarımda en çok düşündüğün iki harf. Durability genelde DB'nin işi. Consistency hem DB hem uygulama. Mülakatta "ACID'i anlat" sorusunun ardından gelen "bir banking senaryosu ile" cümlesini bekle.
-
----
+Banking pratiğinde günlük tasarımda en çok Atomicity ve Isolation'ı düşünürsün; Durability genelde DB'nin işi, Consistency hem DB hem uygulama. Mülakatta "ACID'i anlat" sorusunun ardından gelen "bir banking senaryosu ile" cümlesini bekle.
 
 ### 2. JDBC transaction — Spring'in altında ne var
 
-`@Transactional` sihir gibi durur. Altında **JDBC `Connection`** var. Klasik bir transaction:
+`@Transactional` sihir gibi durur ama altında sıradan bir **JDBC `Connection`** var; sihri çözmenin ilk adımı bu katmanı görmek. Klasik bir transaction:
 
 ```java
 Connection conn = dataSource.getConnection();
@@ -81,21 +75,32 @@ try {
 }
 ```
 
-Bu **çalışır** ama her servis method'una yazmak istemiyoruz. Spring `@Transactional` bunun **AOP wrapper**'ıdır.
-
----
+Bu çalışır ama her servis method'una bu boilerplate'i yazmak istemiyoruz. Spring `@Transactional` tam olarak bunun **AOP wrapper**'ıdır.
 
 ### 3. Spring `@Transactional` proxy mekanizması
 
-Spring `@Transactional` annotation'ı işaretli class veya method için bir **proxy** üretir. Proxy ilgili method'u sarar:
+Neden umursamalısın: proxy'nin nasıl çalıştığını bilmeyen, bir sonraki bölümdeki self-invocation tuzağına production'da düşer. Spring, `@Transactional` işaretli class için bir **proxy** üretir; proxy ilgili method'u begin–commit/rollback döngüsüyle sarar:
 
+```mermaid
+sequenceDiagram
+    participant C as Caller
+    participant P as Spring Proxy
+    participant T as TransactionManager
+    participant S as Gerçek Bean
+    C->>P: transfer çağrısı
+    P->>T: TX başlat
+    P->>S: gerçek method çalışır
+    alt başarılı dönüş
+        P->>T: commit
+    else exception fırladı
+        P->>T: rollback
+    end
+    P-->>C: sonuç veya exception
 ```
-[caller] → [proxy] → (begin tx) → [gerçek bean.method()] → (commit/rollback) → [caller]
-```
 
-İki proxy türü:
+İki proxy türü var:
 
-**JDK dynamic proxy:** Class bir interface implement ediyorsa, Spring **interface bazlı proxy** üretir. `java.lang.reflect.Proxy` kullanır. Proxy nesnesi interface'i implement eder; her method çağrısı bir `InvocationHandler`'a düşer.
+**JDK dynamic proxy:** Class bir interface implement ediyorsa Spring **interface bazlı proxy** üretir (`java.lang.reflect.Proxy`). Proxy nesnesi interface'i implement eder; her method çağrısı bir `InvocationHandler`'a düşer.
 
 ```java
 public interface TransferService { Transfer execute(...); }
@@ -110,7 +115,7 @@ class TransferServiceImpl implements TransferService {
 // Bean container'da TransferService olarak kayıtlı
 ```
 
-**CGLIB proxy:** Class interface implement etmiyorsa, Spring **subclass proxy** üretir. CGLIB (Code Generation Library) ile gerçek class'tan extend eden bir subclass yaratır, method'ları override eder.
+**CGLIB proxy:** Class interface implement etmiyorsa Spring **subclass proxy** üretir — CGLIB ile gerçek class'tan extend eden bir subclass yaratıp method'ları override eder.
 
 ```java
 @Service
@@ -122,15 +127,13 @@ class TransferService {                          // interface yok
 // Spring CGLIB ile: TransferService$$EnhancerBySpringCGLIB$$xxx extends TransferService
 ```
 
-Spring Boot 2.6+ **default CGLIB** — interface olsa bile. Sebep: AOP davranışı her zaman tutarlı olsun. `spring.aop.proxy-target-class=false` ile JDK proxy'e döndürebilirsin.
+Spring Boot 2.6+ default olarak CGLIB kullanır — interface olsa bile, AOP davranışı her zaman tutarlı olsun diye. `spring.aop.proxy-target-class=false` ile JDK proxy'e döndürebilirsin.
 
-**Önemli sonuç:** Proxy aslında **dışarıdaki çağrıları** dinler. **İçeriden** (aynı bean'in başka method'u) çağrılan method proxy'i bypass eder.
-
----
+Bu mekanizmanın en önemli sonucu: <mark>proxy sadece dışarıdan gelen çağrıları görür; aynı bean içinden `this.` üzerinden yapılan çağrı `@Transactional`'ı yok sayar</mark>. Sıradaki konu tam olarak bu tuzak.
 
 ### 4. Self-invocation problemi (mülakat klasiği)
 
-Şu kod ÇALIŞMAZ:
+Bu problem o kadar sık soruluyor ki neredeyse her TR bank mülakatında bir varyantı çıkar. Şu kod ÇALIŞMAZ:
 
 ```java
 @Service
@@ -153,11 +156,23 @@ class AccountService {
 }
 ```
 
-`doTransferAndAudit` çağrıldığında **bir TX başlamaz**. `executeTransfer` ve `writeAuditLog` `this.` üzerinden çağrıldığı için proxy devreye girmez.
+`doTransferAndAudit` çağrıldığında bir TX başlamaz. Sebep: içerideki `executeTransfer()` çağrısı proxy nesnesine değil, gerçek `this`'e gider — proxy ortadan kayboldu, `@Transactional` ignored:
 
-**Sebep:** `doTransferAndAudit` içindeki `executeTransfer()` çağrısı **proxy nesnesine değil, gerçek `this`'e** gider. Proxy ortadan kayboldu → `@Transactional` ignored.
+```mermaid
+sequenceDiagram
+    participant C as Caller
+    participant P as Proxy
+    participant S as AccountService
+    C->>P: doTransferAndAudit
+    Note over P: Bu method'da @Transactional yok, TX açılmaz
+    P->>S: gerçek nesneye delege
+    S->>S: this.executeTransfer
+    Note over S: Çağrı proxy'ye uğramadı, @Transactional yok sayıldı
+```
 
-**Mülakat sorusu:** "Aynı service'in iki method'u var, biri diğerini çağırıyor, ikisi de `@Transactional` — niye ikinci method yeni TX açmıyor?" → Self-invocation.
+```admonish warning title="Dikkat"
+Mülakat sorusu: "Aynı service'in iki method'u var, biri diğerini çağırıyor, ikisi de `@Transactional` — niye ikinci method yeni TX açmıyor?" Cevap tek kelime: self-invocation. Proxy sadece bean sınırından geçen çağrıları sarabilir.
+```
 
 **Çözümler:**
 
@@ -176,7 +191,7 @@ class TransferOrchestrator {
 }
 ```
 
-**B — Self-injection:**
+**B — Self-injection:** Proxy'i kendine inject et; `@Lazy` circular dependency'i bypass için. Hack gibi durur ama meşrudur.
 
 ```java
 @Service
@@ -199,9 +214,7 @@ class AccountService {
 }
 ```
 
-`@Lazy` circular dependency'i bypass için. Hack gibi durur ama meşrudur.
-
-**C — `AopContext.currentProxy()`:**
+**C — `AopContext.currentProxy()`:** Çalışır ama okunmaz, statik bağımlılık doğurur. Tercih etme.
 
 ```java
 @EnableAspectJAutoProxy(exposeProxy = true)
@@ -211,15 +224,13 @@ public class Config {}
 ((AccountService) AopContext.currentProxy()).executeTransfer(...);
 ```
 
-Çalışır ama okunmaz, statik bağımlılık doğurur. **Tercih etme**.
+**D — AspectJ load-time weaving:** Proxy'leri tamamen unut, bytecode-level weaving. Çok güçlü ama kurulum yorucu; banking'de yaygın değil.
 
-**D — AspectJ load-time weaving:** Proxy'leri tamamen unut, AspectJ ile bytecode-level weaving. Çok güçlü ama kurulum yorucu. Banking'de yaygın değil.
-
-**Banking pratiği:** A varyantı her zaman tercih. Transfer orchestrator + transfer service + audit service ayrımı zaten DDD ile uyumlu.
-
----
+Banking pratiği: A varyantı her zaman tercih. Transfer orchestrator + transfer service + audit service ayrımı zaten DDD ile uyumlu.
 
 ### 5. `@Transactional` annotation'ının tüm parametreleri
+
+Annotation'ın tam yüzeyini bir kez görüp, sonra her parametreyi tek tek deşeceğiz:
 
 ```java
 @Transactional(
@@ -234,21 +245,15 @@ public class Config {}
 public void method() { ... }
 ```
 
-Şimdi her birini tek tek deşeceğiz.
-
----
-
 ### 6. Propagation — 7 davranış
 
-`Propagation` = bir method çağrıldığında **mevcut transaction ile ne yapsın**.
+**Propagation** = bir method çağrıldığında mevcut transaction ile ne yapacağı. Yanlış propagation seçimi banking'de "audit log kayboldu" veya "connection pool tükendi" olarak geri döner — o yüzden 7 davranışın hepsini sebep-sonuç olarak bileceksin.
 
 #### 6.1. `REQUIRED` (default)
 
 > "Mevcut TX varsa katıl, yoksa yeni başlat."
 
-%90 senaryoda bunu kullanırsın. Service method'u TX açar, başka bir service'i çağırınca o da aynı TX'e katılır, hepsi atomik olur.
-
-Banking örneği — transfer:
+%90 senaryoda bunu kullanırsın: service method'u TX açar, çağırdığı diğer service'ler aynı TX'e katılır, hepsi atomik olur.
 
 ```java
 @Service
@@ -272,15 +277,13 @@ class AccountService {
 }
 ```
 
-**Logical vs Physical TX:** REQUIRED'da iç method "logical transaction"a katılır ama physical olarak **tek TX vardır**. Rollback davranışı: iç method'da exception fırlarsa **dış TX'i de rollback only işaretler**. Dış katman commit denerse `UnexpectedRollbackException` patlar.
+**Logical vs physical TX** ayrımına dikkat: REQUIRED'da iç method "logical transaction"a katılır ama physical olarak tek TX vardır. İç method'da exception fırlarsa dış TX de rollback-only işaretlenir; dış katman yine de commit denerse `UnexpectedRollbackException` patlar.
 
 #### 6.2. `REQUIRES_NEW`
 
 > "Mevcut TX'i askıya al, yeni bir bağımsız TX başlat, bitince eskisini devam ettir."
 
-**İki ayrı physical TX**. İçerideki TX commit veya rollback olabilir — dışarıdaki etkilenmez.
-
-Banking örneği — audit log:
+İki ayrı physical TX oluşur: içerideki commit veya rollback olabilir, dışarıdaki etkilenmez. Banking'in klasik senaryosu audit log — transfer rollback olsa bile regülatör için log yazılı kalmalı:
 
 ```java
 @Service
@@ -290,12 +293,9 @@ class TransferService {
     public void transfer(...) {
         debit(from, amount);
         credit(to, amount);
-        
-        // BURADA bir hata olursa transfer rollback olmalı
-        // AMA audit log YAZILMALI (regülatör için)
+        // Hata olursa transfer rollback olmalı
+        // AMA audit log YAZILMALI — regülatör için
         auditService.logAttempt(...);     // REQUIRES_NEW
-        
-        // ...
     }
 }
 
@@ -303,30 +303,43 @@ class TransferService {
 class AuditService {
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void logAttempt(...) {
-        auditRepo.save(...);     // bağımsız TX, ana TX rollback olsa da yazılı kalır
+        auditRepo.save(...);   // bağımsız TX, ana TX rollback olsa da kalır
     }
 }
 ```
 
-**Mülakat sorusu (klasik):** "Transfer başarısız olduğunda audit log da rollback oluyor — neden, nasıl düzeltirsin?" Cevap: `REQUIRES_NEW`.
+Akışı zaman çizgisinde gör — TX1 rollback olsa bile TX2 çoktan commit olmuştur:
 
-**Tuzaklar:**
+```mermaid
+sequenceDiagram
+    participant TS as TransferService
+    participant AS as AuditService
+    participant DB as PostgreSQL
+    Note over TS: TX1 başlar — REQUIRED
+    TS->>DB: debit ve credit UPDATE
+    TS->>AS: logAttempt çağrısı
+    Note over AS: TX1 askıya alınır, TX2 başlar — REQUIRES_NEW
+    AS->>DB: audit INSERT
+    Note over AS: TX2 commit, log artık kalıcı
+    Note over TS: TX1 devam eder, exception fırlar
+    TS->>DB: TX1 rollback, debit ve credit geri alınır
+```
 
-- REQUIRES_NEW her seferinde **yeni bir DB bağlantısı** alır. İç içe çok sayıda REQUIRES_NEW = connection pool tükenir, deadlock.
-- Dış TX hâlâ bekliyor, içeride yeni TX başlattın → connection pool'dan 2 connection tutuyorsun. Pool size 2 ise hemen blok.
-- İç TX commit olur ama dış TX rollback. **Audit log yazıldı, transfer atılmadı** durumu — bilinçli olmalı.
+Mülakat sorusu (klasik): "Transfer başarısız olduğunda audit log da rollback oluyor — neden, nasıl düzeltirsin?" Cevap: `REQUIRES_NEW`.
 
-**Banking pratiği:**
+```admonish warning title="REQUIRES_NEW tuzakları"
+- Her REQUIRES_NEW **yeni bir DB bağlantısı** alır. İç içe çok sayıda REQUIRES_NEW = connection pool tükenir, deadlock.
+- Dış TX beklerken içeride yeni TX başlattın → pool'dan aynı anda 2 connection tutuyorsun. Pool size 2 ise hemen blok.
+- İç TX commit olur ama dış TX rollback olabilir: "audit log yazıldı, transfer atılmadı" durumu — bilinçli bir karar olmalı.
+```
 
-- Audit log: REQUIRES_NEW (her zaman yazılmalı, dış TX'i bilmiyor)
-- Failed transaction attempt log: REQUIRES_NEW (rollback olacak ama log kalsın)
-- Notification (SMS, email kuyruğa atma): REQUIRES_NEW veya event-based async (Phase 4)
+Banking pratiği: audit log ve failed-attempt log için REQUIRES_NEW; notification (SMS, email kuyruğa atma) için REQUIRES_NEW veya event-based async (Phase 4).
 
 #### 6.3. `NESTED`
 
 > "Aynı TX içinde bir **savepoint** oluştur. Hata olursa savepoint'e kadar rollback, dış TX devam edebilir."
 
-JDBC `Connection.setSavepoint()` kullanır. **DB'nin savepoint desteği gerekir** (PostgreSQL, MySQL InnoDB, Oracle var; bazı eski DB'lerde yok).
+JDBC `Connection.setSavepoint()` kullanır; DB'nin savepoint desteği gerekir (PostgreSQL, MySQL InnoDB, Oracle var). Banking senaryosu: 1000 transferlik batch işliyorsun, birinde hesap kapalı → o tek transfer rollback, kalan 999 devam:
 
 ```java
 @Service
@@ -353,21 +366,18 @@ class BatchPaymentService {
 }
 ```
 
-Banking senaryosu: 1000 transferlik batch işliyorsun. Birinde hesap kapalı → o tek transfer rollback, kalan 999'u devam et.
+REQUIRES_NEW ile farkı:
 
-**REQUIRES_NEW ile farkı:**
-- REQUIRES_NEW: iki ayrı physical TX, iki ayrı connection
-- NESTED: tek physical TX, savepoint
-- REQUIRES_NEW dış commit'ten bağımsız iç commit olur
-- NESTED iç commit hâlâ dış commit'e bağlı — dış rollback → iç de rollback
+- REQUIRES_NEW: iki ayrı physical TX, iki ayrı connection; iç commit dış commit'ten bağımsız
+- NESTED: tek physical TX, savepoint; iç commit hâlâ dışa bağlı — dış rollback → iç de rollback
 
-Hibernate'le NESTED **tüm DB'lerde sorunsuz** çalışmaz. Hibernate 6 ile destek daha iyi ama yine de test et.
+Hibernate'le NESTED tüm DB'lerde sorunsuz çalışmaz; Hibernate 6 ile destek daha iyi ama yine de test et.
 
 #### 6.4. `MANDATORY`
 
-> "Mevcut TX varsa katıl, **yoksa exception fırlat**."
+> "Mevcut TX varsa katıl, yoksa **exception fırlat**."
 
-Banking örneği: "Bu method sadece bir TX içinde çalışabilir, doğrudan çağırırsan hata":
+API'yı sağlamlaştırmak için: "bu method sadece bir TX içinde çalışabilir" sözleşmesini runtime'da zorlar (`IllegalTransactionStateException`).
 
 ```java
 @Transactional(propagation = Propagation.MANDATORY)
@@ -377,15 +387,11 @@ public void postJournalLine(JournalLine line) {
 }
 ```
 
-`IllegalTransactionStateException` fırlatır.
-
-**Pratik:** API'yı sağlamlaştırmak için. Helper service'ler her zaman bir caller TX bekler.
-
 #### 6.5. `SUPPORTS`
 
 > "TX varsa katıl, yoksa TX'siz çalış."
 
-Genelde okuma yapan helper'lar için:
+Genelde okuma yapan esnek helper'lar için; banking'de nadiren ihtiyaç olur, daha çok altyapı kodu.
 
 ```java
 @Transactional(propagation = Propagation.SUPPORTS, readOnly = true)
@@ -394,13 +400,11 @@ public Optional<Account> findById(AccountId id) {
 }
 ```
 
-Banking'de nadiren ihtiyaç olur. Daha çok altyapı kodu.
-
 #### 6.6. `NOT_SUPPORTED`
 
 > "Mevcut TX'i askıya al, TX'siz çalış, bitince eskiyi devam ettir."
 
-Banking örneği — heavy reporting:
+TX içinde uzun bir query çalıştırmak isolation/lock perspektifinden problemlidir; heavy reporting'i TX dışına almak için kullanılır:
 
 ```java
 @Service
@@ -408,27 +412,23 @@ class ReportingService {
     
     @Transactional   // ana TX
     public void generateReport(...) {
-        // ...
         var summary = heavyAggregation();    // çok yavaş, lock tutmayalım
     }
     
     @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public Summary heavyAggregation() {
-        // TX dışında — uzun süre lock tutmaz
-        // ... 30 saniyelik query
+        // TX dışında — 30 saniyelik query lock tutmaz
     }
 }
 ```
 
-TX içindeyken uzun bir query çalıştırmak isolation/lock perspektifinden problemli. Bazen okuma için TX'siz çalıştırmak istenir.
-
-**Tuzak:** İçeride yine DB call yapacaksın, autoCommit mode'da çalışacak. Repeatable read garantisi yok.
+Tuzak: içeride DB call'lar autoCommit mode'da çalışır — repeatable read garantisi yok.
 
 #### 6.7. `NEVER`
 
 > "TX varsa **exception fırlat**, yoksa TX'siz çalış."
 
-Çok nadiren — kesin TX dışı çalışması gereken (örn. native API'ye birebir geçen) kod için.
+Kesin TX dışı çalışması gereken kod için — banking'de external call koruması:
 
 ```java
 @Transactional(propagation = Propagation.NEVER)
@@ -437,11 +437,9 @@ public void sendToExternalSystem(...) {
 }
 ```
 
-Banking pratiği: External HTTP call'ları zaten TX dışında yapmalıyız (lock tutarak HTTP bekleme = felaket). NEVER ile compile-time-ish (runtime) garanti.
+External HTTP call'ları zaten TX dışında yapmalıyız (lock tutarak HTTP bekleme = felaket); NEVER bunu runtime garantisine çevirir.
 
----
-
-### Propagation özet tablosu
+#### Propagation özet tablosu
 
 | Propagation | TX var | TX yok | Banking use case |
 |---|---|---|---|
@@ -453,13 +451,9 @@ Banking pratiği: External HTTP call'ları zaten TX dışında yapmalıyız (loc
 | NOT_SUPPORTED | Askıya al + TX'siz | TX'siz | Heavy read TX dışı |
 | NEVER | Exception | TX'siz | External call koruma |
 
----
-
 ### 7. Isolation level — 4 standart + DEFAULT
 
-`Isolation` = eşzamanlı transaction'lar birbirini ne kadar görür.
-
-ANSI SQL 4 isolation level tanımlar. Her biri belirli "read phenomenon"ları engeller:
+**Isolation level** = eşzamanlı transaction'ların birbirini ne kadar gördüğü. ANSI SQL 4 level tanımlar; her biri belirli "read phenomenon"ları engeller. Önce anomalileri tanı:
 
 | Phenomenon | Açıklama | Banking örneği |
 |---|---|---|
@@ -482,15 +476,13 @@ Lost update ve write skew gibi başkaları da var; bunları locking topic'inde g
 
 #### Banking için pratik seçim
 
-**PostgreSQL default: READ_COMMITTED.** Çoğu banking servisi bu seviyede çalışır.
+<mark>Isolation level yükseltmek anomali riskini azaltır ama concurrency ve performans maliyeti getirir</mark> — seçim her zaman bu takasın bilinçli kararıdır.
 
-- Dirty read engellenir (zaten istemeyiz)
-- Aynı TX'te aynı satır iki kez okunca farklı değer **gelebilir** — ama transfer kısa sürdüğü için pratikte sorun olmaz
-- Phantom okuyabilirsin — reporting query'lerinde dikkat
+**PostgreSQL default: READ_COMMITTED.** Çoğu banking servisi bu seviyede çalışır: dirty read zaten engellenir; aynı TX'te aynı satırı iki kez okuyunca farklı değer gelebilir ama transfer kısa sürdüğü için pratikte sorun olmaz; phantom okuyabilirsin — reporting query'lerinde dikkat.
 
-**REPEATABLE_READ ne zaman:** Bir TX içinde aynı veriyi birden fazla kez okuyup karar veriyorsan. Örn. "hesap bakiyesini oku, hesapla, tekrar oku, karşılaştır". Veya snapshot bazlı reporting.
+**REPEATABLE_READ ne zaman:** Bir TX içinde aynı veriyi birden fazla kez okuyup karar veriyorsan ("bakiyeyi oku, hesapla, tekrar oku, karşılaştır") veya snapshot bazlı reporting'de.
 
-**SERIALIZABLE ne zaman:** En sıkı. Concurrent transaction'lar **birbirine yol verir** veya **serialization failure** alır. Performans düşer. PostgreSQL'de SSI (Serializable Snapshot Isolation) implementasyonu çok zekidir. Banking'in en kritik para hareketlerinde nadiren kullanılır — genelde locking ile çözüm tercih.
+**SERIALIZABLE ne zaman:** En sıkı seviye — concurrent transaction'lar birbirine yol verir veya **serialization failure** alır, performans düşer. PostgreSQL'in SSI implementasyonu çok zekidir; yine de banking'in kritik para hareketlerinde nadiren kullanılır, genelde locking ile çözüm tercih edilir.
 
 ```java
 @Transactional(isolation = Isolation.SERIALIZABLE)
@@ -499,9 +491,9 @@ public void criticalReconciliation() {
 }
 ```
 
-**Mülakat sorusu (klasik):** "REPEATABLE_READ ile READ_COMMITTED arasında ne fark var?" → Non-repeatable read'i engelleyip engellememesi.
+Mülakat sorusu (klasik): "REPEATABLE_READ ile READ_COMMITTED arasında ne fark var?" → Non-repeatable read'i engelleyip engellememesi.
 
-**Mülakat sorusu (zor):** "PostgreSQL'de REPEATABLE_READ kullanıyorsun. İki TX aynı satırı UPDATE etmeye çalışıyor. Ne olur?" → İkinci TX **serialization failure** alır (`could not serialize access due to concurrent update`), retry gerekir. (Bu topic 2.4'te detaylanacak.)
+Mülakat sorusu (zor): "PostgreSQL'de REPEATABLE_READ kullanıyorsun. İki TX aynı satırı UPDATE etmeye çalışıyor. Ne olur?" → İkinci TX serialization failure alır (`could not serialize access due to concurrent update`), retry gerekir. (Topic 2.4'te detaylanacak.)
 
 #### Isolation level set ederken dikkat
 
@@ -510,33 +502,30 @@ public void criticalReconciliation() {
 public void method() { ... }
 ```
 
-- Spring her TX başında `connection.setTransactionIsolation(...)` çağırır.
-- Bağlantı pool'a iade edildiğinde isolation **eski seviyeye dönmez** (default PostgreSQL JDBC driver). Sonraki TX bu connection'ı alırsa **yanlış isolation'la** çalışır. HikariCP'nin `connection.setTransactionIsolation`'ı bağlantı iadesinde reset etmesini sağla:
+Spring her TX başında `connection.setTransactionIsolation(...)` çağırır. Ama bağlantı pool'a iade edildiğinde isolation eski seviyeye dönmez (default PostgreSQL JDBC driver) — sonraki TX bu connection'ı alırsa yanlış isolation'la çalışır.
+
+```admonish tip title="İpucu"
+HikariCP'ye connection-level default isolation ver ki pool'a dönen bağlantılar öngörülebilir seviyede kalsın. Yeni Spring/Hibernate sürümlerinde `hibernate.connection.handling_mode` ile de kontrol edebilirsin.
+```
 
 ```yaml
 spring.datasource.hikari.transaction-isolation: TRANSACTION_READ_COMMITTED  # connection-level default
 ```
 
-Veya yeni Spring/Hibernate sürümlerinde `hibernate.connection.handling_mode` ile kontrollü.
-
----
-
 ### 8. `readOnly = true` — performans ve niyet
+
+Sadece okuyan bir method neden TX parametresi taşısın? Çünkü **readOnly** hem performans hem niyet beyanıdır:
 
 ```java
 @Transactional(readOnly = true)
 public Account findById(AccountId id) { ... }
 ```
 
-İki etkisi var:
+**A — Hibernate optimizasyonu:** Persistence context dirty checking yapmaz, snapshot tutmaz, flush atılmaz — memory + CPU tasarrufu.
 
-**A — Hibernate optimizasyonu:** Persistence context **dirty checking yapmaz**. Snapshot tutmaz. Flush atılmaz. Memory + CPU tasarrufu.
+**B — DB driver hint:** Bazı driver'lar `Connection.setReadOnly(true)` çağırır; DB bunu hint olarak alabilir (Oracle, PostgreSQL). Read replica routing yapılıyorsa (Phase 9) replica'ya yönlendirme yapılır.
 
-**B — DB driver hint:** Bazı driver'lar `Connection.setReadOnly(true)` çağrısı yapar. DB hint olarak alabilir (Oracle, PostgreSQL). Read replica routing yapılıyorsa (Phase 9) replica'ya yönlendirme yapılır.
-
-**Tuzak — readOnly gerçek bir lock değil:** Yanlışlıkla yazma yaparsan exception almazsın (Hibernate bazen). Sadece flush atmaz. Banking'de niyet beyanı olarak değerli.
-
-**Banking pratiği:**
+Tuzak: readOnly gerçek bir lock değil. Yanlışlıkla yazma yaparsan exception almayabilirsin (Hibernate bazen) — sadece flush atılmaz. Banking'de asıl değeri niyet beyanı olmasıdır.
 
 ```java
 @Service
@@ -553,36 +542,38 @@ public class AccountReportingService {
 }
 ```
 
-Class-level read-only default, write için method-level override. Çok temiz.
-
----
+Class-level read-only default, write için method-level override — çok temiz bir kalıp.
 
 ### 9. `timeout` — TX süresi sınırı
+
+Sınırsız süren bir TX, lock'ları ve connection'ı da sınırsız tutar; her TX'e bir tavan koy.
 
 ```java
 @Transactional(timeout = 5)        // 5 saniye
 public void transfer(...) { ... }
 ```
 
-5 saniye içinde commit veya rollback olmazsa `TransactionTimedOutException`. Sıradaki SQL call'ında patlar.
+5 saniye içinde commit veya rollback olmazsa `TransactionTimedOutException` — sıradaki SQL call'ında patlar.
 
-Banking pratiği:
-- Para hareketleri **kısa** olmalı (< 1-2 saniye). Timeout 5 saniye = güvenlik kemeri.
-- Long-running batch için ayrı bir TX manager veya REQUIRES_NEW + uzun timeout.
-- Default sınırsız — production'da **kötü**. Her TX'e bir tavan koy.
-
-`spring.transaction.default-timeout: 30` ile global default.
-
----
+Banking pratiği: para hareketleri kısa olmalı (< 1-2 saniye), timeout 5 saniye = güvenlik kemeri. Long-running batch için ayrı TX manager veya REQUIRES_NEW + uzun timeout. Default sınırsızdır ve production'da kötüdür; `spring.transaction.default-timeout: 30` ile global default ver.
 
 ### 10. Rollback — checked vs unchecked exception
 
-**Spring default rollback davranışı:**
+Spring'in default rollback kuralı çoğu junior'ı şaşırtır, sebebi EJB tarihidir:
 
-- **Unchecked exception** (`RuntimeException`, `Error`) → **rollback** ✓
-- **Checked exception** (`Exception` subclass, RuntimeException değil) → **commit** (!) ⚠
+- **Unchecked exception** (`RuntimeException`, `Error`) → rollback ✓
+- **Checked exception** (`Exception` subclass, RuntimeException değil) → commit (!) ⚠
 
-Evet, bu çoğu junior'ı şaşırtır. Sebep: EJB tarihi. Spring bu davranışı tutmuş.
+```mermaid
+flowchart LR
+    A["Method exception fırlattı"] --> B{"Exception tipi"}
+    B -->|"RuntimeException veya Error"| C["Rollback"]
+    B -->|"Checked exception"| D{"rollbackFor eşleşiyor mu"}
+    D -->|"Evet"| C
+    D -->|"Hayır"| E["Commit"]
+```
+
+Yani <mark>checked exception default'ta rollback tetiklemez — transaction commit olur</mark>. Banking'de bunun bedeli yarım transferin DB'ye yazılmasıdır:
 
 ```java
 @Transactional
@@ -592,10 +583,8 @@ public void transfer(...) throws InsufficientFundsException {
 }
 ```
 
-Banking'de domain exception'larını **unchecked** yap (RuntimeException extend). Hem rollback davranışı doğru, hem method signature gürültüsü yok.
-
-```java
-public class InsufficientFundsException extends RuntimeException { }
+```admonish tip title="İpucu"
+Banking'de domain exception'larını her zaman unchecked yap (`RuntimeException` extend). Hem rollback davranışı doğru olur, hem method signature gürültüsü kalkar: `public class InsufficientFundsException extends RuntimeException { }`
 ```
 
 #### `rollbackFor` — checked'ı da rollback yap
@@ -607,13 +596,7 @@ public void method() throws SomeCheckedException {
 }
 ```
 
-Veya hepsi için:
-
-```java
-@Transactional(rollbackFor = Exception.class)
-```
-
-Banking pratiği: Domain exception'lar zaten unchecked ise yeterli. External library checked exception fırlatıyorsa ve rollback istiyorsan `rollbackFor` ekle.
+Veya hepsi için `@Transactional(rollbackFor = Exception.class)`. Domain exception'lar zaten unchecked ise gerek yok; external library checked exception fırlatıyorsa ve rollback istiyorsan ekle.
 
 #### `noRollbackFor` — bazı durumlarda rollback istemiyorum
 
@@ -625,15 +608,97 @@ public void transferAndNotify(...) {
 }
 ```
 
-Banking pratiği: Genelde **transfer fail = rollback** isteriz. noRollbackFor'u dikkatli kullan. Notification gibi yan etkileri zaten event-based (Phase 4) yapacağız.
-
----
+Genelde "transfer fail = rollback" isteriz; noRollbackFor'u dikkatli kullan. Notification gibi yan etkileri zaten event-based (Phase 4) yapacağız.
 
 ### 11. Banking money transfer transaction tasarımı (klasik mülakat sorusu)
 
-Hazırlan: "Bir para transferi servisi tasarla — debit, credit, audit log, notification."
+Hazırlan: "Bir para transferi servisi tasarla — debit, credit, audit log, notification." Bu soruyu tahtada parça parça çizeceğiz; tam listing bölüm sonunda katlanmış duruyor.
 
-**Tasarım:**
+Ana servis `@Transactional` (REQUIRED) ile başlar — transfer atomik olacak:
+
+```java
+@Service
+public class TransferService {
+    
+    private final AccountRepository accountRepository;
+    private final JournalRepository journalRepository;
+    private final AuditService auditService;
+    private final NotificationPublisher notificationPublisher;
+    
+    @Transactional                                    // REQUIRED — atomic transfer
+    public Transfer execute(TransferRequest request) {
+        var transferId = TransferId.generate();
+```
+
+İlk adımlar doğrulama: aynı hesaba transfer reddi, hesapları çekme, status kontrolü. Hepsi domain exception fırlatır — unchecked oldukları için otomatik rollback:
+
+```java
+        try {
+            if (request.from().equals(request.to())) {
+                throw new SameAccountTransferException();
+            }
+            var from = accountRepository.findById(request.from())
+                .orElseThrow(() -> new AccountNotFoundException(request.from()));
+            var to = accountRepository.findById(request.to())
+                .orElseThrow(() -> new AccountNotFoundException(request.to()));
+            
+            if (from.getStatus() != ACTIVE) throw new AccountClosedException(from.getId());
+            if (to.getStatus() != ACTIVE) throw new AccountClosedException(to.getId());
+```
+
+Sonra işin kalbi: debit + credit domain logic'i, persist ve double-entry journal kaydı — hepsi aynı TX içinde:
+
+```java
+            from.withdraw(request.amount(), transferId);   // InsufficientFundsException patlayabilir
+            to.deposit(request.amount(), transferId);
+            
+            accountRepository.save(from);
+            accountRepository.save(to);
+            
+            var journalEntry = JournalEntry.builder()
+                .transferId(transferId)
+                .addLine(from.getId(), DEBIT, request.amount())
+                .addLine(to.getId(), CREDIT, request.amount())
+                .build();
+            journalRepository.save(journalEntry);
+```
+
+Kapanış: success audit'i REQUIRES_NEW ile, notification event ile; hata durumunda failure audit'i yazılır ve exception re-throw edilir ki ana TX rollback olsun:
+
+```java
+            auditService.logSuccess(transferId, request);   // REQUIRES_NEW
+            notificationPublisher.publish(new TransferCompleted(transferId, request));
+            return new Transfer(transferId, ...);
+            
+        } catch (BankingException e) {
+            // Ana TX rollback olacak ama log kalmalı
+            auditService.logFailure(transferId, request, e);   // REQUIRES_NEW
+            throw e;   // re-throw → ana TX rollback
+        }
+    }
+}
+```
+
+`AuditService` ayrı bir bean — hem self-invocation'dan kaçınmak hem REQUIRES_NEW'un proxy üzerinden çalışması için:
+
+```java
+@Service
+public class AuditService {
+    
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void logSuccess(TransferId id, TransferRequest req) {
+        auditRepo.save(AuditLog.success(id, req));
+    }
+    
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void logFailure(TransferId id, TransferRequest req, BankingException cause) {
+        auditRepo.save(AuditLog.failure(id, req, cause.getMessage()));
+    }
+}
+```
+
+<details>
+<summary>Tam kod: TransferService + AuditService (~75 satır)</summary>
 
 ```java
 @Service
@@ -682,11 +747,9 @@ public class TransferService {
             journalRepository.save(journalEntry);
             
             // 8. Audit log — REQUIRES_NEW, transfer fail olsa bile yazılı kalsın
-            // BURASI önemli: success log
             auditService.logSuccess(transferId, request);
             
             // 9. Notification — event publish (Phase 4 detay)
-            // Şimdilik: event yayımla, listener async dispatch eder
             notificationPublisher.publish(new TransferCompleted(transferId, request));
             
             return new Transfer(transferId, ...);
@@ -715,6 +778,8 @@ public class AuditService {
 }
 ```
 
+</details>
+
 **Tasarım kararları:**
 
 1. Ana TX `REQUIRED` (default) — transfer atomic.
@@ -723,22 +788,17 @@ public class AuditService {
 4. Notification **event** — TX'in dışına çık (Phase 4'te `@TransactionalEventListener` ile detay).
 5. Idempotency-key bu örnekte gösterilmedi ama gerçek implementasyonda en başta.
 
-**Mülakatçı follow-up:** "Audit log REQUIRES_NEW dedin. Audit DB'si yazılamazsa ne olur, transfer rollback mi?" Cevap: Audit log fail olduğunda transfer rollback olmamalı (audit log ana akışı bloklamaz). `try-catch` ile audit fail'ini yut, log'la (operator'a alert). Veya audit asynchronous yapı.
-
----
+Mülakatçı follow-up: "Audit log REQUIRES_NEW dedin. Audit DB'si yazılamazsa ne olur, transfer rollback mi?" Cevap: Audit log fail olduğunda transfer rollback olmamalı (audit ana akışı bloklamaz). `try-catch` ile audit fail'ini yut, log'la (operator'a alert), veya audit'i asynchronous yap.
 
 ### 12. Nested transaction tuzakları
 
-NESTED'ı kullanırken dikkat:
+NESTED kağıt üzerinde zarif, pratikte dört ayrı tuzak barındırır:
 
-**Tuzak 1 — Driver desteği:**
-Hibernate `Connection.setSavepoint()` kullanır. Bazı eski JDBC driver'larında destek eksik. PostgreSQL, MySQL, Oracle modern sürümlerde sorun yok.
+**Tuzak 1 — Driver desteği:** Hibernate `Connection.setSavepoint()` kullanır; bazı eski JDBC driver'larında destek eksik. PostgreSQL, MySQL, Oracle modern sürümlerde sorun yok.
 
-**Tuzak 2 — Performans:**
-Her NESTED bir savepoint sayar. Loop içinde 10000 NESTED = 10000 savepoint = DB yorulur. NESTED'ı bilinçli kullan, batch için alternatif yöntemler düşün.
+**Tuzak 2 — Performans:** Her NESTED bir savepoint sayar. Loop içinde 10000 NESTED = 10000 savepoint = DB yorulur; batch için alternatif yöntemler düşün.
 
-**Tuzak 3 — Hata yakalama:**
-İçeride exception fırlarsa savepoint rollback olur. Ama sen exception'ı yakalamazsan dış TX'e iletilir, **tüm ana TX rollback** olur.
+**Tuzak 3 — Hata yakalama:** İçeride exception fırlarsa savepoint rollback olur; ama sen exception'ı yakalamazsan dış TX'e iletilir ve tüm ana TX rollback olur:
 
 ```java
 @Transactional
@@ -755,14 +815,13 @@ public void batch(List<X> items) {
 }
 ```
 
-**Tuzak 4 — JPA flush davranışı:**
-Hibernate PC'sini NESTED için tam doğru yönetmeyebilir. NESTED rollback sonrası PC kirli kalabilir. Banking için: NESTED kullanıyorsan kapsamlı test, gerekirse manuel `em.clear()` ile temizle.
+**Tuzak 4 — JPA flush davranışı:** Hibernate persistence context'i NESTED için tam doğru yönetmeyebilir; NESTED rollback sonrası PC kirli kalabilir. Kullanıyorsan kapsamlı test, gerekirse manuel `em.clear()`.
 
-**Banking pratiği:** Mümkünse NESTED yerine REQUIRES_NEW veya batch'i parçala. NESTED'ı tek bir sebep için kullan: "tek TX'te kalmak istiyorum ama belli bir alt-iş rollback olsa diğerleri devam etsin."
-
----
+Banking pratiği: mümkünse NESTED yerine REQUIRES_NEW veya batch'i parçala. NESTED'ı tek bir sebep için kullan: "tek TX'te kalmak istiyorum ama belli bir alt-iş rollback olsa diğerleri devam etsin."
 
 ### 13. Transaction içinde external call ETME — neden
+
+Kural net: <mark>transaction içinde external sisteme (HTTP, SWIFT, Kafka, SMS) çağrı yapma</mark>. Önce ihlalin nasıl göründüğüne bak:
 
 ```java
 @Transactional
@@ -775,15 +834,13 @@ public void transfer(...) {
 }
 ```
 
-**Niye kötü:**
+Üç sebep:
 
-1. **DB lock'ları açıkken HTTP bekliyorsun.** External 30 saniye yanıt verirse, lock'lar 30 saniye duruyor. Diğer transaction'lar bekliyor. Connection pool tükeniyor.
+1. **DB lock'ları açıkken HTTP bekliyorsun.** External 30 saniye yanıt verirse lock'lar 30 saniye duruyor; diğer transaction'lar bekliyor, connection pool tükeniyor.
+2. **External fail olursa rollback davranışı belirsiz.** SWIFT mesajı gitti mi? Sen TX'i commit edersen DB ile external desync olur.
+3. **Timeout zincirleme patlama:** External 30 sn yanıt, TX timeout 10 sn → TX timeout patlar ama external mesaj belki gönderildi.
 
-2. **External fail olursa rollback davranışı belirsiz.** SWIFT mesajı gitti mi? Eğer sen TX'i commit edersen DB ile external desync olur.
-
-3. **Timeout zincirleme patlama:** External 30 sn yanıt, TX timeout 10 sn → TX timeout patlar, ama external mesajı belki gönderildi.
-
-**Doğrusu:** External call'ları **TX'in dışına çıkar**.
+Doğrusu external call'ları TX'in dışına çıkarmak:
 
 ```java
 @Transactional
@@ -799,13 +856,11 @@ public void executeAndNotify(...) {
 }
 ```
 
-Veya **`@TransactionalEventListener(phase = AFTER_COMMIT)`** ile event-driven (Phase 4 detay).
-
----
+Veya `@TransactionalEventListener(phase = AFTER_COMMIT)` ile event-driven — sıradaki konu.
 
 ### 14. Transaction içinde event publish — `@TransactionalEventListener`
 
-Spring 4.2+ event listener'ı transaction phase'ine bağlayabilir:
+"Commit başarılıysa notification gönder" ihtiyacını elle if-else ile çözmek kırılgandır; Spring 4.2+ event listener'ı doğrudan transaction phase'ine bağlar:
 
 ```java
 @Service
@@ -816,7 +871,7 @@ class TransferService {
     public void execute(...) {
         // ... iş
         publisher.publishEvent(new TransferCompleted(transferId, ...));
-        // event PC'de bekler, commit sonrası listener'a gider
+        // event bekler, commit sonrası listener'a gider
     }
 }
 
@@ -832,16 +887,17 @@ class NotificationListener {
 ```
 
 **Phase seçenekleri:**
+
 - `BEFORE_COMMIT` — commit'ten hemen önce (validation gibi)
 - `AFTER_COMMIT` (default) — commit başarılıysa
 - `AFTER_ROLLBACK` — rollback olursa
 - `AFTER_COMPLETION` — her durumda (commit veya rollback)
 
-Banking pratiği: Notification, audit-log-async, downstream-system-sync için AFTER_COMMIT. Çok yaygın pattern.
-
----
+Banking pratiği: notification, audit-log-async, downstream-system-sync için AFTER_COMMIT — çok yaygın pattern.
 
 ### 15. Banking anti-pattern'leri
+
+Mülakatta "bu kodda ne yanlış?" sorusunun cephaneliği burası. Yedi klasik:
 
 **Anti-pattern 1: Controller'a `@Transactional`**
 
@@ -854,13 +910,9 @@ class TransferController {
 }
 ```
 
-Sorunlar: TX HTTP süresi boyunca açık (lazy loading, serialization vs hepsi TX içinde). Service ayrımı kaybolur. Connection 50 ms yerine 500 ms tutulur.
+TX HTTP süresi boyunca açık kalır (lazy loading, serialization hepsi TX içinde), service ayrımı kaybolur, connection 50 ms yerine 500 ms tutulur. Doğrusu: `@Transactional` service'te.
 
-**Doğru:** `@Transactional` service'te.
-
-**Anti-pattern 2: Domain method'una `@Transactional`**
-
-Domain class'lar Spring bilmemeli. `@Transactional` orchestration sorumluluğu, domain'in değil.
+**Anti-pattern 2: Domain method'una `@Transactional`** — Domain class'lar Spring bilmemeli; `@Transactional` orchestration sorumluluğudur, domain'in değil.
 
 **Anti-pattern 3: `catch (Exception e) { ... }` ile TX yutmak**
 
@@ -876,9 +928,9 @@ public void transfer(...) {
 }
 ```
 
-Spring rollback'i sadece **exception fırlarsa** veya `setRollbackOnly()` ile işaretlenirse yapar. Yutarsan commit olur. Yarım transfer DB'ye yazılır.
-
-**Doğru:** Re-throw veya `TransactionAspectSupport.currentTransactionStatus().setRollbackOnly()`.
+```admonish warning title="Dikkat"
+Spring rollback'i sadece exception proxy'ye ulaşırsa veya TX `setRollbackOnly()` ile işaretlenirse yapar. Exception'ı yutarsan TX commit olur — yarım transfer DB'ye yazılır. Doğrusu: re-throw veya `TransactionAspectSupport.currentTransactionStatus().setRollbackOnly()`.
+```
 
 **Anti-pattern 4: Uzun TX**
 
@@ -893,31 +945,11 @@ public void process() {
 }
 ```
 
-TX 200000 saniye açık kalır. Lock'lar, connection, PC memory — felaket.
+TX 200000 saniye açık kalır — lock'lar, connection, PC memory, felaket. Doğrusu: batch'i parçala, her batch ayrı TX, external call TX dışı.
 
-**Doğru:** Batch'i parçala, her batch ayrı TX. External call TX dışı.
+**Anti-pattern 5: `@Transactional` her yere** — Controller → Service → Calculator → ... her layer'da annotation. Default REQUIRED'ın join davranışı bilinmeyince debug imkansızlaşır. TX boundary'sini bilinçli koy; genelde service entry point'i.
 
-**Anti-pattern 5: `@Transactional` her yere**
-
-`AccountController` → `AccountService` (@Transactional) → `BalanceCalculator` (@Transactional) → ... her layer'da. Karmaşıklığı patlatır. Default REQUIRED nested davranışı bilinmeyince debug zor.
-
-**Doğru:** TX boundary'sini bilinçli koy. Genelde service entry point'i.
-
-**Anti-pattern 6: Self-invocation tuzaklı kod (tekrar)**
-
-```java
-@Service
-class AccountService {
-    public void publicMethod() {
-        privateTxMethod();   // ❌ proxy bypass
-    }
-    
-    @Transactional
-    public void privateTxMethod() { ... }
-}
-```
-
-Yukarıda detaylandı. Ayrı bean'e taşı.
+**Anti-pattern 6: Self-invocation tuzaklı kod** — Bölüm 4'te detaylandı; `this.` üzerinden `@Transactional` method çağrısı proxy'yi bypass eder. Ayrı bean'e taşı.
 
 **Anti-pattern 7: Read-only method'da yazma**
 
@@ -930,9 +962,7 @@ public Account getAndUpdateLastSeen(AccountId id) {
 }
 ```
 
-Hibernate flush atmayabilir, değişiklik kaybolabilir. Veya driver `Connection.setReadOnly(true)` yapmışsa DB hata fırlatır.
-
-**Doğru:** Niyet yazma → `readOnly = false`.
+Hibernate flush atmayabilir, değişiklik kaybolabilir; veya driver `Connection.setReadOnly(true)` yapmışsa DB hata fırlatır. Niyet yazma ise `readOnly = false`.
 
 ---
 
@@ -949,240 +979,144 @@ Hibernate flush atmayabilir, değişiklik kaybolabilir. Veya driver `Connection.
 
 ---
 
-## Mini task'ler
+## Kendini Sına
 
-### Task 2.3.1 — Self-invocation problemi reprodüksiyonu (30 dk)
+Aşağıdaki soruları önce **cevaba bakmadan** kendi cümlelerinle yanıtlamayı dene — hepsi TR bank mülakatlarında karşına çıkabilecek tarzda. Takıldığın soru olursa ilgili Kavramlar başlığına dön, sonra tekrar dene.
 
-`core-banking` projesine bir test class'ı ekle. İki versiyon:
+**S1. Aynı service class'ında iki method var, biri diğerini çağırıyor, ikisi de `@Transactional`. İçteki method neden yeni TX açmıyor ve nasıl düzeltirsin?**
 
-**A — broken:**
+<details>
+<summary>Cevabı göster</summary>
 
-```java
-@Service
-class TransferAuditServiceBroken {
-    
-    @Autowired AuditLogRepository auditRepo;
-    
-    public void doTransferAndLog(TransferRequest req) {
-        executeTransfer(req);             // self-invocation
-        writeAuditLog(req);
-    }
-    
-    @Transactional
-    void executeTransfer(TransferRequest req) {
-        // ... balance updates
-    }
-    
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    void writeAuditLog(TransferRequest req) {
-        auditRepo.save(new AuditLog(req));
-    }
-}
-```
+Bu self-invocation problemi. Spring `@Transactional`'ı proxy ile uygular: TX'i başlatan kod proxy'nin içindedir ve proxy sadece bean sınırından geçen (dışarıdan gelen) çağrıları görür. Aynı class içinden yapılan çağrı `this.` üzerinden gerçek nesneye gider — proxy devreye girmez, annotation yok sayılır.
 
-**B — fixed:** Ayrı `AuditService` class.
+En temiz çözüm method'u ayrı bir bean'e taşımak: çağrı bean sınırından geçer, proxy devreye girer. Alternatifler: `@Lazy` self-injection (proxy'i kendine inject edip `self.method()` çağırmak), `AopContext.currentProxy()` (okunmaz, tercih etme) veya AspectJ weaving (kurulumu ağır). Banking'de orchestrator + service + audit ayrımı zaten DDD ile uyumlu olduğu için sınıf ayırma standarttır.
 
-Bir SQL log'lu integration test yaz, A versiyonunda `BEGIN`-`COMMIT` görmeyeceksin (TX yok). B'de iki ayrı TX göreceksin.
+</details>
 
-Defterine yaz: "Self-invocation problemi neden olur, nasıl tespit ederim, nasıl düzeltirim."
+**S2. Transfer başarısız olup rollback olduğunda audit log da siliniyor. Neden ve nasıl düzeltirsin? Peki audit DB'si yazılamazsa transfer rollback olmalı mı?**
 
-### Task 2.3.2 — Propagation deney matrisi (45 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-`PropagationExperiment` test class'ı yaz. Her propagation tipi için:
+Audit method'u default REQUIRED ile çalışıyorsa ana TX'e katılır — ana TX rollback olunca audit kaydı da gider. Çözüm: audit method'una `@Transactional(propagation = Propagation.REQUIRES_NEW)` ver. Ana TX askıya alınır, audit bağımsız bir TX'te commit olur; ana TX sonradan rollback olsa bile log kalıcıdır. Audit service'in ayrı bir bean olması şart, yoksa self-invocation yüzünden REQUIRES_NEW hiç devreye girmez.
 
-1. Dış TX olmadan inner method çağır → davranışı gözlemle
-2. Dış TX içinde inner method çağır → davranışı gözlemle
+Follow-up'ın cevabı: hayır, audit fail'i transferi bloklamamalı. Audit çağrısını try-catch ile sar, hatayı yut ve operator'a alert üret — veya audit'i asynchronous yap. Ters yönde de bilinçli ol: REQUIRES_NEW ile "audit yazıldı ama transfer atılmadı" durumu mümkündür ve bu kabul edilen bir trade-off'tur.
 
-Beklenen sonuçları **önce tahmin et**, sonra test'i çalıştır:
+</details>
 
-| Propagation | TX yok | TX var |
-|---|---|---|
-| REQUIRED | yeni TX | join |
-| REQUIRES_NEW | yeni TX | suspend + new |
-| NESTED | yeni TX | savepoint |
-| MANDATORY | exception | join |
-| SUPPORTS | no TX | join |
-| NOT_SUPPORTED | no TX | suspend + no TX |
-| NEVER | no TX | exception |
+**S3. REQUIRES_NEW ile NESTED arasındaki fark nedir? Hangi banking senaryosunda hangisini seçersin?**
 
-Her satır için bir test yaz. Davranışı log'da (BEGIN, COMMIT, ROLLBACK) gör.
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 2.3.3 — REQUIRES_NEW audit log senaryosu (45 dk)
+REQUIRES_NEW iki ayrı physical TX açar (iki ayrı connection): iç TX dıştan bağımsız commit olur, dış TX rollback olsa bile iç kalır. NESTED ise tek physical TX içinde bir savepoint oluşturur: hata olursa savepoint'e kadar rollback olur ama iç kısmın kalıcılığı hâlâ dış commit'e bağlıdır — dış rollback olursa iç de gider.
 
-`AuditService` yaz:
+Seçim: "dış TX ne olursa olsun bu yazılsın" (audit log) → REQUIRES_NEW. "Tek TX'te kalayım ama batch'in bozuk kaydı diğerlerini bozmasın" (1000 transferlik batch'te bir hesap kapalı) → NESTED. REQUIRES_NEW'un bedeli ekstra connection (pool tükenme riski); NESTED'ın bedeli DB savepoint desteği gereksinimi ve Hibernate ile her DB'de sorunsuz çalışmaması.
 
-```java
-@Service
-class AuditService {
-    
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void logFailure(TransferId id, String reason) {
-        auditRepo.save(new AuditLog(id, "FAILED", reason, Instant.now()));
-    }
-}
-```
+</details>
 
-`TransferService.execute(...)` içinde:
+**S4. Dirty read, non-repeatable read ve phantom read'i birer banking örneğiyle tanımla. Hangi isolation level hangisini engeller?**
 
-```java
-@Transactional
-public Transfer execute(TransferRequest req) {
-    try {
-        // ... transfer logic
-        if (from.getBalance().isLessThan(req.amount())) {
-            auditService.logFailure(transferId, "INSUFFICIENT_FUNDS");
-            throw new InsufficientFundsException(...);
-        }
-        // ...
-    } catch (...) {
-        throw ...;
-    }
-}
-```
+<details>
+<summary>Cevabı göster</summary>
 
-Test: yetersiz bakiyeli transfer at → ana TX rollback olmalı (account balance değişmemeli) **ama** audit log yazılmış olmalı. SQL log'da iki ayrı TX gör.
+Dirty read: commit olmamış veriyi okumak — T1 bakiyeyi 1000'den 500'e çekti ama commit etmedi, T2 500'ü okuyup karar verdi, T1 rollback etti → T2 hiç var olmamış bir değerle işlem yaptı. Non-repeatable read: aynı TX'te aynı satırı iki kez okuyunca farklı değer — arada başka TX commit etti. Phantom read: aynı sorguyu iki kez çalıştırınca yeni satırlar belirmesi — arada başka TX yeni hesap ekledi.
 
-### Task 2.3.4 — Isolation level deneyleri (60 dk)
+Engelleme merdiveni: READ_UNCOMMITTED hiçbirini engellemez; READ_COMMITTED dirty read'i engeller; REPEATABLE_READ non-repeatable'ı da engeller; SERIALIZABLE üçünü de engeller. İnce nokta: MySQL InnoDB REPEATABLE_READ next-key locking ile phantom'u da engeller, PostgreSQL REPEATABLE_READ ise snapshot isolation kullanır.
 
-`@SpringBootTest` ile iki paralel thread başlat. Her birinde farklı TX. Şu phenomenon'ları **reprodüksiyon** dene:
+</details>
 
-**Dirty read (READ_UNCOMMITTED ile):**
-- T1: balance'ı 1000 → 500 yap (commit YOK, sleep 2 sn)
-- T2: aynı hesabın balance'ını oku
-- T1: rollback
-- T2 ne okudu? READ_UNCOMMITTED'da 500, READ_COMMITTED'da 1000
+**S5. PostgreSQL'de REPEATABLE_READ altında iki TX aynı satırı UPDATE etmeye çalışırsa ne olur? READ_COMMITTED'da fark eder miydi?**
 
-Not: PostgreSQL READ_UNCOMMITTED'ı destekler **ama internal olarak READ_COMMITTED gibi davranır**. PostgreSQL'de dirty read'i reprodüksiyon edemezsin. Anekdot olarak bil.
+<details>
+<summary>Cevabı göster</summary>
 
-**Non-repeatable read (READ_COMMITTED vs REPEATABLE_READ):**
-- T1: balance oku (1000), sleep 2 sn, balance tekrar oku
-- T2: balance'ı 1000 → 1500 yap + commit (T1 sleeperken)
-- T1 ikinci okuma: READ_COMMITTED'da 1500, REPEATABLE_READ'de 1000
+REPEATABLE_READ'de ikinci TX `could not serialize access due to concurrent update` hatası (serialization failure) alır — snapshot'ı başladığı andaki veriye sabitlendiği için, birinci TX'in commit ettiği satırı sessizce ezemez. Uygulamanın bu hatayı yakalayıp transaction'ı retry etmesi gerekir.
 
-Bunu **reprodüksiyon yap**. Test'i çalıştır, sonucu gör. Defterine yaz.
+READ_COMMITTED'da davranış farklıdır: ikinci TX birinci commit edene kadar lock'ta bekler, sonra satırın güncel halini görüp UPDATE'ini onun üzerine uygular — hata almaz ama lost update riski doğabilir. Bu yüzden "oku-hesapla-yaz" akışlarında ya REPEATABLE_READ + retry ya da explicit locking (Topic 2.4) gerekir.
 
-**Phantom read:**
-- T1: `WHERE owner_id = X` ile hesap listele (3 satır), sleep
-- T2: aynı owner'a yeni hesap aç + commit
-- T1: aynı sorgu tekrar (4 satır?)
+</details>
 
-PostgreSQL REPEATABLE_READ'de snapshot isolation, phantom da görünmez (MVCC). MySQL InnoDB REPEATABLE_READ'de next-key lock ile phantom blok.
+**S6. `@Transactional` bir method checked exception fırlatırsa Spring ne yapar? Bu default neden tehlikeli ve banking'de nasıl çözersin?**
 
-### Task 2.3.5 — Rollback davranışı: checked vs unchecked (30 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-İki exception class:
+Spring default'ta sadece unchecked exception'larda (`RuntimeException`, `Error`) rollback yapar; checked exception fırlarsa transaction commit olur. Bu EJB tarihinden gelen bir konvansiyon. Tehlikesi: `InsufficientFundsException` checked ise, exception fırladığı ana kadar yapılmış debit DB'ye commit edilir — yarım transfer yazılır.
 
-```java
-public class CheckedBusinessException extends Exception { }
-public class UncheckedBusinessException extends RuntimeException { }
-```
+İki çözüm var: en temizi domain exception'ları `RuntimeException`'dan türetmek — hem rollback doğru çalışır hem signature gürültüsü kalkar. External library'nin checked exception'ı için ise `@Transactional(rollbackFor = SomeCheckedException.class)` eklersin. Bir de ters tuzak: exception'ı catch edip yutarsan proxy'ye hiç ulaşmaz ve TX yine commit olur — re-throw şart.
 
-İki service method:
+</details>
 
-```java
-@Transactional
-public void methodWithChecked() throws CheckedBusinessException {
-    accountRepo.save(...);
-    throw new CheckedBusinessException();
-}
+**S7. Transaction içinde external HTTP call (SWIFT, SMS) yapmanın üç sakıncasını say. Doğru tasarım nedir?**
 
-@Transactional
-public void methodWithUnchecked() {
-    accountRepo.save(...);
-    throw new UncheckedBusinessException();
-}
-```
+<details>
+<summary>Cevabı göster</summary>
 
-Her ikisini integration test'le çağır. DB'de kayıt **var mı** kontrol et.
+Bir: DB lock'ları açıkken HTTP beklersin — external 30 saniye sürerse lock'lar 30 saniye tutulur, diğer TX'ler bekler, connection pool tükenir. İki: external fail olursa tutarlılık belirsizleşir — SWIFT mesajı gitti mi gitmedi mi bilemezsin, commit edersen DB ile external desync olur. Üç: timeout zincirlemesi — TX timeout external'dan önce patlarsa mesaj belki gönderilmiştir ama DB rollback olmuştur.
 
-- methodWithChecked → kayıt var (commit oldu!) ⚠
-- methodWithUnchecked → kayıt yok (rollback)
+Doğru tasarım: TX saf DB işi yapar ve commit eder; external call caller seviyesinde TX dışında yapılır. Daha şık alternatifi `@TransactionalEventListener(phase = AFTER_COMMIT)`: TX içinde event publish edersin, listener sadece commit başarılıysa çalışır — rollback olursa notification hiç gitmez.
 
-Sonra `@Transactional(rollbackFor = CheckedBusinessException.class)` ekle, tekrar dene. Bu sefer kayıt yok.
+</details>
 
-Defter notu: "Spring default rollback davranışı şu yüzden RuntimeException-only..."
+**S8. Controller method'una `@Transactional` koymak neden anti-pattern? TX boundary'sini nereye koyarsın?**
 
-### Task 2.3.6 — TransferService transaction tasarımı (60 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-`core-banking` `TransferService`'ini yukarıdaki "banking money transfer transaction tasarımı" bölümündeki yapıya getir:
+TX scope HTTP request'in tamamına yayılır: request parsing, lazy loading, response serialization hepsi TX içinde kalır ve connection 50 ms yerine 500 ms tutulur — yük altında pool tükenir. Ayrıca transaction yönetimi bir orchestration sorumluluğudur; controller'a koymak katman ayrımını bozar, aynı sebeple domain class'larına da konmaz.
 
-- Ana TX REQUIRED
-- AuditService REQUIRES_NEW
-- Domain exception'lar RuntimeException
-- Notification için event publish (`@TransactionalEventListener(AFTER_COMMIT)` listener da ekle)
-- timeout = 10 saniye
-- readOnly = false (default)
+TX boundary'si bilinçli olarak service entry point'ine konur: use case'i başlatan service method'u `@Transactional` taşır, çağırdığı diğer service'ler default REQUIRED ile aynı TX'e katılır. Her layer'a annotation serpiştirmek de anti-pattern'dir — REQUIRED'ın join davranışı bilinmeyince debug imkansızlaşır.
 
-`AuditService` class'ında `logSuccess` ve `logFailure` method'ları olsun, ikisi de REQUIRES_NEW.
-
-Test: 
-- Başarılı transfer → 1 audit (success), event yayımlandı, balance'lar değişti
-- Insufficient funds → 1 audit (failure), event yayımlanmadı, balance'lar değişmedi
-
-### Task 2.3.7 — `@TransactionalEventListener` ile notification (45 dk)
-
-```java
-public record TransferCompleted(TransferId id, AccountId from, AccountId to, Money amount, Instant at) { }
-
-@Service
-class TransferService {
-    private final ApplicationEventPublisher publisher;
-    
-    @Transactional
-    public Transfer execute(TransferRequest req) {
-        // ...
-        publisher.publishEvent(new TransferCompleted(...));
-        return transfer;
-    }
-}
-
-@Component
-class TransferNotificationListener {
-    
-    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
-    public void onTransferCompleted(TransferCompleted event) {
-        log.info("Notification: transfer {} from {} to {}", event.id(), event.from(), event.to());
-    }
-    
-    @TransactionalEventListener(phase = TransactionPhase.AFTER_ROLLBACK)
-    public void onTransferFailed(TransferCompleted event) {
-        // Bu çağrılmaz çünkü rollback olursa event publish edilse de listener
-        // sadece success phase'i ile bağlıysa çalışmaz. Test et.
-    }
-}
-```
-
-Test:
-- Başarılı transfer → AFTER_COMMIT listener çalıştı
-- Insufficient funds (rollback) → AFTER_COMMIT listener **çalışmadı**
-
-### Task 2.3.8 — readOnly performans gözlemi (30 dk)
-
-`AccountReportingService`'i iki versiyon yaz:
-
-```java
-@Service
-public class AccountReportingService {
-    
-    @Transactional   // readOnly = false (default)
-    public List<Account> listV1(OwnerId ownerId) {
-        return accountRepo.findByOwnerId(ownerId);
-    }
-    
-    @Transactional(readOnly = true)
-    public List<Account> listV2(OwnerId ownerId) {
-        return accountRepo.findByOwnerId(ownerId);
-    }
-}
-```
-
-Hibernate statistics aç. 10000 kez her ikisini çağır. `EntityInsertCount`, `EntityUpdateCount`, `FlushCount` farkını gözlemle.
-
-readOnly = true'da flush count 0 olmalı. Defterine yaz.
+</details>
 
 ---
 
-## Test yazma rehberi
+## Tamamlama kriterleri
+
+- [ ] "Kendini Sına" bölümündeki tüm soruları cevaba bakmadan açıklayabiliyorum
+- [ ] `@Transactional` proxy mekanizmasını (JDK vs CGLIB) 2 dakikada anlatabilirim
+- [ ] Self-invocation probleminin sebebini ve en az iki çözümünü sayabiliyorum
+- [ ] 7 propagation tipi için banking use case'i söyleyebilirim
+- [ ] 4 isolation level ve 3 phenomenon (dirty, non-repeatable, phantom) eşleştirmesini biliyorum
+- [ ] Checked vs unchecked exception default rollback davranışını ve `rollbackFor` çözümünü açıklayabiliyorum
+- [ ] Transfer tasarımını (ana TX REQUIRED + audit REQUIRES_NEW + notification AFTER_COMMIT) tahtada çizebilirim
+- [ ] Transaction içinde external HTTP call yapmamamın 3 sebebini sayabilirim
+- [ ] (Opsiyonel) "Pratik yapmak istersen" bölümündeki testleri yazdım ve Claude-verify prompt'uyla doğrulattım
+
+---
+
+## Defter notları
+
+1. "Spring `@Transactional` proxy: ____ (JDK vs CGLIB ne zaman hangisi)."
+2. "Self-invocation problemi neden olur, 2 ayrı çözüm: ____ ve ____."
+3. "Propagation.REQUIRES_NEW vs NESTED farkı: ____, banking use case farkı: ____."
+4. "Bir TX REQUIRES_NEW açtı, dış TX rollback oldu — iç TX commit mi rollback mi: ____."
+5. "READ_COMMITTED ile REPEATABLE_READ farkı: ____ (engellediği phenomenon)."
+6. "PostgreSQL REPEATABLE_READ ile MySQL InnoDB REPEATABLE_READ farkı: ____."
+7. "Checked exception default'ta rollback YAPMAZ çünkü ____. Banking'de domain exception'ları nasıl yazarım: ____."
+8. "TX içinde external HTTP call yapmamamın 3 sebebi: ____, ____, ____."
+9. "`@TransactionalEventListener(AFTER_COMMIT)` ne zaman kullanılır, alternatifleri: ____."
+10. "Banking transfer'inde ana TX, audit, notification için propagation seçimleri: ____."
+
+```admonish success title="Bölüm Özeti"
+- `@Transactional` bir proxy'dir: TX'i saran kod proxy'de yaşar, bu yüzden aynı bean içinden yapılan çağrı (self-invocation) annotation'ı yok sayar — çözüm sınıfları ayırmak
+- 7 propagation davranışının bel kemiği üçlü: REQUIRED (default, katıl veya başlat), REQUIRES_NEW (bağımsız TX — audit log), NESTED (savepoint — batch partial fail)
+- Isolation merdiveni READ_UNCOMMITTED → SERIALIZABLE anomalileri sırayla engeller; PostgreSQL default READ_COMMITTED çoğu banking servisi için yeterlidir
+- Spring default'ta sadece unchecked exception'da rollback yapar — domain exception'ları `RuntimeException` extend etmeli, checked için `rollbackFor`
+- Transfer tasarımı ezberi: ana TX REQUIRED + audit REQUIRES_NEW + notification `@TransactionalEventListener(AFTER_COMMIT)` + domain exception unchecked
+- TX içinde external call yapma, controller'a `@Transactional` koyma, exception yutma — üçü de production'da para kaybettiren anti-pattern'ler
+```
+
+---
+
+## Pratik yapmak istersen
+
+Kavramları koda dökmek istersen aşağıdaki iki ek hazır: test yazma rehberi self-invocation, REQUIRES_NEW audit, isolation ve rollback davranışları için örnek testler içerir; Claude-verify prompt'u ile yazdığın transaction kodunu banking-grade perspektiften denetletebilirsin.
+
+<details>
+<summary>Test yazma rehberi</summary>
 
 ### Test 2.3.1 — Self-invocation tespiti
 
@@ -1295,7 +1229,11 @@ void repeatableReadShouldPreventNonRepeatable() {
 }
 ```
 
-### Test 2.3.4 — Rollback davranışı
+> Not: PostgreSQL READ_UNCOMMITTED'ı kabul eder ama internal olarak READ_COMMITTED gibi davranır — dirty read'i PostgreSQL'de reprodüksiyon edemezsin, anekdot olarak bil. Phantom read için: PostgreSQL REPEATABLE_READ snapshot isolation kullandığından phantom da görünmez (MVCC); MySQL InnoDB REPEATABLE_READ'de next-key lock phantom'u bloklar.
+
+### Test 2.3.4 — Rollback davranışı (checked vs unchecked)
+
+İki exception class hazırla: `CheckedBusinessException extends Exception` ve `UncheckedBusinessException extends RuntimeException`. Her biri için `accountRepo.save(...)` sonrası exception fırlatan `@Transactional` method yaz, sonra:
 
 ```java
 @Test
@@ -1357,9 +1295,28 @@ void listenerShouldNotRunOnRollback() {
 }
 ```
 
----
+### Bonus — Propagation deney matrisi
 
-## Claude-verify prompt
+Her propagation tipi için iki senaryo test et: dış TX yokken ve dış TX içindeyken inner method çağır. Beklenen sonuçları önce tahmin et, sonra SQL log'da (BEGIN, COMMIT, ROLLBACK) doğrula:
+
+| Propagation | TX yok | TX var |
+|---|---|---|
+| REQUIRED | yeni TX | join |
+| REQUIRES_NEW | yeni TX | suspend + new |
+| NESTED | yeni TX | savepoint |
+| MANDATORY | exception | join |
+| SUPPORTS | no TX | join |
+| NOT_SUPPORTED | no TX | suspend + no TX |
+| NEVER | no TX | exception |
+
+### Bonus — readOnly performans gözlemi
+
+Aynı query'yi `@Transactional` (default) ve `@Transactional(readOnly = true)` iki method'da yaz. Hibernate statistics aç, her ikisini 10000 kez çağır, `FlushCount` farkını gözlemle — readOnly = true'da flush count 0 olmalı.
+
+</details>
+
+<details>
+<summary>Claude-verify prompt</summary>
 
 ```
 Aşağıdaki Spring transaction management kodumu banking-grade kriterlere göre 
@@ -1424,35 +1381,4 @@ değerlendir. Eksikleri işaretle, kod yazma:
 Her madde için PASS / FAIL / EKSIK işaretle, kanıt göster, kod yazma.
 ```
 
----
-
-## Tamamlama kriterleri
-
-- [ ] `@Transactional` proxy mekanizmasını (JDK vs CGLIB) 2 dakikada anlatabilirim
-- [ ] Self-invocation problemini reprodüksiyon ettim ve fix uyguladım
-- [ ] 7 propagation tipi için banking use case'i söyleyebilirim
-- [ ] REQUIRES_NEW audit log pattern'ini `core-banking` projesinde implemente ettim
-- [ ] 4 isolation level ve 3 phenomenon (dirty, non-repeatable, phantom) eşleştirmesini biliyorum
-- [ ] PostgreSQL'de non-repeatable read'i reprodüksiyon ettim ve REPEATABLE_READ ile engelledim
-- [ ] Checked vs unchecked exception default rollback davranışını test ile gördüm
-- [ ] Domain exception'larım `RuntimeException` extend ediyor
-- [ ] `TransferService` ana TX REQUIRED + audit REQUIRES_NEW + notification AFTER_COMMIT pattern'inde
-- [ ] `@Transactional(timeout = N)` ile timeout koymanın önemini biliyorum
-- [ ] Transaction içinde external HTTP call yapmamamın 3 sebebini sayabilirim
-- [ ] `@TransactionalEventListener(AFTER_COMMIT)` ile event-based notification yazdım
-- [ ] Anti-pattern listesi rahat — özellikle "controller'a @Transactional", self-invocation, exception yutma
-
----
-
-## Defter notları
-
-1. "Spring `@Transactional` proxy: ____ (JDK vs CGLIB ne zaman hangisi)."
-2. "Self-invocation problemi neden olur, 2 ayrı çözüm: ____ ve ____."
-3. "Propagation.REQUIRES_NEW vs NESTED farkı: ____, banking use case farkı: ____."
-4. "Bir TX REQUIRES_NEW açtı, dış TX rollback oldu — iç TX commit mi rollback mi: ____."
-5. "READ_COMMITTED ile REPEATABLE_READ farkı: ____ (engellediği phenomenon)."
-6. "PostgreSQL REPEATABLE_READ ile MySQL InnoDB REPEATABLE_READ farkı: ____."
-7. "Checked exception default'ta rollback YAPMAZ çünkü ____. Banking'de domain exception'ları nasıl yazarım: ____."
-8. "TX içinde external HTTP call yapmamamın 3 sebebi: ____, ____, ____."
-9. "`@TransactionalEventListener(AFTER_COMMIT)` ne zaman kullanılır, alternatifleri: ____."
-10. "Banking transfer'inde ana TX, audit, notification için propagation seçimleri: ____."
+</details>

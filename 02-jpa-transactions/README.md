@@ -1,10 +1,45 @@
+<div class="phase-cover-kicker">İkinci Bölüm</div>
+
 # Faz 2 — JPA & Transactions
+
+<div class="phase-cover-meta">
+<div><strong>Süre</strong> 3 hafta</div>
+<div><strong>Topic</strong> 7 konu + mini proje</div>
+<div><strong>Çıktı</strong> core-banking v0.2</div>
+<div><strong>Ön koşul</strong> Faz 1 tamamlandı</div>
+</div>
+
+```admonish info title="Bu fazda ne öğreneceksin?"
+Spring Data JPA'nın iç çalışmasını, transaction propagation ve isolation kurallarını,
+optimistic/pessimistic locking'i, N+1 problemini ve HikariCP tuning'i **banking-grade**
+seviyede öğreneceksin. Fazın sonunda `core-banking`, race condition'a dirençli,
+locking ile korunan, N+1'siz ve bilinçli tune edilmiş bir uygulama olacak.
+```
 
 ## Hedef
 
 Spring Data JPA'nın iç çalışmasını, transaction propagation ve isolation kurallarını, optimistic ve pessimistic locking'i, N+1 problemini ve HikariCP connection pool tuning'i banking-grade seviyede öğrenmek.
 
 Sonunda elinde: `core-banking` projesinde **race condition'a karşı dirençli**, optimistic + pessimistic locking ile korunan, N+1'siz reporting endpoint'leri olan, HikariCP'i bilinçli tune edilmiş bir uygulama.
+
+## Fazın haritası
+
+```mermaid
+flowchart TD
+    subgraph HaftaBir["Hafta 1 — JPA Motoru"]
+        direction LR
+        A["2.1 JPA Fundamentals"] --> B["2.2 Spring Data JPA"] --> C["2.3 Transactions"]
+    end
+    subgraph HaftaIki["Hafta 2 — Eşzamanlılık"]
+        direction LR
+        D["2.4 Locking"] --> E["2.5 N+1 Problem"]
+    end
+    subgraph HaftaUc["Hafta 3 — Performans"]
+        direction LR
+        F["2.6 HikariCP"] --> G["2.7 Hibernate Perf"]
+    end
+    HaftaBir --> HaftaIki --> HaftaUc --> MP(["Mini Proje: core-banking v0.2 + Faz Testi"])
+```
 
 ## Süre
 
@@ -21,6 +56,7 @@ Sonunda elinde: `core-banking` projesinde **race condition'a karşı dirençli**
 7. **[Hibernate Performance](./07-hibernate-performance/index.md)** — batch insert, statement cache, second-level cache, identity vs sequence
 
 Sonra:
+
 - **[Mini-project](./mini-project/index.md)** — `core-banking`'i locking + N+1 fix + pool tuning ile genişlet, **deadlock'u canlı reprodüksiyon + fix**
 - **[PHASE_TEST.md](./PHASE_TEST.md)** — Phase 3'e geçmeden kendini sına
 
@@ -37,4 +73,7 @@ Test et — şu soruları net cevaplayabiliyor musun?
 - [ ] "HikariCP `maximumPoolSize`'ı hangi formülle belirlersin, neden 200 yapmazsın?"
 - [ ] "PgBouncer'ı niye HikariCP'in önüne koyarsın?"
 
-Hepsine "evet" → Faz 3'e geç (Concurrency & JVM).
+```admonish success title="Faza geçiş kuralı"
+Yukarıdaki soruların **hepsine** net cevap verebiliyorsan → [Faz 3 — Concurrency & JVM](../03-concurrency/index.md)'a geç.
+Takıldığın soru hangi topic'e aitse oraya geri dön — bu fazın konuları mülakatların bel kemiği.
+```

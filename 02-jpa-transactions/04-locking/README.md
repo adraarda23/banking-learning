@@ -1,12 +1,20 @@
 # Topic 2.4 — Locking: Optimistic & Pessimistic
 
+```admonish info title="Bu bölümde"
+- Lost update probleminin banking'deki gerçek maliyeti ve isolation level'ların neden tek başına yetmediği
+- Optimistic locking: `@Version` mekaniği, `OptimisticLockingFailureException` ve retry pattern'leri
+- Pessimistic locking: `SELECT FOR UPDATE`, `LockModeType` seçenekleri, `NOWAIT` ve `SKIP LOCKED`
+- Deadlock'u kasten üretme, `jstack` ile gözlemleme ve lock ordering ile kalıcı çözüm
+- PostgreSQL SERIALIZABLE (SSI) alternatifi ve banking-grade retry: exponential backoff + jitter + metrics
+```
+
 ## Hedef
 
 Concurrency'nin banking domain'inde yarattığı problemleri (lost update, double withdraw, deadlock) **gerçek reprodüksiyon kodlarıyla** görmek. Optimistic locking (`@Version`) ve pessimistic locking (`LockModeType.PESSIMISTIC_WRITE`) arasında karar verebilmek. Deadlock'u Java kodunda **kasten üretip** `jstack` ile gözlemleyip, **lock ordering** ile çözmek. PostgreSQL `SERIALIZABLE` serialization failure pattern'ini ve retry strategy'lerini (exponential backoff, `@Retryable`) banking-grade yazabilmek. `SELECT FOR UPDATE NOWAIT`, `SKIP LOCKED` gibi SQL primitiflerini bilinçli kullanmak.
 
 ## Süre
 
-Okuma: 2 saat • Mini task: 3 saat • Test: 1.5 saat • Toplam: ~6.5 saat
+Okuma: 2 saat • Kendini Sına: 30 dk • Pratik (opsiyonel): 3-4 saat • Toplam: ~2.5 saat (+ pratik)
 
 ## Önbilgi
 
@@ -20,40 +28,54 @@ Okuma: 2 saat • Mini task: 3 saat • Test: 1.5 saat • Toplam: ~6.5 saat
 
 ### 1. Concurrency'nin banking'deki yüzü — lost update senaryosu
 
-Bir hesap, bakiyesi 1000 TL. İki user (veya iki paralel API call) aynı anda gelir:
+Bir hesapta 1000 TL var ve aynı anda iki para çekme isteği geliyor — bu bölümdeki her şeyin motivasyonu bu tek an. İki paralel API call düşün:
 
 - **T1:** "Hesaptan 800 çek" — SELECT balance (1000) → balance - 800 = 200 → UPDATE
 - **T2:** "Hesaptan 500 çek" — SELECT balance (1000) → balance - 500 = 500 → UPDATE
 
-Eğer iki transaction da READ_COMMITTED isolation'da çalışıyorsa ve her biri `SELECT` → uygulama katmanında matematik → `UPDATE` şeklinde işliyorsa, ikisi de **kendi snapshot'ında 1000** görür. Son commit hangisi olursa, onun yazdığı değer (500 veya 200) DB'de kalır. **Ötekinin update'i kaybolur** — bu "lost update" problemi.
+İki transaction da READ_COMMITTED'ta `SELECT` → uygulama katmanında matematik → `UPDATE` şeklinde işlerse, ikisi de **kendi snapshot'ında 1000** görür. Son commit hangisi olursa onun yazdığı değer kalır; ötekinin update'i kaybolur. Bu **lost update** problemi.
 
-Sonuç: hesaptan toplam 1300 TL çekildi (kaynak yetersiz olduğu halde her iki işlem de "başarılı" dedi), bakiye 500 veya 200 kaldı. **Banka 800 TL veya 500 TL açık.**
+Sonuç: hesaptan toplam 1300 TL çekildi (kaynak yetersiz olduğu halde her iki işlem de "başarılı" dedi), bakiye 500 veya 200 kaldı. Banka 800 TL veya 500 TL açık.
 
-**Bu lost update isolation level ile çözülmüyor mu?**
+Peki isolation level bunu çözmüyor mu?
 
 - READ_COMMITTED: Hayır (iki SELECT de 1000 görür, lock yok).
 - REPEATABLE_READ (MySQL InnoDB): Hayır — MySQL `SELECT` salt okuyucu, lock almaz.
 - REPEATABLE_READ (PostgreSQL): "Could not serialize access" hatası bazı durumlarda, ama UPDATE-only pattern'de garantili değil.
 - SERIALIZABLE: Evet, ama performans cezası ağır ve hâlâ serialization failure retry'ı gerektirir.
 
-**Pratik çözüm:** Locking — ya **optimistic** (`@Version`), ya **pessimistic** (`SELECT FOR UPDATE`). Banking'de bu seçim **iş kuralları + tahmini contention seviyesine** göre yapılır.
-
----
+Pratik çözüm locking: ya **optimistic** (`@Version`), ya **pessimistic** (`SELECT FOR UPDATE`). <mark>Lost update'i isolation level değil, bilinçli seçilmiş bir locking stratejisi çözer</mark> — banking'de bu seçim iş kuralları + tahmini contention seviyesine göre yapılır.
 
 ### 2. Optimistic Locking — `@Version`
 
-**Felsefe:** "Çatışma az olur — biri olduğunda kullanıcıyı reddederim ve retry istersem isterim." Yani **iyimser**.
+**Felsefe:** "Çatışma az olur — biri olduğunda işlemi reddederim, gerekirse retry ederim." Yani iyimser. **Optimistic locking** DB'de lock tutmaz; çatışmayı yazma anında yakalar.
 
-**Mekanik:**
+Mekanik üç adım:
 
-1. Entity'ye `@Version` ile bir integer (genelde `long` veya `int`) kolon eklenir.
+1. Entity'ye `@Version` ile bir integer (genelde `long`) kolon eklenir.
 2. Her UPDATE'te Hibernate bu kolonu WHERE'e koyar ve değerini bir artırır:
    ```sql
    UPDATE accounts 
    SET balance_amount = ?, version = ? + 1 
    WHERE id = ? AND version = ?
    ```
-3. Etkilenen satır sayısı 0 ise (çünkü başka biri version'u değiştirdi), Hibernate `OptimisticLockException` fırlatır.
+3. Etkilenen satır sayısı 0 ise (başka biri version'u değiştirdi), Hibernate `OptimisticLockException` fırlatır.
+
+Aynı senaryo `@Version` ile şöyle akar:
+
+```mermaid
+sequenceDiagram
+    participant T1 as TX1 800 çek
+    participant DB as PostgreSQL
+    participant T2 as TX2 500 çek
+    T1->>DB: SELECT balance 1000, version 5
+    T2->>DB: SELECT balance 1000, version 5
+    T1->>DB: UPDATE WHERE version 5
+    DB-->>T1: 1 satır, commit, version 6
+    T2->>DB: UPDATE WHERE version 5
+    DB-->>T2: 0 satır etkilendi
+    Note over T2: OptimisticLockException, rollback
+```
 
 **Banking örneği:**
 
@@ -88,7 +110,36 @@ Migration:
 ALTER TABLE accounts ADD COLUMN version BIGINT NOT NULL DEFAULT 0;
 ```
 
-**Reprodüksiyon — lost update artık olmuyor:**
+**Reprodüksiyon — lost update artık olmuyor.** Test iki paralel withdraw çalıştırır; her runnable kendi transaction'ında entity'yi okur, kısa bir delay sonrası günceller:
+
+```java
+Runnable withdraw800 = () -> transactionTemplate.executeWithoutResult(tx -> {
+    try {
+        startLatch.await();
+        AccountJpaEntity a = repo.findById(accountId).orElseThrow();
+        Thread.sleep(100);   // simulate processing delay
+        a.setBalanceAmount(a.getBalanceAmount().subtract(new BigDecimal("800.00")));
+        repo.saveAndFlush(a);
+    } catch (Exception e) { ex1.set(e); }
+});
+```
+
+İki thread de aynı version'u okuduğu için ikinci flush 0 satır etkiler — birinin exception alması garantilidir:
+
+```java
+// Birinin OptimisticLockException alması garantili
+assertThat(
+    ex1.get() instanceof OptimisticLockingFailureException
+    || ex2.get() instanceof OptimisticLockingFailureException
+).isTrue();
+
+BigDecimal finalBalance = repo.findById(accountId).orElseThrow().getBalanceAmount();
+// Sadece bir update kaldı: ya 200 ya 500
+assertThat(finalBalance).isIn(new BigDecimal("200.00"), new BigDecimal("500.00"));
+```
+
+<details>
+<summary>Tam kod: optimisticLockingShouldPreventLostUpdate testi (~47 satır)</summary>
 
 ```java
 @Test
@@ -139,30 +190,20 @@ void optimisticLockingShouldPreventLostUpdate() throws Exception {
 }
 ```
 
-**Hibernate'in fırlattığı exception:** `StaleObjectStateException` → Spring `OptimisticLockingFailureException` ile sarmalar (DataAccessException hierarchy).
+</details>
 
-**Avantajlar:**
+Exception zinciri: Hibernate `StaleObjectStateException` fırlatır → Spring bunu `OptimisticLockingFailureException` ile sarmalar (DataAccessException hierarchy).
 
-- DB lock yok → throughput yüksek
-- Read-heavy workload'da ideal (zaten çatışma az)
-- Deadlock olmaz (lock yok)
+**Trade-off özeti:**
 
-**Dezavantajlar:**
+- Artı: DB lock yok → throughput yüksek; read-heavy workload'da ideal; deadlock olmaz (lock yok)
+- Eksi: çatışma anında işlem reddedilir → retry gerekir; çatışma yoğunsa retry storm → ters performans
 
-- Çatışma anında **işlem reddedilir** → kullanıcı retry yapmalı
-- Çatışma yoğunsa retry storm → ters performans
-
-**Banking'de ne zaman:**
-
-- Hesap profili güncelleme (telefon, adres) — çatışma çok düşük
-- Hesap detayları edit ekranı (kullanıcı 5 dk düzeltir, save'ler)
-- Microservice'te dağıtık veri — pessimistic lock kurumsal olarak imkânsız
-
----
+**Banking'de ne zaman:** hesap profili güncelleme (telefon, adres — çatışma çok düşük), kullanıcı edit ekranları (5 dk düzeltir, save'ler), microservice'te dağıtık veri (pessimistic lock kurumsal olarak imkânsız).
 
 ### 3. Optimistic Lock + Retry pattern
 
-Çatışma olduğunda otomatik retry uygula. **İki strateji:**
+`OptimisticLockingFailureException` kullanıcıya "hata" olarak dönmemeli — çatışma geçicidir, otomatik retry çoğu zaman ikinci denemede başarır. İki strateji var.
 
 #### Strateji A — Spring Retry (`@Retryable`)
 
@@ -205,13 +246,34 @@ public class WithdrawService {
 }
 ```
 
-**Uyarı:** `@Retryable` AOP proxy ile çalışır — **self-invocation tuzağı geçerli** (Topic 2.3'teki gibi). Aynı sınıf içinden çağrılırsa retry aktif değil.
-
-**Dikkat 2:** `@Retryable` `@Transactional`'lı method'u retry ederken, **TX retry başında yeniden açılmalı** — yani method'a giriyor → TX açılıyor → fail → TX rollback → retry → yeni TX. Bunun için method seviyesinde `@Transactional` çok önemli. Eğer outer TX zaten açıksa retry işe yaramaz (aynı TX içinde version stale kalır).
+```admonish warning title="İki @Retryable tuzağı"
+1. `@Retryable` AOP proxy ile çalışır — **self-invocation tuzağı geçerli** (Topic 2.3'teki gibi). Aynı sınıf içinden çağrılırsa retry aktif değildir.
+2. Retry'ın işe yaraması için TX her denemede **yeniden açılmalı**: method'a giriş → TX açılır → fail → rollback → retry → yeni TX. Bu yüzden `@Transactional` method seviyesinde olmalı; outer TX zaten açıksa retry işe yaramaz (aynı TX içinde version stale kalır).
+```
 
 #### Strateji B — Manuel retry loop
 
-Kütüphane istemiyorsan veya finer control gerekiyorsa:
+Kütüphane istemiyorsan veya finer control gerekiyorsa loop'u kendin yazarsın. Backoff hesabının çekirdeği şu üç satır:
+
+```java
+long delay = BASE_DELAY_MS * (long) Math.pow(2, attempt - 1);
+long jitter = ThreadLocalRandom.current().nextLong(0, delay / 2);
+Thread.sleep(delay + jitter);
+```
+
+Retry edilen iş, her denemede yeni TX açılsın diye ayrı bir `@Transactional` method'da durur — self-invocation'dan kaçınmak için self-injection ile çağrılır:
+
+```java
+@Transactional
+public void doWithdraw(AccountId id, Money amount) {
+    Account account = accountRepository.findById(id).orElseThrow();
+    account.withdraw(amount);
+    accountRepository.save(account);
+}
+```
+
+<details>
+<summary>Tam kod: manuel retry loop ile WithdrawService (~40 satır)</summary>
 
 ```java
 @Service
@@ -256,13 +318,15 @@ public class WithdrawService {
 }
 ```
 
-**Exponential backoff + jitter:** Birden fazla worker aynı anda retry yaparsa "thundering herd" oluşur — hepsi aynı delay'de gelir. Random jitter bunu önler.
+</details>
 
-**Banking pratiği:** 3 denemeden sonra fail → 409 Conflict, kullanıcıya "tekrar deneyin" mesajı. Retry sayısı **idempotency** ile birleşince güvenli — aynı işlem iki kere uygulanmaz.
+Neden jitter? Birden fazla worker aynı anda retry yaparsa hepsi aynı delay'de geri gelir — buna **thundering herd** denir. **Exponential backoff** dalgaları seyreltir, random jitter aynı ana denk gelmelerini önler.
 
----
+**Banking pratiği:** 3 denemeden sonra fail → 409 Conflict, kullanıcıya "tekrar deneyin" mesajı. Retry, idempotency ile birleşince güvenli — aynı işlem iki kere uygulanmaz.
 
 ### 4. `@Version` data type seçimi ve tuzaklar
+
+Version kolonu masum görünür ama tip seçimi ve kullanım şekli production'da fark yaratır.
 
 **Type tercihleri:**
 
@@ -297,13 +361,11 @@ Optional<AccountJpaEntity> findWithLock(UUID id);
 // Hibernate hiçbir şey yapmaz — version olmadan lock yok
 ```
 
----
-
 ### 5. Pessimistic Locking — `SELECT FOR UPDATE`
 
-**Felsefe:** "Çatışma sık olur — okurken kilitlerim, kimse aynı zamanda alamaz." Yani **kötümser**.
+Transfer gibi yüksek çatışmalı money movement'ta her çatışmada reject + retry pahalıya gelir — burada devreye **pessimistic locking** girer. Felsefe: "Çatışma sık olur — okurken kilitlerim, kimse aynı anda alamaz."
 
-**Mekanik:** DB seviyesinde **row-level lock**. `SELECT ... FOR UPDATE` çalıştırırsın, satır kilitlenir. Aynı satırı başka transaction `FOR UPDATE` ile veya UPDATE ile almak isterse **bekler** (veya timeout / hata, davranışa göre).
+Mekanik: DB seviyesinde **row-level lock**. `SELECT ... FOR UPDATE` çalıştırırsın, satır kilitlenir; aynı satırı başka transaction `FOR UPDATE` veya UPDATE ile almak isterse bekler (veya timeout / hata, konfigürasyona göre).
 
 **LockModeType seçenekleri (JPA standardı):**
 
@@ -316,7 +378,7 @@ Optional<AccountJpaEntity> findWithLock(UUID id);
 | `PESSIMISTIC_WRITE` | `SELECT FOR UPDATE` | Exclusive lock — başkaları okuyamaz da, yazamaz da (DB'ye göre) |
 | `PESSIMISTIC_FORCE_INCREMENT` | `SELECT FOR UPDATE` + version++ | Lock + optimistic version |
 
-**Banking'in en yaygın seçimi: `PESSIMISTIC_WRITE`.**
+Banking'in en yaygın seçimi: `PESSIMISTIC_WRITE`.
 
 #### `@Lock` annotation — Spring Data JPA
 
@@ -367,15 +429,13 @@ public class TransferService {
 }
 ```
 
-Şimdi paralel olarak iki transfer aynı `from` hesabı üzerinden gelirse, **biri kilitler, diğeri bekler**. İlki commit ettiğinde lock bırakılır, ikincisi yeni veriyle (eski transfer sonrası bakiye) çalışır. Lost update **imkânsız**.
+Paralel iki transfer aynı `from` hesabına gelirse biri kilitler, diğeri bekler; ilki commit ettiğinde ikincisi güncel bakiyeyle çalışır. <mark>Pessimistic lock altında lost update imkânsızdır — ikinci transaction ilkinin commit'ini beklemek zorundadır</mark>.
 
-**Trade-off:** Throughput düşer (bekleyen var). Banking'de para transferinde bu OK — doğruluk hızdan önemli.
-
----
+Trade-off: throughput düşer (bekleyen var). Banking'de para transferinde bu OK — doğruluk hızdan önemli.
 
 ### 6. Lock timeout — `NOWAIT`, `WAIT n`, `SKIP LOCKED`
 
-`FOR UPDATE`'ı süresiz beklemek tehlikeli — bir transaction lock'ı tutarken diğerleri pool'u tüketebilir. Lock timeout şart.
+`FOR UPDATE`'ı süresiz beklemek tehlikeli — bir transaction lock'ı tutarken bekleyenler connection pool'u tüketebilir. Lock timeout şart.
 
 #### `NOWAIT` — beklemeden hata
 
@@ -394,9 +454,7 @@ PostgreSQL SQL:
 SELECT ... FROM accounts WHERE id = ? FOR UPDATE NOWAIT;
 ```
 
-Eğer satır kilitliyse: anında `PessimisticLockException` fırlatır. Bekleme yok.
-
-**Banking use case:** Hızlı API çağrısı — beklemektense reddetip kullanıcıyı tekrar denemeye yönlendirmek.
+Satır kilitliyse anında `PessimisticLockException` fırlatır, bekleme yok. Banking use case: hızlı API çağrısı — beklemektense reddedip kullanıcıyı tekrar denemeye yönlendirmek.
 
 #### `WAIT n` (Oracle terminolojisi) / `lock_timeout` (PostgreSQL)
 
@@ -408,7 +466,9 @@ Eğer satır kilitliyse: anında `PessimisticLockException` fırlatır. Bekleme 
 
 PostgreSQL'de bu hint genelde `SET LOCAL lock_timeout` ile uygulanır. 3 saniyede lock alınamazsa exception.
 
-**Banking pratiği:** API endpoint'lerinde 2-5 saniye timeout. Batch job'larda 30+ saniye OK.
+```admonish tip title="Banking timeout kalibrasyonu"
+API endpoint'lerinde 2-5 saniye lock timeout kullan — kullanıcı zaten beklemez. Batch job'larda 30+ saniye OK. Timeout'suz `FOR UPDATE` production'a çıkmamalı.
+```
 
 #### `SKIP LOCKED` — queue pattern
 
@@ -423,32 +483,102 @@ PostgreSQL'de bu hint genelde `SET LOCAL lock_timeout` ile uygulanır. 3 saniyed
 List<PendingTransactionEntity> claimNextBatch(@Param("limit") int limit);
 ```
 
-Birden fazla worker aynı tabloyu çekiyor. **Kilit gördüğü satırı atlar**, başkasını alır. Her worker farklı batch alır, çatışma yok.
+Birden fazla worker aynı tabloyu çekiyor. Kilit gördüğü satırı atlar, başkasını alır — her worker farklı batch alır, çatışma sıfır. Banking use case: pending transfer queue, asenkron fee hesaplama, retry kuyruğu. Multi-worker job processing'in altın standardı.
 
-**Banking use case:** Pending transfer queue, asenkron fee hesaplama, retry kuyruğu. Multi-worker'lı job processing'in altın standardı.
+Pratikte tablo ve worker şöyle görünür:
 
-**Tuzak:** Sadece PostgreSQL 9.5+, Oracle, SQL Server 2016+ destekler. MySQL InnoDB 8.0.1+.
+```sql
+CREATE TABLE pending_transactions (
+    id UUID PRIMARY KEY,
+    payload JSONB NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    claimed_at TIMESTAMP WITH TIME ZONE,
+    claimed_by VARCHAR(100)
+);
 
----
+CREATE INDEX idx_pending_status ON pending_transactions(status, created_at);
+```
+
+```java
+@Scheduled(fixedDelay = 1000)
+@Transactional
+public void processNextBatch() {
+    List<PendingTransactionEntity> batch = repo.claimBatch(10);
+    for (var pending : batch) {
+        pending.setStatus("PROCESSING");
+        pending.setClaimedAt(Instant.now());
+        pending.setClaimedBy(workerId);
+        // ... process
+    }
+}
+```
+
+İki instance aynı anda çalışsa bile aynı kayıt iki yerde görünmez — `SKIP LOCKED` kilitli satırı diğer instance'a hiç göstermez.
+
+Tuzak: destek PostgreSQL 9.5+, Oracle, SQL Server 2016+, MySQL InnoDB 8.0.1+ — daha eski sürümlerde yok.
 
 ### 7. Deadlock — banking'in klasik tuzağı
 
-İki transaction farklı sırada aynı kaynakları kilitlerse → deadlock.
+Pessimistic lock'un bedeli var: iki transaction aynı kaynakları **farklı sırada** kilitlerse **deadlock** oluşur. Banking'deki klasik senaryo, A→B ve B→A transferlerinin aynı anda gelmesi:
 
-**Senaryo: A → B ve B → A transfer aynı anda**
-
+```mermaid
+sequenceDiagram
+    participant T1 as TX1 A'dan B'ye
+    participant DB as PostgreSQL
+    participant T2 as TX2 B'den A'ya
+    T1->>DB: SELECT A FOR UPDATE
+    DB-->>T1: lock A alındı
+    T2->>DB: SELECT B FOR UPDATE
+    DB-->>T2: lock B alındı
+    T1->>DB: SELECT B FOR UPDATE
+    Note over T1: T2'nin commit'ini bekliyor
+    T2->>DB: SELECT A FOR UPDATE
+    Note over T2: T1'in commit'ini bekliyor
+    Note over DB: deadlock detected 40P01
+    DB-->>T2: transaction iptal edildi
 ```
-T1: SELECT account A FOR UPDATE   (lock A)
-T2: SELECT account B FOR UPDATE   (lock B)
-T1: SELECT account B FOR UPDATE   → waits for T2
-T2: SELECT account A FOR UPDATE   → waits for T1
-                                     ↑
-                                  DEADLOCK
-```
 
-DB deadlock'ı tespit eder (PostgreSQL ~1 saniye sonra) ve **birini öldürür**: `40P01: deadlock detected`.
+DB deadlock'ı tespit eder (PostgreSQL ~1 saniye sonra) ve birini öldürür: `40P01: deadlock detected`. Spring tarafında bu `CannotAcquireLockException` (DataAccessException) olarak yakalanır.
 
 #### Reprodüksiyon kodu
+
+Test, 20 thread'lik pool'da 100 iterasyon boyunca iki yönde transfer submit eder. Her iterasyonda A→B ve B→A birlikte kuyruğa girer:
+
+```java
+// A → B yönü — aynı döngüde B → A da simetrik şekilde submit ediliyor
+futures.add(executor.submit(() -> {
+    try {
+        transferService.transfer(
+            new AccountId(accountA),
+            new AccountId(accountB),
+            Money.of("10.00", "TRY")
+        );
+        successes.incrementAndGet();
+    } catch (CannotAcquireLockException e) {
+        deadlocks.incrementAndGet();
+    } catch (Exception e) {
+        otherErrors.incrementAndGet();
+    }
+}));
+```
+
+Sonunda sayaçlar toplanır — lock ordering yokken deadlock kaçınılmazdır:
+
+```java
+for (Future<?> f : futures) f.get(30, TimeUnit.SECONDS);
+executor.shutdown();
+
+System.out.println("Success: " + successes.get());
+System.out.println("Deadlock: " + deadlocks.get());
+System.out.println("Other: " + otherErrors.get());
+
+// Sıralama yokken deadlock kaçınılmaz
+assertThat(deadlocks.get()).isGreaterThan(0);
+```
+
+<details>
+<summary>Tam kod: DeadlockReproductionTest (~72 satır)</summary>
 
 ```java
 @SpringBootTest
@@ -525,6 +655,8 @@ class DeadlockReproductionTest {
 }
 ```
 
+</details>
+
 Bu test'i çalıştırdığında PostgreSQL log'da:
 
 ```
@@ -534,11 +666,9 @@ DETAIL: Process 1234 waits for ShareLock on transaction 567; blocked by process 
 HINT: See server log for query details.
 ```
 
-Spring tarafında `CannotAcquireLockException` (DataAccessException) yakalanır.
-
 #### `jstack` ile deadlock analizi (uygulama tarafında)
 
-Bazen deadlock DB seviyesinde değil, **Java thread seviyesinde** olur (lock objesi, monitor). Bunu `jstack` ile görürsün:
+Bazen deadlock DB seviyesinde değil, Java thread seviyesinde olur (lock objesi, monitor). Bunu `jstack` ile görürsün:
 
 ```bash
 jps                                  # PID'i bul
@@ -562,11 +692,37 @@ Found one Java-level deadlock:
 
 DB deadlock için `pg_stat_activity` ve `pg_locks` view'larından okursun. Banking üretim ortamında bunu monitoring'e bağlamak şart.
 
----
-
 ### 8. Deadlock fix — Lock Ordering
 
-**Çözüm:** Tüm transaction'lar aynı sırada kilitlesin. `account.id` sıralı al, küçük olanı önce.
+Deadlock'un panzehiri şaşırtıcı derecede basit: **lock ordering** — tüm transaction'lar kaynakları aynı sırada kilitlesin. `account.id`'ye göre sırala, küçük olanı önce al.
+
+Transfer method'unun başında sıralamayı belirle:
+
+```java
+// Lock ordering: küçük ID önce
+AccountId firstLockId, secondLockId;
+if (fromId.value().compareTo(toId.value()) < 0) {
+    firstLockId = fromId;
+    secondLockId = toId;
+} else {
+    firstLockId = toId;
+    secondLockId = fromId;
+}
+```
+
+Sonra bu sırayla kilitle ve hangisinin `from`, hangisinin `to` olduğunu geri çöz:
+
+```java
+AccountJpaEntity first = jpaRepo.findByIdForUpdate(firstLockId.value()).orElseThrow();
+AccountJpaEntity second = jpaRepo.findByIdForUpdate(secondLockId.value()).orElseThrow();
+
+// Hangisi from, hangisi to olduğunu ayırt et
+AccountJpaEntity from = firstLockId.equals(fromId) ? first : second;
+AccountJpaEntity to = firstLockId.equals(fromId) ? second : first;
+```
+
+<details>
+<summary>Tam kod: lock ordering ile TransferService (~38 satır)</summary>
 
 ```java
 @Service
@@ -608,9 +764,11 @@ public class TransferService {
 }
 ```
 
-Şimdi A→B ve B→A senaryosunda: ikisi de önce min(A,B), sonra max(A,B) kilitler. **Sıra aynı → deadlock yok.** İkinci transaction birinci bittikten sonra çalışır.
+</details>
 
-**Çoklu hesap senaryosu** (örnek: 5 hesabı kilitleyen bir batch): hepsini ID'ye göre `sort` et, sırayla kilitle.
+Şimdi A→B ve B→A senaryosunda ikisi de önce min(A,B), sonra max(A,B) kilitler. <mark>Tüm transaction'lar kaynakları aynı sırada kilitlerse deadlock oluşamaz</mark> — ikinci transaction birincinin bitmesini bekler, döngüsel bekleme hiç kurulamaz.
+
+Çoklu hesap senaryosunda (örnek: 5 hesabı kilitleyen bir batch) prensip aynı — hepsini ID'ye göre sort et, sırayla kilitle:
 
 ```java
 List<AccountId> sortedIds = accountIds.stream()
@@ -623,18 +781,44 @@ for (AccountId id : sortedIds) {
 }
 ```
 
----
-
 ### 9. PostgreSQL SERIALIZABLE — serialization failure ve retry
 
-PostgreSQL'in SERIALIZABLE isolation'ı **SSI** (Serializable Snapshot Isolation) algoritmasını kullanır. Lock almaz, ama transaction'lar bir "uygun sıra" oluşturamazsa **commit'i reddeder**:
+Lock ordering ile uğraşmak istemiyorsan lock-free bir alternatif var. PostgreSQL'in SERIALIZABLE isolation'ı **SSI** (Serializable Snapshot Isolation) algoritmasını kullanır: lock almaz, ama transaction'lar geçerli bir sıraya oturmuyorsa commit'i reddeder:
 
 ```
 ERROR: could not serialize access due to read/write dependencies among transactions
 SQLSTATE: 40001
 ```
 
-Spring tarafında `CannotSerializeTransactionException`. **Retry edilmeli.**
+Spring tarafında bu `CannotSerializeTransactionException`. Retry edilmeli — pattern manuel retry loop'un aynısı:
+
+```java
+public void transfer(TransferRequest req) {
+    for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        try {
+            self.doTransfer(req);
+            return;
+        } catch (CannotSerializeTransactionException ex) {
+            if (attempt == MAX_ATTEMPTS) {
+                throw new TransferRetryExhaustedException(req.idempotencyKey(), ex);
+            }
+            sleepWithBackoff(attempt);
+        }
+    }
+}
+```
+
+Asıl iş SERIALIZABLE isolation'da, `FOR UPDATE`'siz döner:
+
+```java
+@Transactional(isolation = Isolation.SERIALIZABLE)
+public void doTransfer(TransferRequest req) {
+    // ... transfer logic, lock-free
+}
+```
+
+<details>
+<summary>Tam kod: SerializableTransferService (~39 satır)</summary>
 
 ```java
 @Service
@@ -677,22 +861,20 @@ public class SerializableTransferService {
 }
 ```
 
-**SERIALIZABLE'in pessimistic lock'a göre avantajı:**
+</details>
 
-- Lock yok → deadlock yok (DB tarafında)
-- Read-heavy workload'da daha iyi
-- DB tek algoritmayı yönetir, uygulama lock ordering ile uğraşmaz
+**Pessimistic lock'a göre karşılaştırma:**
 
-**Dezavantajı:**
+- Artı: lock yok → DB tarafında deadlock yok; read-heavy workload'da daha iyi; uygulama lock ordering ile uğraşmaz
+- Eksi: retry oranı contention'a göre yüksek olabilir; SSI PostgreSQL-specific — Oracle/MySQL'de SERIALIZABLE lock-based çalışır, deadlock olabilir
 
-- Retry oranı yüksek olabilir (contention'a göre)
-- PostgreSQL-specific algoritma — Oracle/MySQL'de SERIALIZABLE farklı (lock-based, deadlock olabilir)
-
-**Banking pratiği:** PostgreSQL'de SERIALIZABLE + idempotency-key + retry kombinasyonu çok güçlü pattern. Birçok TR fintech bu pattern'i kullanır.
-
----
+```admonish tip title="Güçlü kombinasyon"
+PostgreSQL'de SERIALIZABLE + idempotency-key + retry üçlüsü banking'de çok güçlü bir pattern — birçok TR fintech transfer akışını tam bu kombinasyonla kurar.
+```
 
 ### 10. Pessimistic vs Optimistic — karar matrisi
+
+İki stratejinin hangisini seçeceğin mülakatlarda da production'da da en çok sorulan karar. Matris:
 
 | Kriter | Optimistic | Pessimistic |
 |---|---|---|
@@ -704,6 +886,17 @@ public class SerializableTransferService {
 | Throughput | Yüksek | Düşük |
 | Banking örnekleri | Profile update, hesap detay edit | Para transferi, bakiye kontrolü |
 
+```mermaid
+flowchart LR
+    A["Eşzamanlı yazma riski var"] --> B{"Çatışma oranı yüksek mi"}
+    B -->|"Düşük"| C["Optimistic - Version + retry"]
+    B -->|"Yüksek"| D{"Tek DB node mu"}
+    D -->|"Evet"| E["Pessimistic - FOR UPDATE + lock ordering"]
+    D -->|"Hayır, dağıtık"| F["Optimistic local + Saga - Outbox"]
+    C --> G["Retry biterse 409 Conflict"]
+    E --> H["Lock timeout şart"]
+```
+
 **Banking pratiği:**
 
 - **Money movement** (transfer, deposit, withdraw): Pessimistic + lock ordering
@@ -711,15 +904,13 @@ public class SerializableTransferService {
 - **Reporting** (read-only): Lock yok, `readOnly = true`, snapshot isolation
 - **Distributed transaction** (microservice): Saga / Outbox + optimistic local
 
----
-
 ### 11. Lock granularity — row vs table vs custom
 
-**Row-level lock:** `SELECT FOR UPDATE` — sadece o satırlar kilitlenir. **Yaygın olan.**
+**Row-level lock:** `SELECT FOR UPDATE` — sadece o satırlar kilitlenir. Yaygın olan.
 
-**Table-level lock:** `LOCK TABLE accounts IN EXCLUSIVE MODE;` — tüm tablo kilitli. Sadece migration veya DDL benzeri operasyon için. Banking'de operasyonel kullanımı **yok**.
+**Table-level lock:** `LOCK TABLE accounts IN EXCLUSIVE MODE;` — tüm tablo kilitli. Sadece migration veya DDL benzeri operasyon için; banking'de operasyonel kullanımı yok.
 
-**Advisory lock** (PostgreSQL özelliği): Custom semantic lock. `pg_advisory_xact_lock(account_id_hash)`. Bir transaction içinde alınır, commit/rollback'te bırakılır. Uygulama-seviyesi mutex gibi.
+**Advisory lock** (PostgreSQL özelliği): custom semantic lock — `pg_advisory_xact_lock(hash)`. Transaction içinde alınır, commit/rollback'te bırakılır; uygulama-seviyesi mutex gibi çalışır.
 
 ```sql
 -- Aynı transaction'da
@@ -727,15 +918,13 @@ SELECT pg_advisory_xact_lock(hashtext('transfer-' || :idempotencyKey));
 -- ... transfer işlemi ...
 ```
 
-Banking'de **idempotency lock** için faydalı: aynı idempotency-key için iki istek geldiğinde, advisory lock ikincinin beklemesini sağlar.
-
----
+Banking'de idempotency lock için faydalı: aynı idempotency-key ile iki istek geldiğinde advisory lock ikincinin beklemesini sağlar.
 
 ### 12. `LockModeType.OPTIMISTIC_FORCE_INCREMENT` — kullanım senaryosu
 
-Bir transaction sadece bir aggregate'i **okuyor** ama version'unu artırmak istiyor (parent-child invariant'ı korumak için).
+Bir transaction bir aggregate'i sadece **okuyor** ama version'unu artırmak istiyor — parent-child invariant'ı korumak için.
 
-**Banking örneği:** `Account` (parent) ve `JournalLine` (child). Yeni bir journal line eklediğinde, Account aggregate root'unun version'u artmalı — başka bir transaction Account'u eski snapshot'ta görüp inconsistent değişiklik yapmasın.
+Banking örneği: `Account` (parent) ve `JournalLine` (child). Yeni bir journal line eklediğinde Account aggregate root'unun version'u artmalı — başka bir transaction Account'u eski snapshot'ta görüp inconsistent değişiklik yapmasın.
 
 ```java
 @Lock(LockModeType.OPTIMISTIC_FORCE_INCREMENT)
@@ -743,15 +932,52 @@ Bir transaction sadece bir aggregate'i **okuyor** ama version'unu artırmak isti
 Optional<AccountJpaEntity> findAndIncrementVersion(@Param("id") UUID id);
 ```
 
-Account hiç değişmese bile, flush zamanında `UPDATE accounts SET version = version + 1 WHERE id = ? AND version = ?` çıkar.
+Account hiç değişmese bile flush zamanında `UPDATE accounts SET version = version + 1 WHERE id = ? AND version = ?` çıkar. DDD aggregate invariant pattern'in JPA implementasyonu.
 
-DDD aggregate invariant pattern'in JPA implementasyonu.
+### 13. Banking-grade retry — exponential backoff + jitter + metrics
 
----
+Buraya kadarki retry parçalarını production kalitesinde birleştirelim: exception ayrımı, backoff cap'i ve Micrometer metrics tek serviste. Kalbi, retry edilecek ve edilmeyecek exception'ları ayıran catch zinciri:
 
-### 13. Banking-grade retry — exponential backoff + jitter + circuit breaker
+```java
+try {
+    self.doTransfer(req);
+    meterRegistry.counter("transfer.success",
+        "attempts", String.valueOf(attempt)).increment();
+    sample.stop(meterRegistry.timer("transfer.duration"));
+    return;
+} catch (OptimisticLockingFailureException
+       | CannotSerializeTransactionException
+       | CannotAcquireLockException ex) {
+    lastEx = ex;
+    meterRegistry.counter("transfer.retry",
+        "reason", ex.getClass().getSimpleName()).increment();
+    if (attempt == MAX_ATTEMPTS) break;
+    sleepWithBackoff(attempt);
+} catch (InsufficientFundsException | AccountNotFoundException ex) {
+    throw ex;   // business exception — retry etme
+}
+```
 
-Tam production-grade retry pattern:
+Backoff bu kez cap'li — exponential büyüme bir üst sınırda durdurulur:
+
+```java
+private void sleepWithBackoff(int attempt) {
+    long exponential = BASE_DELAY_MS * (1L << (attempt - 1));
+    long capped = Math.min(exponential, MAX_DELAY_MS);
+    long jitter = ThreadLocalRandom.current().nextLong(0, capped);
+    long total = capped + jitter;
+    
+    try {
+        Thread.sleep(total);
+    } catch (InterruptedException ie) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException(ie);
+    }
+}
+```
+
+<details>
+<summary>Tam kod: ResilientTransferService (~63 satır)</summary>
 
 ```java
 @Service
@@ -818,21 +1044,19 @@ public class ResilientTransferService {
 }
 ```
 
-**Kritik noktalar:**
+</details>
 
-1. **Sadece concurrency exception'larını retry et.** Business exception (insufficient funds) retry edilmez — sonsuza kadar aynı hata.
-2. **Jitter şart.** Aynı anda 100 retry, hepsi aynı delay sonrası → ikinci dalga deadlock.
-3. **Max delay cap.** Exponential 2^10 = 1024, 1024 * 50ms = 51 saniye. Banking'de bu çok uzun. Cap koy.
-4. **Idempotency-key**: Retry sırasında DB'de aynı kayıt iki kere oluşmasın. Bu pattern Phase 5'te detaylı.
-5. **Metrics**: Retry sayısı, hangi exception, hangi attempt success — Prometheus'a yaz. SLO için kritik.
+Kritik noktalar:
 
----
+1. <mark>Business exception asla retry edilmez — retry'a sadece concurrency exception'ları girer</mark>. Insufficient funds sonsuza kadar aynı hatayı verir.
+2. Jitter şart — aynı anda 100 retry, hepsi aynı delay sonrası gelirse ikinci dalga deadlock.
+3. Max delay cap — 2^10 × 50ms = 51 saniye; banking'de bu çok uzun, cap koy.
+4. Idempotency-key — retry sırasında aynı kayıt iki kere oluşmasın (Phase 5'te detaylı).
+5. Metrics — retry sayısı, hangi exception, hangi attempt success; Prometheus'a yaz, SLO için kritik.
 
 ### 14. Anti-pattern'ler
 
-**Anti-pattern 1: `@Version` olmadan optimistic test etmek**
-
-`@Lock(LockModeType.OPTIMISTIC)` ama entity'de `@Version` yok → hiçbir şey yapmaz. Sessiz fail.
+**Anti-pattern 1: `@Version` olmadan optimistic test etmek** — `@Lock(LockModeType.OPTIMISTIC)` ama entity'de `@Version` yok → hiçbir şey yapmaz. Sessiz fail.
 
 **Anti-pattern 2: Lock'lu okumanın sonucunu cache'lemek**
 
@@ -855,11 +1079,11 @@ public void process() {
 }
 ```
 
-Kural: Pessimistic lock'lu TX **mümkün olduğunca kısa**. External call YOK.
+```admonish warning title="Lock süresi kuralı"
+Pessimistic lock'lu transaction mümkün olduğunca kısa olmalı. Lock açıkken external HTTP call, mesaj kuyruğu bekleyişi veya kullanıcı etkileşimi kesinlikle yasak — connection pool tükenir, sistem geneli durur.
+```
 
-**Anti-pattern 4: Lock ordering'i unutmak**
-
-A→B ve B→A senaryosunda her zaman lock ordering. **Test et.**
+**Anti-pattern 4: Lock ordering'i unutmak** — A→B ve B→A senaryosunda her zaman lock ordering. Test et.
 
 **Anti-pattern 5: Retry'da business exception yutmak**
 
@@ -878,7 +1102,7 @@ Sadece concurrency exception'larını yakala.
 while (true) { try { ... } catch (...) { ... } }
 ```
 
-Always max attempt + cap + fail-fast yol. Sonsuza kadar retry = canlı kilitlenme.
+Her zaman max attempt + delay cap + fail-fast yol. Sonsuz retry = canlı kilitlenme (livelock).
 
 **Anti-pattern 7: `findById` sonra `findByIdForUpdate`**
 
@@ -888,11 +1112,9 @@ Optional<Account> a = repo.findById(id);   // SELECT (lock yok)
 Optional<Account> locked = repo.findByIdForUpdate(id);   // 2. SELECT, lock
 ```
 
-Race condition: ikisi arasında başka biri güncelleyebilir. **İlk SELECT'i `FOR UPDATE` ile yap.**
+Race condition: ikisi arasında başka biri güncelleyebilir. İlk SELECT'i `FOR UPDATE` ile yap.
 
-**Anti-pattern 8: Distributed lock için DB tabanlı çözümü hafife almak**
-
-Mikroservislerde "ben DB'de bir lock tablosu yaparım" → idempotency için OK, ama gerçek dağıtık lock için Redis Redlock, Zookeeper, etcd gibi araçlar daha sağlam. Banking'de Phase 7'de detay.
+**Anti-pattern 8: Distributed lock için DB tabanlı çözümü hafife almak** — mikroservislerde "DB'de lock tablosu yaparım" idempotency için OK, ama gerçek dağıtık lock için Redis Redlock, Zookeeper, etcd gibi araçlar daha sağlam (Phase 7'de detay).
 
 ---
 
@@ -909,142 +1131,127 @@ Mikroservislerde "ben DB'de bir lock tablosu yaparım" → idempotency için OK,
 
 ---
 
-## Mini task'ler
+## Kendini Sına
 
-### Task 2.4.1 — `@Version` ekle (30 dk)
+Aşağıdaki soruları önce **cevaba bakmadan** kendi cümlelerinle yanıtlamayı dene — hepsi mülakatta karşına çıkabilecek tarzda. Takıldığın soru olursa ilgili Kavramlar başlığına dön, sonra tekrar dene.
 
-`AccountJpaEntity` ve `JournalEntryJpaEntity`'e `@Version` ekle. Migration V5 yaz:
+**S1. Lost update nedir ve neden READ_COMMITTED hatta REPEATABLE_READ isolation level bile bunu güvenilir şekilde engellemez?**
 
-```sql
-ALTER TABLE accounts ADD COLUMN version BIGINT NOT NULL DEFAULT 0;
-ALTER TABLE journal_entries ADD COLUMN version BIGINT NOT NULL DEFAULT 0;
-```
+<details>
+<summary>Cevabı göster</summary>
 
-Mevcut testlerin geçtiğini doğrula. Sonra optimistic conflict üreten bir test yaz (yukarıdaki örnek).
+Lost update, iki transaction'ın aynı satırı okuyup uygulama katmanında hesap yaparak geri yazması sonucu birinin update'inin kaybolmasıdır: ikisi de 1000 görür, biri 200 biri 500 yazar, son commit kazanır. READ_COMMITTED'ta SELECT lock almaz, iki transaction da aynı snapshot'ı görür. MySQL InnoDB'nin REPEATABLE_READ'inde de düz SELECT salt okuyucudur; PostgreSQL REPEATABLE_READ bazı durumlarda serialization hatası verir ama UPDATE-only pattern'de garanti değildir. Güvenilir çözüm isolation değil locking'dir: `@Version` ile optimistic veya `SELECT FOR UPDATE` ile pessimistic.
 
-### Task 2.4.2 — Manuel retry loop ile `WithdrawService` (45 dk)
+</details>
 
-`WithdrawService.withdraw(AccountId, Money)` method'u:
+**S2. `@Version` mekaniği tam olarak nasıl çalışır? Hibernate hangi SQL'i üretir ve çatışmayı nereden anlar?**
 
-- Maksimum 3 deneme
-- Exponential backoff (50ms, 100ms, 200ms) + jitter
-- Sadece `OptimisticLockingFailureException` retry edilsin
-- 3 başarısız sonra `ConcurrentModificationException` fırlat (mapping: 409 Conflict)
+<details>
+<summary>Cevabı göster</summary>
 
-`@Retryable` kullanma — manuel loop ile öğren.
+Hibernate her UPDATE'in WHERE'ine version kolonunu ekler ve SET'te bir artırır: `UPDATE accounts SET balance_amount = ?, version = ? + 1 WHERE id = ? AND version = ?`. Başka bir transaction araya girip version'u değiştirmişse WHERE tutmaz, etkilenen satır sayısı 0 olur — Hibernate bunu `StaleObjectStateException` olarak fırlatır, Spring de `OptimisticLockingFailureException` ile sarmalar. Version field'ı `long` olmalı (int ~2.1 milyar update'te taşar) ve Java tarafından asla set edilmemeli — Hibernate yönetir. `@Version` olmadan `@Lock(OPTIMISTIC)` hiçbir şey yapmaz.
 
-### Task 2.4.3 — `@Retryable` ile aynı kalibrasyon (30 dk)
+</details>
 
-Aynı `WithdrawService`'in `@Retryable` versiyonunu yaz. Self-injection veya separate bean ile self-invocation problem'inden kaçın.
+**S3. Optimistic retry pattern'inde neden sadece concurrency exception'ları retry edilir ve jitter neden şarttır?**
 
-İki implementasyonu test et:
-- Aynı concurrency davranışı mı?
-- Hangisi daha temiz?
-- Defter notu: Hangisini production'da seçersin, neden?
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 2.4.4 — `PESSIMISTIC_WRITE` ile `TransferService` (1 saat)
+Business exception (örn. `InsufficientFundsException`) deterministic'tir — kaç kere denersen dene aynı sonucu verir, retry sadece kaynak israfıdır ve hatayı geciktirir. Retry'a yalnızca geçici olan concurrency exception'ları girer: `OptimisticLockingFailureException`, `CannotSerializeTransactionException`, `CannotAcquireLockException`. Jitter ise thundering herd'e karşıdır: 100 worker aynı anda çakışıp hepsi aynı sabit delay sonrası geri gelirse ikinci dalga çatışma yaratır. Random jitter denemeleri zamana yayar. Buna max attempt ve max delay cap de eklenir — sonsuz retry livelock demektir.
 
-`TransferService.transfer(...)`'i pessimistic locking ile yeniden yaz:
+</details>
 
-- `findByIdForUpdate` method'u JPA repository'de `@Lock` ile
-- Lock ordering: account ID'ye göre küçükten büyüğe
-- Lock timeout: 3 saniye (`@QueryHints` ile)
-- Transfer logic: bakiye kontrolü, debit, credit, journal_entry, 2 journal_line
+**S4. `@Retryable` + `@Transactional` kombinasyonundaki iki klasik tuzak nedir?**
 
-Test: paralel A→B + B→A 100 iterasyon — **0 deadlock** olmalı.
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 2.4.5 — Deadlock reprodüksiyon ve fix karşılaştırması (1 saat)
+Birincisi self-invocation: `@Retryable` AOP proxy ile çalışır; method aynı sınıf içinden `this` üzerinden çağrılırsa proxy devreye girmez, retry hiç olmaz. Çözüm self-injection veya ayrı bean. İkincisi TX ömrü: retry'ın işe yaraması için her denemede transaction'ın yeniden açılması gerekir — fail → rollback → yeni TX → taze SELECT. `@Transactional` retry edilen method'un üzerinde olmalı; dışarıda zaten açık bir TX varsa retry aynı stale version ile döner ve her deneme aynı hatayı alır.
 
-İki versiyon kod yaz:
+</details>
 
-- **A:** Lock ordering YOK (her zaman `from` önce, `to` sonra)
-- **B:** Lock ordering VAR (sorted by ID)
+**S5. A→B ve B→A transferleri aynı anda gelirse deadlock nasıl oluşur? Nasıl reproduce eder, nasıl çözersin?**
 
-Aynı concurrency test'i (A↔B 100 iterasyon, 20 thread) ile ikisini çalıştır:
+<details>
+<summary>Cevabı göster</summary>
 
-- A'da kaç deadlock?
-- B'de kaç deadlock?
-- A'da success / B'de success oranı?
+T1 A'yı `FOR UPDATE` ile kilitler, T2 B'yi kilitler; sonra T1 B'yi ister (T2'yi bekler), T2 A'yı ister (T1'i bekler) — döngüsel bekleme kuruldu, PostgreSQL ~1 saniyede tespit edip birini `40P01 deadlock detected` ile öldürür (Spring'de `CannotAcquireLockException`). Reproduce etmek için 20 thread'lik pool'da 100 iterasyon A→B ve B→A transferi paralel koşturursun — sıralama yokken deadlock kaçınılmazdır. Çözüm lock ordering: her transaction hesapları account ID'ye göre sıralayıp hep küçükten büyüğe kilitler; sıra herkes için aynı olunca döngüsel bekleme matematiksel olarak imkânsızlaşır ve aynı test 0 deadlock verir.
 
-`jstack` çıktısı al — A versiyonu çalışırken `jps` ile PID bul, `jstack -l <pid>` ile thread dump. Çıktıyı `docs/deadlock-analysis.md`'a yapıştır.
+</details>
 
-### Task 2.4.6 — PostgreSQL SERIALIZABLE alternatifi (45 dk)
+**S6. `NOWAIT` ile `SKIP LOCKED` arasındaki fark nedir? Hangi banking senaryosunda hangisi?**
 
-`SerializableTransferService` yaz:
-- `@Transactional(isolation = Isolation.SERIALIZABLE)`
-- Lock yok (`FOR UPDATE` kullanma)
-- 5 retry exponential backoff
-- `CannotSerializeTransactionException` yakala
+<details>
+<summary>Cevabı göster</summary>
 
-Aynı concurrency test'i ile çalıştır. Performans karşılaştırması:
-- Pessimistic version: ms/transfer ortalama
-- Serializable version: ms/transfer ortalama
-- Hangisinde retry sayısı yüksek?
+`FOR UPDATE NOWAIT` kilitli satırla karşılaşınca beklemeden anında `PessimisticLockException` fırlatır — hızlı API çağrılarında beklemek yerine 409 dönüp kullanıcıyı tekrar denemeye yönlendirmek için idealdir. `FOR UPDATE SKIP LOCKED` ise kilitli satırı hata vermeden atlar ve sonraki uygun satırı alır — multi-worker job queue'nun altın standardı: her worker `claimBatch` ile farklı satırları claim eder, aynı kayıt iki instance'ta asla görünmez. Aradaki üçüncü seçenek `lock_timeout` (örn. 3000 ms): sınırlı süre bekle, sonra hata. API'de 2-5 sn, batch'te 30+ sn tipiktir.
 
-Defter notu: Hangi yaklaşım hangi senaryoda?
+</details>
 
-### Task 2.4.7 — `SKIP LOCKED` ile job queue (45 dk)
+**S7. PostgreSQL SERIALIZABLE (SSI) pessimistic locking'e göre ne vaat eder, bedeli nedir?**
 
-`pending_transactions` tablosu (yeni migration):
+<details>
+<summary>Cevabı göster</summary>
 
-```sql
-CREATE TABLE pending_transactions (
-    id UUID PRIMARY KEY,
-    payload JSONB NOT NULL,
-    status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    claimed_at TIMESTAMP WITH TIME ZONE,
-    claimed_by VARCHAR(100)
-);
+SSI lock almaz; transaction'ların read/write bağımlılıklarını izler ve geçerli bir serial sıraya oturmayan commit'i `40001 could not serialize access` ile reddeder. Avantaj: DB tarafında deadlock yok, lock ordering derdi yok, read-heavy workload'da iyi. Bedel: reddedilen transaction'ı uygulamanın retry etmesi şart (`CannotSerializeTransactionException` + exponential backoff) ve contention arttıkça retry oranı büyür. Ayrıca SSI PostgreSQL-specific'tir — Oracle/MySQL'de SERIALIZABLE lock-based çalışır ve deadlock üretebilir. SERIALIZABLE + idempotency-key + retry üçlüsü banking'de güçlü bir pattern'dir.
 
-CREATE INDEX idx_pending_status ON pending_transactions(status, created_at);
-```
+</details>
 
-Repository method:
+**S8. Money movement için pessimistic, profile update için optimistic seçilmesinin gerekçesi nedir?**
 
-```java
-@Query(value = """
-    SELECT * FROM pending_transactions 
-    WHERE status = 'PENDING' 
-    ORDER BY created_at 
-    LIMIT :limit 
-    FOR UPDATE SKIP LOCKED
-""", nativeQuery = true)
-List<PendingTransactionEntity> claimBatch(@Param("limit") int limit);
-```
+<details>
+<summary>Cevabı göster</summary>
 
-Service:
+Karar üç boyutta verilir: çatışma oranı, TX süresi ve dağıtıklık. Transfer/withdraw yüksek contention'lı, kısa ve atomik DB işlemidir — pessimistic lock kısa süre tutulur, lost update fiziksel olarak imkânsızlaşır ve doğruluk hızdan önemlidir; bedeli lock ordering disiplinidir. Profile update ise düşük contention'lıdır ve kullanıcı dakikalarca edit ekranında kalabilir — bu süre boyunca DB lock'u tutmak pool'u öldürür; optimistic `@Version` lock'suz çalışır, nadir çatışmada retry veya 409 yeterlidir. Distributed senaryoda pessimistic zaten mümkün değildir — optimistic local + Saga/Outbox kullanılır.
 
-```java
-@Scheduled(fixedDelay = 1000)
-@Transactional
-public void processNextBatch() {
-    List<PendingTransactionEntity> batch = repo.claimBatch(10);
-    for (var pending : batch) {
-        pending.setStatus("PROCESSING");
-        pending.setClaimedAt(Instant.now());
-        pending.setClaimedBy(workerId);
-        // ... process
-    }
-}
-```
-
-İki uygulama instance'ı aç (farklı port), 50 pending kayıt insert et, log'larda ne gördüğünü gözle. **Aynı kayıt iki instance'ta görünmemeli**.
-
-### Task 2.4.8 — Banking-grade `ResilientTransferService` (1 saat)
-
-Yukarıdaki tam örneği uyarla:
-- 5 attempt
-- Base delay 50ms, max delay 2 saniye
-- Jitter
-- Concurrency exception'larını yakala, business'i yakalama
-- Micrometer metrics (`transfer.retry`, `transfer.success`, `transfer.failure`)
-
-`/actuator/metrics/transfer.retry` endpoint'inde retry sayısını gör.
+</details>
 
 ---
 
-## Test yazma rehberi
+## Tamamlama kriterleri
+
+- [ ] "Kendini Sına" bölümündeki tüm soruları cevaba bakmadan açıklayabiliyorum
+- [ ] Lost update'in isolation level ile neden güvenilir çözülmediğini anlatabiliyorum
+- [ ] `@Version` mekaniğini (UPDATE WHERE version) ve exception zincirini (StaleObjectState → OptimisticLockingFailure) biliyorum
+- [ ] Optimistic vs pessimistic kararını çatışma oranı, TX süresi ve dağıtıklık boyutlarında verebiliyorum
+- [ ] Deadlock'un nasıl oluştuğunu ve lock ordering'in neden kesin çözüm olduğunu açıklayabiliyorum
+- [ ] Banking-grade retry'ın beş unsurunu sayabiliyorum: max attempt, exponential backoff, delay cap, jitter, sadece concurrency exception
+- [ ] `NOWAIT`, `lock_timeout`, `SKIP LOCKED` üçlüsünün hangi senaryoda hangisi olduğunu biliyorum
+- [ ] (Opsiyonel) "Pratik yapmak istersen" bölümündeki testleri yazdım ve Claude-verify prompt'uyla doğrulattım
+
+---
+
+## Defter notları
+
+1. "Optimistic locking'in temeli `@Version` kolonu + UPDATE WHERE version = ?. Çatışma olursa ____ exception fırlatılır."
+2. "Pessimistic locking'in SQL karşılığı ____. PostgreSQL'de `FOR UPDATE` ile `FOR SHARE` farkı ____."
+3. "`NOWAIT` ile `lock_timeout` farkı ____. Banking'de hangi senaryoda hangisi: ____."
+4. "`SKIP LOCKED`'ın asıl kullanım senaryosu ____ (queue pattern). Hangi DB versiyonlarında destekli: ____."
+5. "Deadlock üretmek için minimum şart: ____. Lock ordering ile çözüm prensibi: ____."
+6. "Exponential backoff formülü ____. Jitter neden eklenir: ____."
+7. "PostgreSQL SERIALIZABLE algoritması (SSI) lock yerine ____ kullanır. Pessimistic'e göre avantajı: ____."
+8. "Optimistic vs Pessimistic karar matrisi 3 boyutta: ____, ____, ____."
+9. "`OPTIMISTIC_FORCE_INCREMENT` ne zaman kullanılır (DDD aggregate pattern): ____."
+10. "Banking-grade retry pattern'in 5 zorunlu unsuru: ____, ____, ____, ____, ____."
+
+```admonish success title="Bölüm Özeti"
+- Lost update isolation level ile güvenilir çözülmez — çözüm bilinçli locking: optimistic (`@Version`) veya pessimistic (`SELECT FOR UPDATE`)
+- `@Version` her UPDATE'in WHERE'ine girer; 0 satır etkilenirse `OptimisticLockingFailureException` — retry pattern olmadan optimistic locking yarımdır
+- Money movement için pessimistic + lock ordering; düşük çatışmalı configuration işleri için optimistic + retry; dağıtıkta optimistic local + Saga/Outbox
+- Deadlock'un panzehiri lock ordering: tüm transaction'lar hesapları ID sırasıyla kilitler, döngüsel bekleme kurulamaz hale gelir
+- Banking-grade retry: sadece concurrency exception, max attempt, exponential backoff + jitter + max delay cap, Micrometer metrics
+- `NOWAIT` hızlı fail, `lock_timeout` sınırlı bekleme, `SKIP LOCKED` multi-worker queue; PostgreSQL SERIALIZABLE (SSI) + retry lock-free alternatiftir
+```
+
+---
+
+## Pratik yapmak istersen
+
+Kavramları koda dökmek istersen aşağıdaki iki ek hazır: test yazma rehberi optimistic conflict, retry, deadlock ve `SKIP LOCKED` için örnek testler içerir; Claude-verify prompt'u ile yazdığın locking kodunu banking-grade perspektiften denetletebilirsin. Önerilen pratik sırası: `@Version` + migration → manuel retry loop ve `@Retryable` karşılaştırması → `PESSIMISTIC_WRITE` + lock ordering ile `TransferService` → deadlock reprodüksiyonu (ordering'siz versiyon) + `jstack` analizi → SERIALIZABLE alternatifi ve performans kıyası → `SKIP LOCKED` job queue → Micrometer metrics'li `ResilientTransferService`.
+
+<details>
+<summary>Test yazma rehberi</summary>
 
 ### Test 2.4.1 — Optimistic lock conflict
 
@@ -1155,13 +1362,16 @@ void lockOrderingShouldEliminateDeadlock() throws Exception {
 }
 ```
 
+Aynı testi lock ordering'siz `TransferService` versiyonuna karşı da koştur: orada `deadlocks.get()` sıfırdan büyük çıkmalı. İki sonucu (deadlock sayısı, success oranı) karşılaştırıp not al; ordering'siz versiyon çalışırken `jps` ile PID bulup `jstack -l <pid>` çıktısını incelemek analiz alışkanlığı kazandırır.
+
 ### Test 2.4.4 — `SKIP LOCKED` queue test
 
-İki transaction simultaneously aynı `claimBatch(5)` çağrısı yapsın, sonuçların **kesişimi boş** olmalı. PostgreSQL gerçek behavior'u TestContainers ile test.
+İki transaction simultaneously aynı `claimBatch(5)` çağrısı yapsın, sonuçların **kesişimi boş** olmalı. PostgreSQL gerçek behavior'u TestContainers ile test. İstersen iki uygulama instance'ı aç (farklı port), 50 pending kayıt insert et, log'larda aynı kaydın iki instance'ta görünmediğini doğrula.
 
----
+</details>
 
-## Claude-verify prompt
+<details>
+<summary>Claude-verify prompt</summary>
 
 ```
 Banking domain'inde yazdığım concurrency / locking kodumu aşağıdaki kriterlere göre 
@@ -1194,13 +1404,13 @@ değerlendir. PASS / FAIL / EKSIK işaretle, KOD YAZMA, sadece neyin yanlış ol
    - 100 iterasyon A↔B test'i 0 deadlock üretiyor mu?
 
 5. Deadlock analizi:
-   - `docs/deadlock-analysis.md` jstack çıktısı + analiz ile yazılı mı?
+   - jstack çıktısı alınıp analiz notu yazıldı mı?
    - Lock ordering öncesi vs sonrası deadlock sayıları karşılaştırılmış mı?
 
 6. PostgreSQL SERIALIZABLE alternatifi:
    - SerializableTransferService implementasyonu var mı?
    - CannotSerializeTransactionException yakalanıp retry mı?
-   - Performans karşılaştırması (pessimistic vs serializable) defter notunda mı?
+   - Performans karşılaştırması (pessimistic vs serializable) not edilmiş mi?
 
 7. SKIP LOCKED:
    - pending_transactions tablosu + claimBatch native query mevcut mu?
@@ -1228,36 +1438,6 @@ değerlendir. PASS / FAIL / EKSIK işaretle, KOD YAZMA, sadece neyin yanlış ol
 Her madde için PASS / FAIL / EKSIK ve kısa gerekçe. Kod yazma.
 ```
 
----
+</details>
 
-## Tamamlama kriterleri
-
-- [ ] `@Version` tüm money-movement entity'lerinde aktif, DB'de NOT NULL DEFAULT 0
-- [ ] Optimistic conflict reprodüksiyon test'i geçiyor
-- [ ] Manuel retry loop ve `@Retryable` versiyonlarını her ikisini de yazdım
-- [ ] `PESSIMISTIC_WRITE` ile `findByIdForUpdate` repository method'u var
-- [ ] Lock timeout query hint ile 3 saniye limit
-- [ ] Lock ordering ile `TransferService` 100 iterasyon A↔B test'inde 0 deadlock
-- [ ] Lock ordering YOK versiyonunda deadlock üretildi, jstack analizi `docs/`'a kaydedildi
-- [ ] PostgreSQL SERIALIZABLE alternatifi yazıldı, performans karşılaştırıldı
-- [ ] `SKIP LOCKED` ile job queue pattern çalıştı, multi-instance test geçti
-- [ ] Exponential backoff + jitter + max delay cap doğru
-- [ ] Retry metrics Micrometer'a yazılıyor (`/actuator/metrics/transfer.retry` gözüktü)
-- [ ] Anti-pattern listesi rahat — özellikle "lock ordering unutmak", "business exception retry"
-
-Hepsi onaylı → Topic 2.5'e geç → [05-n-plus-one/](../05-n-plus-one/index.md)
-
----
-
-## Defter notları
-
-1. "Optimistic locking'in temeli `@Version` kolonu + UPDATE WHERE version = ?. Çatışma olursa ____ exception fırlatılır."
-2. "Pessimistic locking'in SQL karşılığı ____. PostgreSQL'de `FOR UPDATE` ile `FOR SHARE` farkı ____."
-3. "`NOWAIT` ile `lock_timeout` farkı ____. Banking'de hangi senaryoda hangisi: ____."
-4. "`SKIP LOCKED`'ın asıl kullanım senaryosu ____ (queue pattern). Hangi DB versiyonlarında destekli: ____."
-5. "Deadlock üretmek için minimum şart: ____. Lock ordering ile çözüm prensibi: ____."
-6. "Exponential backoff formülü ____. Jitter neden eklenir: ____."
-7. "PostgreSQL SERIALIZABLE algoritması (SSI) lock yerine ____ kullanır. Pessimistic'e göre avantajı: ____."
-8. "Optimistic vs Pessimistic karar matrisi 3 boyutta: ____, ____, ____."
-9. "`OPTIMISTIC_FORCE_INCREMENT` ne zaman kullanılır (DDD aggregate pattern): ____."
-10. "Banking-grade retry pattern'in 5 zorunlu unsuru: ____, ____, ____, ____, ____."
+Hepsi tamam → Topic 2.5'e geç → [05-n-plus-one/](../05-n-plus-one/index.md)
