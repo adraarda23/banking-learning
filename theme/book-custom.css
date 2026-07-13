@@ -95,6 +95,25 @@
     opacity: 0.6;
 }
 
+/* Fosforlu kalem vurgusu: bölüm başına en fazla birkaç kritik cümle */
+.content mark {
+    background: linear-gradient(transparent 45%, rgba(255, 213, 79, 0.55) 45%);
+    color: inherit;
+    padding: 0 2px;
+    border-radius: 2px;
+}
+
+.navy .content mark,
+.coal .content mark,
+.ayu .content mark {
+    background: linear-gradient(transparent 45%, rgba(255, 213, 79, 0.28) 45%);
+}
+
+/* Anahtar terim vurgusu biraz nefes alsın */
+.content strong {
+    font-weight: 650;
+}
+
 /* Yazdırma: her bölüm yeni sayfadan başlasın */
 @media print {
     .content h1 {

@@ -35,7 +35,7 @@ System.out.println(0.1 + 0.2);          // 0.30000000000000004
 System.out.println(0.1 + 0.2 == 0.3);   // false
 ```
 
-Neden? IEEE 754 floating-point standardı **binary** tabanlı. 0.1 gibi decimal sayıların binary'de kesin temsili yok — tıpkı 1/3'ün decimal'de 0.3333... olarak sonsuza gitmesi gibi. `float` 7 basamak hassasiyet sunar, `double` 15-17; ikisi de finansal kesinlik için yetersiz.
+Neden? **IEEE 754** floating-point standardı **binary** tabanlı. 0.1 gibi decimal sayıların binary'de kesin temsili yok — tıpkı 1/3'ün decimal'de 0.3333... olarak sonsuza gitmesi gibi. `float` 7 basamak hassasiyet sunar, `double` 15-17; ikisi de finansal kesinlik için yetersiz.
 
 Peki banking'de bu ne demek? Bir hesaba günde 10.000 işlem gelsin, her biri 0.1 TL eklesin. Beklenen toplam 1000.00 TL; `double` ile 999.9999999... veya 1000.0000001 çıkabilir. Milyonlarca müşteride bu kuruş hataları birikir — gerçek para kaybı ya da fazla yazım. TCMB/BDDK denetiminde yakalandığında ceza, lisans riski ve müşteri itirazları kapıda.
 
@@ -106,7 +106,7 @@ a.equals(b);            // FALSE — scale farklı
 a.compareTo(b) == 0;    // TRUE — değer aynı
 ```
 
-`equals` scale'i de karşılaştırır; `compareTo` sadece değeri. Bu yüzden `compareTo`, `equals` ile **consistent değildir** — `HashSet`/`HashMap` key'i olarak BigDecimal kullanırken bunu unutan çok junior gördüm.
+<mark>`equals` scale'i de karşılaştırır; `compareTo` sadece değeri</mark>. Bu yüzden `compareTo`, `equals` ile **consistent değildir** — `HashSet`/`HashMap` key'i olarak BigDecimal kullanırken bunu unutan çok junior gördüm.
 
 ```admonish tip title="İpucu"
 **Banking pratiği:** İki para miktarını her zaman `compareTo` ile karşılaştır, `equals` ile asla. Map key olarak BigDecimal kullanma — string veya normalize edilmiş scale kullan.
@@ -133,7 +133,7 @@ BigDecimal value = new BigDecimal("100.123456");
 BigDecimal rounded = value.setScale(2, RoundingMode.HALF_EVEN);  // 100.12
 ```
 
-Banking'de **her zaman** rounding mode belirt, default'a güvenme. Peki hangi mode? Sıradaki konu tam olarak bu.
+<mark>Banking'de **her zaman** rounding mode belirt, default'a güvenme</mark>. Peki hangi mode? Sıradaki konu tam olarak bu.
 
 ### 3. RoundingMode — banking'in en kritik konularından
 
@@ -231,7 +231,7 @@ a.divide(b, new MathContext(10, RoundingMode.HALF_EVEN));  // 10 significant dig
 
 ### 4. `Currency` — para birimi bir string değil
 
-Miktarı çözdük; peki "100.00 neyin 100.00'ı?" `java.util.Currency`, ISO 4217 standardındaki para birimlerini temsil eder — ve her birimin ondalık hane sayısı farklıdır:
+Miktarı çözdük; peki "100.00 neyin 100.00'ı?" `java.util.Currency`, **ISO 4217** standardındaki para birimlerini temsil eder — ve her birimin ondalık hane sayısı farklıdır:
 
 ```java
 Currency tl  = Currency.getInstance("TRY");
@@ -253,7 +253,7 @@ Bunun pratik sonucu: `Money` value object'in scale'i **currency'nin default frac
 
 #### Currency-aware aritmetik
 
-100 TRY + 100 USD kaç eder? Cevap yok — bu bir **bug**. Farklı currency'ler arası aritmetik otomatik hata olmalı; önce conversion yapılır:
+100 TRY + 100 USD kaç eder? Cevap yok — bu bir **bug**. <mark>Farklı currency'ler arası aritmetik otomatik hata olmalı</mark>; önce conversion yapılır:
 
 ```java
 public Money add(Money other) {
@@ -294,7 +294,7 @@ public class ExchangeRate {
 3,350 TRY → 100.00 USD (rate 0.02985...)
 ```
 
-HALF_EVEN ile geri dönüş çoğu zaman tutar, ama büyük sayılarda 1 kuruş kayıp olabilir. Round-trip'i asla expectation olarak kabul etme; testlerde tolerance ile assert et.
+HALF_EVEN ile geri dönüş çoğu zaman tutar, ama büyük sayılarda 1 kuruş kayıp olabilir. <mark>Round-trip'i asla expectation olarak kabul etme</mark>; testlerde tolerance ile assert et.
 
 **Tuzak 2 — cross rate.** Direct rate yoksa (TRY → JPY için TRY → USD → JPY) iki ayrı conversion iki ayrı rounding demek → **kümülatif hata**:
 
@@ -453,7 +453,7 @@ a.equals(BigDecimal.ZERO);     // FALSE (scale farklı)
 a.compareTo(BigDecimal.ZERO);  // 0
 ```
 
-**Performans:** `BigDecimal` sınırsızdır ama bedava değildir. Hot path'te (her transaction'da çağrılan kod) gereksiz operasyon yapma.
+**Performans:** `BigDecimal` sınırsızdır ama bedava değildir. **Hot path**'te (her transaction'da çağrılan kod) gereksiz operasyon yapma.
 
 **`stripTrailingZeros` tuzağı:**
 
@@ -601,7 +601,7 @@ public record Money(BigDecimal amount, Currency currency) {
 
 İki inceliğe dikkat:
 
-- Compact constructor'da `amount = amount.setScale(...)` ile parameter'ı değiştiriyoruz — record syntax'ında bu geçerli.
+- **Compact constructor**'da `amount = amount.setScale(...)` ile parameter'ı değiştiriyoruz — record syntax'ında bu geçerli.
 - `equals`/`hashCode` record tarafından üretilir ve BigDecimal'ın scale'e duyarlı `equals`'ını kullanır. Ama compact constructor scale'i normalize ettiği için `Money.of("100", TRY)` da `Money.of("100.00", TRY)` da içeride `100.00 TRY` olur — equals **true**. Normalization tam da bu yüzden var.
 
 ---

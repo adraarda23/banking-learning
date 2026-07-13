@@ -71,7 +71,7 @@ Fark net: standart bir format, stacktrace yerine `traceId`, kullanıcıya göste
 
 ### 2. RFC 7807 — Problem Details for HTTP APIs
 
-Herkes kendi error formatını uydurursa her client her API için ayrı parser yazar; [RFC 7807](https://tools.ietf.org/html/rfc7807) bu kaosu bitiren standart. Beş standart alan tanımlar:
+Herkes kendi error formatını uydurursa her client her API için ayrı parser yazar; **[RFC 7807](https://tools.ietf.org/html/rfc7807)** bu kaosu bitiren standart. Beş standart alan tanımlar:
 
 | Alan | Anlamı |
 |---|---|
@@ -123,7 +123,7 @@ sequenceDiagram
     H-->>C: 422 application/problem+json
 ```
 
-Handler'ın iskeleti şöyle. İki örnek yeter — domain exception ve catch-all; diğer domain exception'lar (`AccountNotFoundException` → 404, `CurrencyMismatchException` → 422 vb.) birebir aynı kalıbı izler, validation'ı da bölüm 11'de göreceğiz:
+Handler'ın iskeleti şöyle. İki örnek yeter — domain exception ve **catch-all**; diğer domain exception'lar (`AccountNotFoundException` → 404, `CurrencyMismatchException` → 422 vb.) birebir aynı kalıbı izler, validation'ı da bölüm 11'de göreceğiz:
 
 ```java
 @RestControllerAdvice
@@ -166,7 +166,7 @@ class GlobalExceptionHandler {
 }
 ```
 
-Catch-all handler'daki kalıba dikkat et: stacktrace **log'a** gider, response'a sadece generic mesaj + `traceId` yazılır. Bu, bölümün en kritik refleksi.
+Catch-all handler'daki kalıba dikkat et: <mark>stacktrace **log'a** gider, response'a sadece generic mesaj + `traceId` yazılır</mark>. Bu, bölümün en kritik refleksi.
 
 ### 5. Exception hierarchy — banking için tasarım
 
@@ -191,7 +191,7 @@ flowchart LR
     VE --> ICE["InvalidCurrencyException"]
 ```
 
-Her exception bir HTTP status'a karşılık gelir — bu haritayı ezberleme, mantığını kavra: "kaynak yok" 404, "state uygun değil" 409, "istek anlaşıldı ama iş kuralı engelledi" 422, "istek bozuk" 400.
+Her exception bir HTTP status'a karşılık gelir — bu haritayı ezberleme, mantığını kavra: <mark>"kaynak yok" 404, "state uygun değil" 409, "istek anlaşıldı ama iş kuralı engelledi" 422, "istek bozuk" 400</mark>.
 
 | Exception | Status |
 |---|---|
@@ -324,7 +324,7 @@ ProblemDetail handle(AccountNotFoundException ex, ...) {
 Saldırgan farklı `accountId`'ler dener: hangileri 404, hangileri 401/403 dönüyor diye bakar. Status ayrımından, sistemde hangi hesapların **var olduğunu** öğrenir.
 ```
 
-Çözüm iki adım. Önce authentication kontrol edilir — başarısızsa **401 önce döner**. Sonra "erişim yok" ile "kaynak yok" aynı yanıtı verir:
+Çözüm iki adım. Önce authentication kontrol edilir — başarısızsa **401 önce döner**. Sonra <mark>"erişim yok" ile "kaynak yok" aynı yanıtı verir</mark>:
 
 ```java
 // Better
@@ -373,7 +373,7 @@ Production'da kullanıcı "hata aldım" dediğinde log yığınında o hatayı n
 2. Sysadmin log'larda `traceId`'yi arar
 3. Tam stacktrace'i bulur, sorunu çözer
 
-`traceId` her request'in başında üretilir, MDC ile her log satırına girer, response'a da yazılır:
+`traceId` her request'in başında üretilir, **MDC** ile her log satırına girer, response'a da yazılır:
 
 ```mermaid
 sequenceDiagram
@@ -415,7 +415,7 @@ class TraceIdFilter implements Filter {
 }
 ```
 
-`finally` bloğundaki `MDC.remove`'a dikkat: thread'ler pool'dan geri dönüşümlü kullanılır, temizlemezsen bir sonraki request eski traceId'yi miras alır.
+`finally` bloğundaki `MDC.remove`'a dikkat: thread'ler pool'dan geri dönüşümlü kullanılır, <mark>temizlemezsen bir sonraki request eski traceId'yi miras alır</mark>.
 
 Logback pattern'ine MDC'yi ekle:
 
@@ -499,11 +499,11 @@ Error code'lar sadece kodda yaşamaz; client ve partner ekipleri için dokümant
 **Retry:** Not automatic — user action required.
 ````
 
-Banking ekiplerinde error catalog **publicly documented** olur; client ve partner ekipleri entegrasyonu buradan yazar.
+Banking ekiplerinde **error catalog** **publicly documented** olur; client ve partner ekipleri entegrasyonu buradan yazar.
 
 ### 13. Logging levels — banking pratiği
 
-Her hatayı ERROR'la loglamak, hiçbirini loglamamak kadar kötü — alarm yorgunluğu yaratır. Hangi exception hangi level'da:
+Her hatayı ERROR'la loglamak, hiçbirini loglamamak kadar kötü — **alarm yorgunluğu** yaratır. Hangi exception hangi level'da:
 
 | Exception | Log level |
 |---|---|

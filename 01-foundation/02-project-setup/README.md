@@ -145,8 +145,8 @@ Bu projede **Initializr ile başla.** Sonra `pom.xml`'i inceleyip "Initializr ne
 Bu dosyada üç şeye dikkat et:
 
 - **`<parent>`:** Spring Boot'un parent POM'u `dependencyManagement` getirir — Spring Boot dependency'lerine versiyon yazmazsın, parent yönetir. Versiyon uyumsuzluğu derdi biter.
-- **`spring-boot-starter-*`:** Starter = bir grup ilgili dependency. `starter-web` tek satır ama arkada Spring MVC + Tomcat + Jackson dahil ~30 jar gelir.
-- **`spring-boot-maven-plugin`:** `mvn spring-boot:run` ve fat JAR build bunun sayesinde.
+- **`spring-boot-starter-*`:** **Starter** = bir grup ilgili dependency. `starter-web` tek satır ama arkada Spring MVC + Tomcat + Jackson dahil ~30 jar gelir.
+- **`spring-boot-maven-plugin`:** `mvn spring-boot:run` ve **fat JAR** build bunun sayesinde.
 
 ### 4. Maven temel komutlar
 
@@ -243,7 +243,7 @@ logging:
 
 Üç satır özellikle önemli:
 
-- **`${DB_PASSWORD:}`:** Environment variable set edilmemişse boş string. Production'da password yml'de olmaz — env var veya secret manager'dan gelir.
+- **`${DB_PASSWORD:}`:** Environment variable set edilmemişse boş string. <mark>Production'da password yml'de olmaz — env var veya secret manager'dan gelir.</mark>
 - **`ddl-auto: validate`:** Hibernate schema'ya dokunmasın, sadece doğrulasın. Migration Flyway'in işi.
 - **`exposure.include`:** Actuator'da neyi expose edeceğini sen seçersin. Production'da `health,info,prometheus` kâfi.
 
@@ -265,7 +265,7 @@ src/main/resources/
 └── application-prod.yml         ← `prod` profile aktifken eklenir
 ```
 
-Override mekaniği basit: önce `application.yml` yüklenir, üzerine aktif profile'in dosyası biner. Aynı key varsa profile-specific olan kazanır.
+Override mekaniği basit: önce `application.yml` yüklenir, üzerine aktif profile'in dosyası biner. <mark>Aynı key varsa profile-specific olan kazanır.</mark>
 
 ```mermaid
 flowchart LR
@@ -329,7 +329,7 @@ Birden fazla profile de verebilirsin: `SPRING_PROFILES_ACTIVE=prod,monitoring,de
 
 ### 8. Configuration source precedence (kim kazanır)
 
-Aynı key birden fazla kaynaktan geldiğinde kim kazanır? Spring Boot'un net bir öncelik sırası var — sondaki en güçlü:
+Aynı key birden fazla kaynaktan geldiğinde kim kazanır? Spring Boot'un net bir **öncelik sırası** var — sondaki en güçlü:
 
 ```mermaid
 flowchart LR
@@ -424,7 +424,7 @@ class TransferService {
 }
 ```
 
-**Banking kuralı:** Tüm business rule config'leri için `@ConfigurationProperties`. `@Value` sadece çok basit, tekil durumlarda.
+**Banking kuralı:** <mark>Tüm business rule config'leri için `@ConfigurationProperties`.</mark> `@Value` sadece çok basit, tekil durumlarda.
 
 ### 10. Property naming — kebab-case ↔ camelCase
 
@@ -477,7 +477,7 @@ Bir bankada sızmış bir DB password'ü regülasyon olayıdır — o yüzden cr
 - Slack/email üzerinden paylaşılan password
 ```
 
-Üretimde secret'lar bir secret manager'dan gelir: HashiCorp Vault, AWS Secrets Manager, Kubernetes Secrets (dikkat: base64'tür, encrypted değil) veya Sealed Secrets. Local dev için ara çözüm: gitignored `.env` dosyası veya `application-local.yml`.
+Üretimde secret'lar bir **secret manager**'dan gelir: HashiCorp Vault, AWS Secrets Manager, Kubernetes Secrets (dikkat: base64'tür, encrypted değil) veya Sealed Secrets. Local dev için ara çözüm: gitignored `.env` dosyası veya `application-local.yml`.
 
 Spring Boot 3.2+ ile Vault entegrasyonu tek satır:
 
@@ -491,7 +491,7 @@ Bunu Phase 8'de (Security) detaylı yapacağız; şimdilik environment variable 
 
 ### 13. Spring Boot DevTools
 
-Her kod değişikliğinde uygulamayı elle restart etmek zaman yer — DevTools bunu otomatikleştirir:
+Her kod değişikliğinde uygulamayı elle restart etmek zaman yer — **DevTools** bunu otomatikleştirir:
 
 ```xml
 <dependency>
@@ -524,7 +524,7 @@ flowchart TD
     C3 --> CS["Main class paketi ve alt paketleri taranir"]
 ```
 
-Kural net: sadece main class'ın **paketi ve alt paketleri** taranır. Main class `com.mavibank.banking`'deyse:
+Kural net: <mark>sadece main class'ın **paketi ve alt paketleri** taranır.</mark> Main class `com.mavibank.banking`'deyse:
 
 - `com.mavibank.banking.account.adapter.in.web.*` ✓ taranır
 - `com.mavibank.banking.transfer.adapter.out.persistence.*` ✓ taranır

@@ -55,7 +55,7 @@ flowchart LR
 
 Standart: JSR 380 (Jakarta Bean Validation 3.0). Implementation: **Hibernate Validator** — Spring Boot'un default'u, ekstra kurulum gerekmez.
 
-İşin büyük kısmını standart constraint'ler karşılar. Tabloyu ezberleme; hangi ihtiyaca hangi annotation'ın karşılık geldiğini bil:
+İşin büyük kısmını **standart constraint'ler** karşılar. Tabloyu ezberleme; hangi ihtiyaca hangi annotation'ın karşılık geldiğini bil:
 
 | Annotation | Anlamı |
 |---|---|
@@ -117,7 +117,7 @@ public record TransferRequest(
 ) {}
 ```
 
-BigDecimal için `@Min`/`@Max` değil `@DecimalMin`/`@DecimalMax` kullanıyoruz — long bazlı olanlar ondalık kesinliği kaybettirir.
+<mark>BigDecimal için `@Min`/`@Max` değil `@DecimalMin`/`@DecimalMax` kullanıyoruz</mark> — long bazlı olanlar ondalık kesinliği kaybettirir.
 
 ### 4. `@Valid` etkinleştirme
 
@@ -178,7 +178,7 @@ Default response'ta stacktrace expose olabiliyor ve hangi field'ın neden redded
 
 Standart constraint'ler "3 büyük harf" gibi kuralları karşılar, ama IBAN checksum'ı gibi domain'e özgü format kurallarını karşılamaz. Banking'de IBAN doğrulamak o kadar yaygın ki, ilk custom validator'ın bu olacak.
 
-Custom validator her zaman aynı 3 adımdır:
+**Custom validator** her zaman aynı 3 adımdır:
 
 ```mermaid
 flowchart LR
@@ -211,7 +211,7 @@ public @interface IbanFormat {
 
 #### Adım 2: Validator implementation
 
-IBAN'ın matematiği: ilk 4 karakteri sona taşı, harfleri sayıya çevir (A=10, B=11, ...), çıkan dev sayının mod 97'si 1 olmalı.
+IBAN'ın matematiği: ilk 4 karakteri sona taşı, harfleri sayıya çevir (A=10, B=11, ...), çıkan dev sayının **mod 97**'si 1 olmalı.
 
 ```java
 package com.mavibank.banking.common.validation;
@@ -265,7 +265,7 @@ flowchart LR
     G -- "hayır" --> R
 ```
 
-Buradaki incelik: validator null'a **izin verir**. Null kontrolü `@NotNull`'ın sorumluluğu — her constraint tek bir şeyi kontrol eder, böylece "optional ama girilirse geçerli IBAN" gibi kombinasyonlar kurulabilir.
+Buradaki incelik: validator null'a **izin verir**. <mark>Null kontrolü `@NotNull`'ın sorumluluğu</mark> — her constraint tek bir şeyi kontrol eder, böylece "optional ama girilirse geçerli IBAN" gibi kombinasyonlar kurulabilir.
 
 #### Adım 3: Kullanım
 
@@ -379,7 +379,7 @@ public record TransferRequest(...) {}
 
 ### 9. Validation group'ları — aynı DTO, farklı senaryolar
 
-Aynı DTO bazen farklı endpoint'lerde farklı kurallara tabidir: "hesap aç"ta `id` olmamalı, "hesap güncelle"de zorunlu. Group'lar bunu tek DTO ile çözer:
+Aynı DTO bazen farklı endpoint'lerde farklı kurallara tabidir: "hesap aç"ta `id` olmamalı, "hesap güncelle"de zorunlu. **Validation group**'ları bunu tek DTO ile çözer:
 
 ```java
 public interface OnCreate {}
@@ -414,7 +414,7 @@ public AccountResponse update(
 ) { ... }
 ```
 
-Fark önemli: `@Valid` standarttır ama group bilmez; `@Validated` Spring'e özgüdür ve group destekler.
+Fark önemli: <mark>`@Valid` standarttır ama group bilmez; `@Validated` Spring'e özgüdür ve group destekler</mark>.
 
 ```admonish tip title="İpucu"
 **Banking pratiği:** Tek DTO + group genelde **karışıklığa** sebep olur — hangi field hangi senaryoda zorunlu, kod okuyarak anlaşılmaz. Daha temiz yol: her senaryo için ayrı DTO. Group'ları biliyor ol ama **kullanırken iki kere düşün.**
@@ -438,7 +438,7 @@ public @interface IsoCurrencyCode {
 }
 ```
 
-Composite annotation'da validator class yok (`validatedBy = {}`) — işi üzerindeki constraint'ler yapar. Kullanımı:
+**Composite annotation**'da validator class yok (`validatedBy = {}`) — işi üzerindeki constraint'ler yapar. Kullanımı:
 
 ```java
 public record OpenAccountRequest(
@@ -453,7 +453,7 @@ public record OpenAccountRequest(
 
 ### 11. Nested validation — `@Valid` ile cascade
 
-DTO içinde başka DTO varsa validation otomatik içeri inmez — cascade'i açıkça istemen gerekir:
+DTO içinde başka DTO varsa validation otomatik içeri inmez — **cascade**'i açıkça istemen gerekir:
 
 ```java
 public record AddressDto(
@@ -519,7 +519,7 @@ class AccountService {
 
 ### 14. Validation message i18n
 
-TR bankalarında Türkçe + İngilizce mesaj desteği yaygın; hardcoded mesaj yerine message key kullan.
+TR bankalarında Türkçe + İngilizce mesaj desteği yaygın; hardcoded mesaj yerine **message key** kullan.
 
 `messages.properties`:
 ```
@@ -600,7 +600,7 @@ public void process(String userInput) {
 }
 ```
 
-Banking'de **her input** validate + sanitize edilir: prepared statement, escape, whitelist. Validation güvenlik zincirinin ilk halkasıdır, son halkası değil.
+Banking'de **her input** validate + sanitize edilir: prepared statement, escape, whitelist. <mark>Validation güvenlik zincirinin ilk halkasıdır, son halkası değil</mark>.
 
 ---
 

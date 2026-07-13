@@ -58,7 +58,7 @@ Bu kodun problemleri:
 6. **API evolution zor.** Aynı entity = aynı JSON = backward compat kırılır.
 ```
 
-Çözüm basit: HTTP sınırında **ayrı DTO'lar** kullan. Entity hiçbir zaman bu sınırı geçmez; veri katmanlar arasında şöyle akar:
+Çözüm basit: HTTP sınırında **ayrı DTO'lar** kullan. <mark>Entity hiçbir zaman bu sınırı geçmez</mark>; veri katmanlar arasında şöyle akar:
 
 ```mermaid
 flowchart LR
@@ -147,7 +147,7 @@ Tek DTO'nun sorunları:
 - Mass assignment riski geri gelir
 ```
 
-Kural şu: her endpoint için **yön bazlı** DTO yaz — `OpenAccountRequest` / `AccountResponse`, `TransferRequest` / `TransferResponse`, `UpdateAccountStatusRequest` gibi.
+Kural şu: <mark>her endpoint için **yön bazlı** DTO yaz</mark> — `OpenAccountRequest` / `AccountResponse`, `TransferRequest` / `TransferResponse`, `UpdateAccountStatusRequest` gibi.
 
 ```admonish tip title="İpucu"
 Bu yaklaşım PR'da daha çok dosya yaratır ama **explicit > implicit**.
@@ -155,7 +155,7 @@ Bu yaklaşım PR'da daha çok dosya yaratır ama **explicit > implicit**.
 
 ### 3. RESTful resource design — banking
 
-URL'ler API'nin vitrinidir; kaynak (resource) odaklı düşünürsen tutarlı kalır:
+URL'ler API'nin vitrinidir; **kaynak (resource)** odaklı düşünürsen tutarlı kalır:
 
 - `/accounts` — hesap collection
 - `/accounts/{id}` — tek hesap
@@ -190,7 +190,7 @@ Karar ekibe ait — ama hangisini seçersen seç, **tutarlı ol**.
 
 ### 4. Idempotency — banking için kritik
 
-Neden önemli, tek cümle: bir transfer iki kez işlenirse çift ödeme olur, çift ödeme felakettir. Network timeout'ta client retry yapar ve aynı istek iki kez gelir — buna hazır olmalısın.
+Neden önemli, tek cümle: <mark>bir transfer iki kez işlenirse çift ödeme olur</mark>, çift ödeme felakettir. Network timeout'ta client retry yapar ve aynı istek iki kez gelir — buna hazır olmalısın.
 
 Çözüm: `POST /transfers` endpoint'inde **`Idempotency-Key` header** zorunlu olsun.
 
@@ -359,7 +359,7 @@ GET /transactions?cursor=eyJpZCI6Ii4uLiJ9&limit=20
 
 Bölüm 1'deki manuel `toResponse` metodunu hatırla: sıkıcı, tekrarlı ve hata-prone. Entity'e yeni field ekleyip mapper'ı güncellemeyi unutursan response'da o field eksik kalır — sessiz bir bug.
 
-**MapStruct** bu kodu annotation-processor ile compile-time'da senin yerine üretir:
+**MapStruct** bu kodu **annotation-processor** ile compile-time'da senin yerine üretir:
 
 ```java
 @Mapper(componentModel = "spring")
@@ -425,7 +425,7 @@ Lombok ile birlikte kullanacaksan annotation processor sırası önemli — `lom
 </path>
 ```
 
-Peki mapper'lar nerede yaşar? **Adapter katmanında**, domain'de değil:
+Peki mapper'lar nerede yaşar? <mark>**Adapter katmanında**, domain'de değil</mark>:
 
 ```
 banking/account/adapter/in/web/AccountWebMapper.java
@@ -479,7 +479,7 @@ Domain'de Lombok **tartışmalı** — bazı ekipler görünmezlik yüzünden hi
 
 ### 10. `record` vs class vs Lombok — modern Java kararı
 
-Java 16+ ile `record`, immutable data class'ı dile gömdü — çoğu DTO için Lombok'a gerek kalmadı:
+Java 16+ ile **`record`**, immutable data class'ı dile gömdü — çoğu DTO için Lombok'a gerek kalmadı:
 
 ```java
 public record AccountResponse(
@@ -547,7 +547,7 @@ TR bankalarında çoğunlukla **camelCase JSON** kullanılır; bu projede de cam
 
 ### 12. API versioning
 
-API yayınlandığı an client'lar ona bağımlı olur; breaking change yapmanın tek güvenli yolu versioning. Banking'de **şart**. Üç yöntem:
+API yayınlandığı an client'lar ona bağımlı olur; breaking change yapmanın tek güvenli yolu **versioning**. Banking'de **şart**. Üç yöntem:
 
 1. **URL versioning:** `/v1/accounts`, `/v2/accounts` — en explicit, banking'de yaygın
 2. **Header versioning:** `Accept: application/vnd.mavibank.v2+json`
@@ -565,7 +565,7 @@ Yeni versiyon geldiğinde `/v1/accounts` çalışmaya devam eder (backward compa
 
 ### 13. HATEOAS — ne, neden, ne zaman?
 
-REST'in en üst seviyesi (Richardson Maturity Model) HATEOAS: response'ta ilgili kaynakların link'leri gelir.
+REST'in en üst seviyesi (Richardson Maturity Model) **HATEOAS**: response'ta ilgili kaynakların link'leri gelir.
 
 ```json
 {

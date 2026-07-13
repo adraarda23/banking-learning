@@ -95,7 +95,7 @@ Peki sorun ne? Dikkat et: Service, JPA repository'e bağımlı. Yani iş kuralla
 
 ### 3. Hexagonal Architecture (Ports & Adapters)
 
-Şimdi bağımlılık yönünü ters çevirelim. Alistair Cockburn'ün 2005'te önerdiği fikir: **çekirdek domain logic ortada durur**, tüm dış dünya (DB, HTTP, Kafka) çevrede. Çekirdek dış dünyaya bağımlı değildir — dış dünya çekirdeğe bağımlıdır.
+Şimdi bağımlılık yönünü ters çevirelim. Alistair Cockburn'ün 2005'te önerdiği fikir: **çekirdek domain logic ortada durur**, tüm dış dünya (DB, HTTP, Kafka) çevrede. <mark>Çekirdek dış dünyaya bağımlı değildir — dış dünya çekirdeğe bağımlıdır.</mark>
 
 İki anahtar kavram var:
 
@@ -263,7 +263,7 @@ Controller sadece port interface'ini bilir, service persistence'a sadece port ü
 
 **Kazandıkların:**
 
-1. **Domain saf Java.** Spring ve JPA olmadan çalışır; unit test'ler mock'sız yazılır.
+1. **Domain saf Java.** <mark>Spring ve JPA olmadan çalışır; unit test'ler mock'sız yazılır.</mark>
 2. **Adapter değiştirilebilir.** JPA → MongoDB geçişinde sadece adapter değişir.
 3. **Test piramidi sağlıklı:** domain unit test (hızlı, çok), adapter test (TestContainers), integration test (az).
 4. **Açık kontrat:** port'lar, "uygulamanın dış dünyadan ihtiyaçları neler" sorusunun tek cevabı.
@@ -289,7 +289,7 @@ Bu isimleri iş ilanlarında ve mülakatlarda göreceksin, paniğe gerek yok:
 
 ### 5. Domain-Driven Design (DDD) — mimari değil ama bağlantılı
 
-Hexagonal sana "domain'i ortaya koy" der ama o domain'i **nasıl modelleyeceğini** söylemez. Orada DDD devreye girer (Eric Evans, 2003). DDD bir mimari değil, modelleme yaklaşımıdır — hexagonal ile çok iyi eşleşir.
+Hexagonal sana "domain'i ortaya koy" der ama o domain'i **nasıl modelleyeceğini** söylemez. Orada DDD devreye girer (Eric Evans, 2003). **DDD** bir mimari değil, modelleme yaklaşımıdır — hexagonal ile çok iyi eşleşir.
 
 Faz 1'de bilmen gereken parçaları:
 
@@ -333,7 +333,7 @@ public record Money(BigDecimal amount, Currency currency) {
 }
 ```
 
-Dikkat: currency mismatch kuralı `Money`'nin **içinde** yaşıyor. Onu kullanan hiçbir servis bu kontrolü unutamaz.
+Dikkat: currency mismatch kuralı `Money`'nin **içinde** yaşıyor. <mark>Onu kullanan hiçbir servis bu kontrolü unutamaz.</mark>
 
 **Banking örneği — aggregate root:**
 
@@ -446,7 +446,7 @@ Bu projede Variant A kullanacağız.
 
 ### 7. Maven multi-module ile fiziksel ayrılık (opsiyonel ama güçlü)
 
-Package ayrımı bir söz; multi-module ise **derleyicinin zorladığı** bir sözleşme. Katmanları ayrı Maven module'lerine bölersin:
+Package ayrımı bir söz; **multi-module** ise **derleyicinin zorladığı** bir sözleşme. Katmanları ayrı Maven module'lerine bölersin:
 
 ```
 core-banking/
@@ -480,7 +480,7 @@ Avantajı compile-time enforcement: domain modülünde Spring dependency'si olma
 
 ### 8. Architectural Decision Records (ADR)
 
-Altı ay sonra "biz neden hexagonal seçmiştik?" diye soran olacak — belki de o kişi sen olacaksın. ADR, mimari kararları yazılı kayıt altına alma alışkanlığıdır: `core-banking/docs/adr/` klasörü, her karar için bir markdown dosyası.
+Altı ay sonra "biz neden hexagonal seçmiştik?" diye soran olacak — belki de o kişi sen olacaksın. **ADR**, mimari kararları yazılı kayıt altına alma alışkanlığıdır: `core-banking/docs/adr/` klasörü, her karar için bir markdown dosyası.
 
 Template:
 
@@ -533,7 +533,7 @@ class AccountService {
 }
 ```
 
-Sorun: `Account`'un iç tutarlılığı dışarıdan korunmak zorunda. Başka bir servis aynı kontrolü unutursa bakiye negatife düşer. Doğrusu: `account.withdraw(amount)` — kural nesnenin içinde yaşar.
+Sorun: `Account`'un iç tutarlılığı dışarıdan korunmak zorunda. Başka bir servis aynı kontrolü unutursa bakiye negatife düşer. Doğrusu: `account.withdraw(amount)` — <mark>kural nesnenin içinde yaşar</mark>.
 
 **Anti-pattern 2: Her şeyi yapan Service**
 
