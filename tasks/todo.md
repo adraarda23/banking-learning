@@ -35,6 +35,12 @@
 - [x] Test rehberi + Claude-verify → "Pratik yapmak istersen" katlanır eki
 - [x] Mini-project istisnası: proje karakteri korundu, sadece kod düzeni/katlama
 
+## Faz 2 yayılımı (2026-07-13)
+- [x] Faz 2 kapak sayfası + PHASE_TEST kitap formatı
+- [x] 7 topic + mini proje tek geçişte tam standart (8 paralel agent)
+- [x] QA temiz: 27 diyagram, 53 kutu, 56 soru, 89 katlanır kutu, 30 mark
+- [x] Commit: fba7574
+
 ## Review
 - Faz 1 pilot tamam: 34 diyagram, ~70 kutu, 56 soru, 93 katlanır kutu; QA temiz
 - Format standardı tasks/lessons.md + hafızada — kalan 11 faza aynı şablonla yayılacak

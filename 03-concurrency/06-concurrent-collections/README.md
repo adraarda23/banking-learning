@@ -1,12 +1,20 @@
 # Topic 3.6 — Concurrent Collections
 
+```admonish info title="Bu bölümde"
+- `HashMap`/`ArrayList` concurrent ortamda neden bozulur, `Collections.synchronizedMap` neden yetersiz kalır
+- `ConcurrentHashMap`'in Java 8+ iç mekanizması (segment-free, CAS, bin-level lock) ve atomic operasyonları: `merge`, `compute`, `computeIfAbsent`, `putIfAbsent`
+- `BlockingQueue` ailesinin producer/consumer pattern'i ve her üyenin en uygun banking senaryosu — bounded vs unbounded kararı
+- Senkronizasyon aidleri: `CountDownLatch`, `CyclicBarrier`, `Semaphore`, `Phaser`, `Exchanger` — hangi problem hangisini çözer
+- `CopyOnWriteArrayList` ve `ConcurrentSkipListMap` ne zaman doğru, ne zaman felaket + 6 banking anti-pattern'i
+```
+
 ## Hedef
 
-Java'nın **thread-safe collection** kütüphanesini derinlemesine öğrenmek. `ConcurrentHashMap`'in iç mekanizmasını (segment-free, CAS-based), `BlockingQueue` ailesinin kullanım pattern'lerini, `CountDownLatch`/`CyclicBarrier`/`Semaphore`/`Phaser`'ın hangi senaryoda ne çözdüğünü banking örnekleriyle kavramak. `synchronizedMap` ve `Collections.synchronizedList` gibi legacy yöntemlerden neden uzaklaştığımızı anlamak.
+Java'nın **thread-safe collection** kütüphanesini derinlemesine öğrenmek. `ConcurrentHashMap`'in iç mekanizmasını (segment-free, CAS-based), `BlockingQueue` ailesinin kullanım pattern'lerini, `CountDownLatch`/`CyclicBarrier`/`Semaphore`/`Phaser`'ın hangi senaryoda ne çözdüğünü banking örnekleriyle kavramak. `synchronizedMap` gibi legacy yöntemlerden neden uzaklaştığımızı anlamak.
 
 ## Süre
 
-Okuma: 2 saat • Mini task: 2.5 saat • Test: 1 saat • Toplam: ~5.5 saat
+Okuma: 2 saat • Kendini Sına: 45 dk • Pratik (opsiyonel): 2-3 saat • Toplam: ~2.5 saat (+ pratik)
 
 ## Önbilgi
 
@@ -20,10 +28,10 @@ Okuma: 2 saat • Mini task: 2.5 saat • Test: 1 saat • Toplam: ~5.5 saat
 
 ### 1. Single-threaded collection'lar neden thread-safe değil
 
-`HashMap`, `ArrayList`, `LinkedList` — concurrent yazmaya **dayanıksızdır**. Eşzamanlı modifikasyon sonucu:
+Önce tehlikeyi görelim: neden hiç uğraşmayıp `HashMap`'i paylaşamıyoruz? Çünkü `HashMap`, `ArrayList`, `LinkedList` eşzamanlı yazmaya **dayanıksızdır** ve sessizce bozulur.
 
 - **Lost update:** İki thread put yapar, biri kaybolur
-- **Infinite loop (Java 7 ve öncesi `HashMap` resize):** Resize sırasında linked list'in döngülenmesi, get() forever spins
+- **Infinite loop (Java 7 ve öncesi `HashMap` resize):** Resize sırasında linked list döngülenir, `get()` sonsuza spin eder
 - **`ConcurrentModificationException`:** Iteration sırasında başka thread modify ederse fail-fast
 
 Banking örneği — yanlış kod:
@@ -37,24 +45,19 @@ public void deposit(UUID accountId, BigDecimal amount) {
 }
 ```
 
-İki paralel `deposit(id, 100)`:
-1. T1 reads current=0
-2. T2 reads current=0
-3. T1 puts 100
-4. T2 puts 100
+İki paralel `deposit(id, 100)` şu sırayla ilerlerse: T1 current=0 okur, T2 current=0 okur, T1 100 yazar, T2 100 yazar. Sonuç 100 (oysa 200 olmalı) — **atomicity yok**, 100 TL bankaya hediye edildi.
 
-Sonuç: 100 (200 olması gerekirken). **Atomicity yok.** 100 TL bankaya hediye edildi.
+<mark>Birden fazla thread'in paylaştığı state'te `HashMap` asla kullanılmaz</mark> — bozulma olasılık değil, zaman meselesidir.
 
 ### 2. Eski çözüm: `Collections.synchronizedMap`
+
+İlk akla gelen çare her metodu kilitlemek — çalışır ama iki nedenle yetersizdir.
 
 ```java
 Map<UUID, BigDecimal> sync = Collections.synchronizedMap(new HashMap<>());
 ```
 
-Her metot `synchronized` ile sarılır. **Çalışır ama kötü:**
-
-- **Tüm map için tek lock** → 100 paralel okuma 100 kez sıraya girer (performans katil)
-- **Compound action'lar atomik değil:** `get + put` race condition hâlâ var
+Her metot `synchronized` ile sarılır. Sorun ikili: **tüm map için tek lock** vardır (100 paralel okuma 100 kez sıraya girer — performans katili), ve **compound action'lar hâlâ atomik değildir** (`get + put` arasında race açık kalır).
 
 ```java
 // HÂLÂ YANLIŞ
@@ -64,26 +67,29 @@ synchronized (sync) {   // explicit external lock gerekli
 }
 ```
 
-External synchronization sorumluluğu kullanıcıya — kolayca unutulur.
+**Tuzak:** Compound action'ı doğru yapmak için external synchronization sorumluluğu kullanıcıya kalır — ve kolayca unutulur.
 
 ### 3. `ConcurrentHashMap` — banking standardı
 
-Java 5'te tanıtıldı, Java 8'de yeniden yazıldı (segment-free).
+Peki neden `ConcurrentHashMap` tek lock'lu çözümden dramatik olarak hızlı? Cevap iç mimaride. Java 5'te tanıtıldı, Java 8'de segment-free olarak yeniden yazıldı.
 
-**Iç çalışma (Java 8+):**
+**Iç çalışma (Java 8+):** Internal bir bin array (default 16, büyür) tutulur. Her bin **bağımsız CAS-based lock** kullanır — write sırasında yalnızca o bin'in ilk node'u üzerinde `synchronized` olunur. Read operasyonları ise **tamamen lock-free** (volatile read). Collision threshold'u aşan bin (8 eleman) `TreeMap` gibi tree-bin'e döner.
 
-- Internal array of bins (default 16, grows)
-- Her bin **independent CAS-based lock** kullanır (sadece o bin sırasında lock)
-- Read operasyonları **lock-free** (volatile read)
-- Write operasyonları **bin-level lock** (synchronized on first node of bin)
-- Tree-bin'e dönüşüm (collision threshold 8) — TreeMap gibi davranır
+Aşağıda iki writer farklı bin'lere yazdığı için birbirini beklemez; reader hiçbir kilit almaz:
 
-Sonuç:
-- 16 ayrı bin'e yazan thread'ler **birbirini engellemez**
-- Read'ler **lock'suz**
-- Throughput: synchronizedMap'ten 5-10x
+```mermaid
+flowchart LR
+    W1["Writer T1"] --> B0["Bin 0 lock"]
+    W2["Writer T2"] --> B5["Bin 5 lock"]
+    R1["Reader T3"] -.lock-free.-> B9["Bin 9"]
+    subgraph Table["Internal bin array"]
+        B0
+        B5
+        B9
+    end
+```
 
-**Banking örneği — doğru kod:**
+Sonuç: 16 ayrı bin'e yazan thread'ler birbirini engellemez, read'ler lock'suz, throughput `synchronizedMap`'ten 5-10x. **Banking örneği — doğru kod:**
 
 ```java
 private final ConcurrentHashMap<UUID, BigDecimal> accountBalances = new ConcurrentHashMap<>();
@@ -93,11 +99,15 @@ public void deposit(UUID accountId, BigDecimal amount) {
 }
 ```
 
-`merge` **atomic** — get + compute + put tek operasyon. Race condition yok.
+`merge` **atomic** — get + compute + put tek operasyondur, race condition yok.
+
+**Tuzak — `size()` yaklaşıktır:** Concurrent bir map'te `size()` çağrıldığı an başka thread'ler ekliyor/siliyor olabilir. Dönen değer **weakly consistent**'tir; kesin sayım gerektiren kontrol (örn. "tam 1000 kayıt olunca dur") için güvenilmez.
 
 ### 4. `ConcurrentHashMap` atomic operasyonları
 
-#### `putIfAbsent(K, V)`
+Asıl güç bu atomic metotlarda: her biri check-then-act race'ini tek adıma indirir. <mark>`merge`, `compute`, `computeIfAbsent` ve `putIfAbsent` bin-level lock altında tek atomik operasyondur; manuel `if (contains) put` pattern'i değildir</mark>.
+
+**`putIfAbsent(K, V)`** — yoksa koy, varsa dokunma, tek adımda:
 
 ```java
 BigDecimal previous = accountBalances.putIfAbsent(accountId, BigDecimal.ZERO);
@@ -105,24 +115,17 @@ BigDecimal previous = accountBalances.putIfAbsent(accountId, BigDecimal.ZERO);
 // previous != null → zaten varmış, biz dokunmadık
 ```
 
-**Tek atomic adım.** Eski:
+Eski `if (!map.containsKey(id)) map.put(id, value)` yazımı iki adım arasında race barındırır — `putIfAbsent` bunu kapatır.
+
+**`compute(K, BiFunction)`** — get + compute + put atomik; `v` null gelirse key yok demektir:
 
 ```java
-// ❌ Race condition var
-if (!map.containsKey(id)) map.put(id, value);
-```
-
-#### `compute(K, BiFunction<K, V, V>)`
-
-```java
-accountBalances.compute(accountId, (k, v) -> 
+accountBalances.compute(accountId, (k, v) ->
     (v == null ? BigDecimal.ZERO : v).add(amount)
 );
 ```
 
-Get + compute + put **atomik**. v null gelirse yok demek.
-
-#### `computeIfAbsent(K, Function<K, V>)`
+**`computeIfAbsent(K, Function)`** — yoksa üret + koy + dön. Banking'in per-account collection pattern'inin kalbi:
 
 ```java
 List<Transaction> txList = transactionsByAccount
@@ -130,25 +133,14 @@ List<Transaction> txList = transactionsByAccount
 txList.add(transaction);
 ```
 
-Yok ise compute et + koy + dön. **Atomik.** Banking pattern: per-account collection'lar.
-
-**Tuzak:** Compute lambda'sı **kısa olmalı**. İçinde uzun iş yapma (DB call, sleep) — bin lock tutulur, başka thread'ler bekler.
-
-#### `computeIfPresent(K, BiFunction)`
+**`computeIfPresent`** varsa günceller, yoksa dokunmaz; **`merge`** yoksa değeri koyar, varsa fonksiyonla birleştirir:
 
 ```java
-accountBalances.computeIfPresent(accountId, (k, v) -> v.add(amount));
-// Yoksa hiçbir şey yapma
+accountBalances.computeIfPresent(accountId, (k, v) -> v.add(amount));  // yoksa no-op
+accountBalances.merge(accountId, amount, BigDecimal::add);             // yoksa koy, varsa add
 ```
 
-#### `merge(K, V, BiFunction)`
-
-```java
-accountBalances.merge(accountId, amount, BigDecimal::add);
-// Yoksa amount koy, varsa add ile birleştir
-```
-
-**Banking örneği — günlük transaction sayacı:**
+Bunları birleştiren günlük transaction sayacı — `computeIfAbsent` ile `AtomicLong` üret (atomik), sonra `incrementAndGet` (atomik):
 
 ```java
 private final ConcurrentHashMap<LocalDate, AtomicLong> dailyTxCount = new ConcurrentHashMap<>();
@@ -159,33 +151,37 @@ public void recordTransaction(Instant occurredAt) {
 }
 ```
 
-`computeIfAbsent` ile `AtomicLong` yarat (atomik), sonra `incrementAndGet` (atomik). İki ayrı atomik adım, **aralarında race var mı?** Hayır — `incrementAndGet` zaten thread-safe, hangi thread çağırırsa çağırsın doğru artırır.
+İki ayrı atomik adım arasında race var mı? Hayır — `incrementAndGet` zaten thread-safe, hangi thread çağırırsa doğru artırır.
 
-### 5. `ConcurrentHashMap.computeIfAbsent` atomicity vs `putIfAbsent`
-
-İki yakın görünür ama farklı:
-
-```java
-// A — putIfAbsent
-map.putIfAbsent(key, new ExpensiveObject());   // ← ExpensiveObject HER ZAMAN yaratılır
+```admonish warning title="computeIfAbsent lambda'sı kısa olmalı"
+Compute lambda'sı bin lock tutarken çalışır. İçinde DB call, HTTP çağrısı veya `sleep` yaparsan o bin'e düşen tüm thread'ler beklemek zorunda kalır — throughput çöker. Lambda yalnızca hafif, hızlı üretim yapmalı; ağır işi lock dışına taşı.
 ```
 
-`new ExpensiveObject()` argüman olarak değerlendirilir. Atomicity sadece put için. Eğer key zaten varsa, yarattığın obje **çöpe gider**.
+### 5. `computeIfAbsent` vs `putIfAbsent` — lazy yaratım
+
+İkisi yakın görünür ama kritik bir farkla ayrışır: obje ne zaman yaratılır?
 
 ```java
-// B — computeIfAbsent
-map.computeIfAbsent(key, k -> new ExpensiveObject());   // ← yalnızca yoksa yaratılır
+// A — putIfAbsent: ExpensiveObject HER ZAMAN yaratılır
+map.putIfAbsent(key, new ExpensiveObject());
 ```
 
-Lambda **sadece gerektiğinde** çağrılır. Lazy.
+`new ExpensiveObject()` argüman olarak önce değerlendirilir; atomicity sadece put içindir. Key zaten varsa yarattığın obje **çöpe gider**.
 
-**Banking:** Yüksek volume bir map'te (her transaction için per-customer state) `computeIfAbsent` ile **gereksiz yaratım önlenir**.
+```java
+// B — computeIfAbsent: lambda yalnızca yoksa çağrılır
+map.computeIfAbsent(key, k -> new ExpensiveObject());
+```
+
+Lambda **lazy**'dir, sadece gerektiğinde çalışır. Yüksek volume bir map'te (her transaction için per-customer state) `computeIfAbsent` gereksiz yaratımı önler.
+
+```admonish tip title="Kural"
+Değer yaratımı ucuz değilse veya key genelde zaten mevcutsa `computeIfAbsent` seç. `putIfAbsent`'ı yalnızca hazırda tuttuğun (zaten var olan) bir değeri koyarken kullan.
+```
 
 ### 6. `ConcurrentSkipListMap` — sıralı concurrent
 
-`TreeMap`'in thread-safe versiyonu. Internal: lock-free skip list.
-
-**Kullanım:** Sıralı erişim gerekir + concurrent modification gerekir.
+`ConcurrentHashMap` sıra tutmaz; sıralı erişim + concurrent modification birlikte gerekiyorsa bu devreye girer. `TreeMap`'in thread-safe versiyonudur, internal olarak lock-free skip list kullanır.
 
 ```java
 // Order book pattern
@@ -194,16 +190,14 @@ bidOrders.put(price, order);
 Map.Entry<BigDecimal, Order> highestBid = bidOrders.lastEntry();   // O(log n)
 ```
 
-Banking: order matching engine, time-series cache. Çoğu banking app'inde **gerek yok** — `ConcurrentHashMap` yeter.
+Banking: order matching engine, time-series cache. **Tuzak:** Çoğu banking app'inde sıra gerekmez — gereksiz yere seçme, `ConcurrentHashMap` daha hızlıdır.
 
 ### 7. `CopyOnWriteArrayList` — read-heavy / write-rare
 
-Yazma yapıldığında **tüm internal array kopyalanır**. Okuma lock'suz.
-
-**Kullanım:** Read >>> write (örn. 1000:1).
+Bazı collection'lar neredeyse hiç değişmez ama çok okunur; işte tam onlar için. Yazma yapıldığında **tüm internal array kopyalanır**, buna karşılık okuma tamamen lock'suzdur.
 
 ```java
-// Banking: subscriber list (rarely changes, queried per event)
+// Banking: subscriber list (nadiren değişir, her event'te okunur)
 CopyOnWriteArrayList<EventSubscriber> subscribers = new CopyOnWriteArrayList<>();
 
 public void onEvent(Event e) {
@@ -213,51 +207,56 @@ public void onEvent(Event e) {
 }
 ```
 
-**Anti-pattern:** Sık yazılan collection'da kullanma. Her yazımda full copy = O(n) yazma maliyeti.
+<mark>`CopyOnWriteArrayList`'i yalnızca read >>> write (örn. 1000:1) olduğunda kullan</mark>. Sık yazılan bir collection'da her yazım full copy = O(n) maliyet demektir — anti-pattern.
 
 ### 8. `BlockingQueue` ailesi — producer/consumer
 
-**Banking örneği:** Transfer request'leri queue'ya at, worker thread'ler işlesin.
+İş üreten ile işleyen thread'leri ayırmak istediğinde temel araç budur: producer queue'ya atar, consumer alır, aradaki bloklama akışı doğal olarak dengeler.
+
+```mermaid
+sequenceDiagram
+    participant P as Producer
+    participant Q as BlockingQueue
+    participant C as Consumer
+    P->>Q: put request
+    Note over Q: Kapasite dolu ise put bloklar
+    C->>Q: take
+    Note over Q: Boş ise take bloklar
+    Q-->>C: request teslim
+    C->>C: request işlenir
+```
 
 ```java
 BlockingQueue<TransferRequest> queue = new LinkedBlockingQueue<>(1000);
-
-// Producer
-queue.put(request);   // blocks if queue full
-
-// Consumer
-TransferRequest req = queue.take();   // blocks if empty
+queue.put(request);                       // producer: doluysa bloklar
+TransferRequest req = queue.take();       // consumer: boşsa bloklar
 ```
 
 #### Aile üyeleri
 
-**`ArrayBlockingQueue`:** Sabit kapasite, array-backed, FIFO, fair option.
+**`ArrayBlockingQueue`** — sabit kapasite, array-backed, FIFO, opsiyonel fairness:
 
 ```java
-new ArrayBlockingQueue<>(1000);   // 1000 capacity
+new ArrayBlockingQueue<>(1000);         // 1000 capacity
 new ArrayBlockingQueue<>(1000, true);   // fair (FIFO strict)
 ```
 
-Kullanım: Bounded queue ihtiyacı, kapasite tahmin edilebilir.
-
-**`LinkedBlockingQueue`:** Linked node-based, optionally bounded.
+**`LinkedBlockingQueue`** — linked node-based, opsiyonel bounded. Default'u **unbounded**'dır ve tehlikelidir:
 
 ```java
 new LinkedBlockingQueue<>();          // UNBOUNDED — OOM riski
 new LinkedBlockingQueue<>(10000);     // bounded
 ```
 
-**Tuzak:** Unbounded default — eğer consumer yavaşsa queue sınırsız büyür, OOM. **Banking'de her zaman bounded.**
+<mark>Banking'de her `BlockingQueue` bounded olmalı</mark> — consumer yavaşlarsa unbounded queue sınırsız büyür ve OOM ile sistemi düşürür.
 
-**`SynchronousQueue`:** 0 kapasite. Her `put` bir `take` bekler (direct handoff).
+**`SynchronousQueue`** — 0 kapasite, her `put` bir `take` bekler (direct handoff). Producer-consumer arası back-pressure için:
 
 ```java
 new SynchronousQueue<>();
 ```
 
-Kullanım: Producer-consumer arasında back-pressure (consumer hazır değilse producer bekler).
-
-**`PriorityBlockingQueue`:** Unbounded, priority-ordered (`Comparable` veya `Comparator`).
+**`PriorityBlockingQueue`** — unbounded, priority-ordered. Fraud check queue'da yüksek risk skorlu transaction'lar öne alınır:
 
 ```java
 PriorityBlockingQueue<FraudCheck> queue = new PriorityBlockingQueue<>(
@@ -265,19 +264,17 @@ PriorityBlockingQueue<FraudCheck> queue = new PriorityBlockingQueue<>(
 );
 ```
 
-Banking: Fraud check queue — yüksek risk skorlu transaction'lar önce.
-
-**`DelayQueue`:** Element belirli süre sonra alınabilir hale gelir.
+**`DelayQueue`** — element belirli süre sonra alınabilir hale gelir; failed transaction retry (5 sn → 30 sn → 5 dk backoff) için ideal:
 
 ```java
 public class DelayedRetry implements Delayed {
     private final long executeAt;
-    
+
     @Override
     public long getDelay(TimeUnit unit) {
         return unit.convert(executeAt - System.currentTimeMillis(), TimeUnit.MILLISECONDS);
     }
-    
+
     @Override
     public int compareTo(Delayed o) {
         return Long.compare(this.executeAt, ((DelayedRetry) o).executeAt);
@@ -285,13 +282,11 @@ public class DelayedRetry implements Delayed {
 }
 
 DelayQueue<DelayedRetry> retryQueue = new DelayQueue<>();
-retryQueue.put(new DelayedRetry(System.currentTimeMillis() + 5000));   // 5 sn sonra al
-DelayedRetry next = retryQueue.take();   // blocks until ready
+retryQueue.put(new DelayedRetry(System.currentTimeMillis() + 5000));  // 5 sn sonra al
+DelayedRetry next = retryQueue.take();                                // hazır olana kadar bloklar
 ```
 
-Banking: Failed transaction retry (5 sn → 30 sn → 5 dk exponential backoff).
-
-**`TransferQueue` (`LinkedTransferQueue`):** `BlockingQueue` + `transfer(element)` method'u (consumer'ı **bekler**).
+**`LinkedTransferQueue`** — `BlockingQueue` + `transfer(element)` metodu, bir consumer alana kadar bekler:
 
 ```java
 LinkedTransferQueue<Notification> queue = new LinkedTransferQueue<>();
@@ -299,6 +294,8 @@ queue.transfer(notification);   // bir consumer alana kadar block
 ```
 
 #### Banking pattern — bounded queue + thread pool
+
+Bounded queue'yu bir `ThreadPoolExecutor` ile birleştirince doğal backpressure elde edersin:
 
 ```java
 ThreadPoolExecutor executor = new ThreadPoolExecutor(
@@ -310,36 +307,50 @@ ThreadPoolExecutor executor = new ThreadPoolExecutor(
 );
 ```
 
-`CallerRunsPolicy`: Queue dolu olduğunda task'ı submit eden thread çalıştırır. **Doğal backpressure** — producer yavaşlar, sistem stabil kalır.
+`CallerRunsPolicy`: queue dolduğunda task'ı submit eden thread çalıştırır. Producer yavaşlar, sistem stabil kalır.
 
-### 9. `CountDownLatch` — one-shot çakıl
+### 9. `CountDownLatch` — one-shot bariyer
 
-Bir thread'in **n event** beklemesi gerekiyorsa.
+Bir thread'in **n bağımsız event'in bitmesini** beklemesi gerektiğinde kullanılır. Sayaç sıfıra düşene kadar `await()` bloklar:
+
+```mermaid
+sequenceDiagram
+    participant M as Main
+    participant L as CountDownLatch
+    participant W as Workers
+    M->>L: await count 3
+    W->>L: countDown
+    W->>L: countDown
+    W->>L: countDown
+    Note over L: Count sıfıra düştü
+    L-->>M: await döner
+    M->>M: reconciliation başlar
+```
 
 ```java
 CountDownLatch latch = new CountDownLatch(3);
 
-// 3 farklı task
 new Thread(() -> { doWork1(); latch.countDown(); }).start();
 new Thread(() -> { doWork2(); latch.countDown(); }).start();
 new Thread(() -> { doWork3(); latch.countDown(); }).start();
 
-latch.await();   // blocks until count = 0
+latch.await();   // count = 0 olana kadar bloklar
 System.out.println("All done");
 ```
 
-**Banking:** EOD reconciliation — 3 farklı sistem rapor üretir, hepsi bittiğinde mutabakat başlar.
+Banking: EOD reconciliation — 3 farklı sistem rapor üretir, hepsi bittiğinde mutabakat başlar.
 
-**Sınır:** Count **sıfıra düşünce** yeniden kullanılamaz. One-shot.
+```admonish warning title="CountDownLatch tek kullanımlıktır"
+Sayaç sıfıra düşünce latch yeniden kullanılamaz. İkinci faz için aynı latch'te `await()` çağırırsan anında döner (zaten 0). Tekrarlı senkronizasyon gerekiyorsa yeni bir latch yarat veya `CyclicBarrier` kullan.
+```
 
 ### 10. `CyclicBarrier` — yeniden kullanılabilir senkronizasyon
 
-n thread aynı noktaya geldiğinde devam etsin.
+`CountDownLatch`'in aksine tekrar tekrar kullanılabilir: n thread aynı noktaya geldiğinde hep birlikte devam eder.
 
 ```java
 CyclicBarrier barrier = new CyclicBarrier(3, () -> System.out.println("Tüm faz bitti"));
 
-// 3 worker
 for (int i = 0; i < 3; i++) {
     new Thread(() -> {
         for (int phase = 0; phase < 5; phase++) {
@@ -350,19 +361,29 @@ for (int i = 0; i < 3; i++) {
 }
 ```
 
-Her `await()`'da 3 thread toplanır, **barrier action** çalışır (varsa), sonra devam. **Yeniden kullanılabilir.**
-
-**Banking:** Multi-step batch — 3 worker her adımda senkronize ilerler.
+Her `await()`'da 3 thread toplanır, varsa **barrier action** çalışır, sonra devam ederler. Banking: multi-step batch — 3 worker her adımda senkronize ilerler.
 
 ### 11. `Semaphore` — kaynak sayısı sınırı
 
-n izin var, alana ver, alamayan beklesin.
+Sınırlı bir kaynağa (bağlantı, external API slot) aynı anda kaç thread erişebileceğini kısıtlar: n izin vardır, alan girer, alamayan bekler.
+
+```mermaid
+sequenceDiagram
+    participant T as Thread
+    participant S as Semaphore
+    T->>S: acquire
+    Note over S: İzin varsa ver, yoksa blokla
+    S-->>T: izin verildi
+    T->>T: external API call
+    T->>S: release
+    Note over S: İzin havuza geri döner
+```
 
 ```java
 Semaphore connectionLimit = new Semaphore(5);   // 5 izin
 
 public void callExternalApi() throws InterruptedException {
-    connectionLimit.acquire();   // izin al (blocks if 0)
+    connectionLimit.acquire();   // izin al (0 ise bloklar)
     try {
         // external API call
     } finally {
@@ -371,13 +392,13 @@ public void callExternalApi() throws InterruptedException {
 }
 ```
 
-**Banking örneği — rate limiter:**
+Banking'in klasik kullanımı — token bucket rate limiter (örn. TCMB'nin 100 req/sn limiti):
 
 ```java
 public class TokenBucketRateLimiter {
     private final Semaphore tokens;
     private final ScheduledExecutorService refiller;
-    
+
     public TokenBucketRateLimiter(int maxTokens, int refillPerSecond) {
         this.tokens = new Semaphore(maxTokens);
         this.refiller = Executors.newSingleThreadScheduledExecutor();
@@ -387,20 +408,18 @@ public class TokenBucketRateLimiter {
             tokens.release(toAdd);
         }, 1, 1, TimeUnit.SECONDS);
     }
-    
+
     public boolean tryAcquire() {
         return tokens.tryAcquire();   // hemen dön — yoksa false
     }
 }
 ```
 
-Banking: External API rate limit (TCMB'nin 100 req/sn limiti gibi).
-
-**Fairness:** `new Semaphore(5, true)` FIFO — kim önce bekledi, önce alır. Default false (throughput odaklı).
+Burada `acquire()` yerine `tryAcquire()` kullanmak bilinçli: rate limit'e takılan çağrı beklemez, anında `false` alır ve reddedilir. **Fairness:** `new Semaphore(5, true)` FIFO garantiler; default `false` throughput odaklıdır.
 
 ### 12. `Phaser` — dinamik CountDownLatch
 
-`CountDownLatch` ve `CyclicBarrier`'ın esnek hibridi. Phase'ler arasında thread sayısı **değişebilir**.
+`CountDownLatch` ve `CyclicBarrier`'ın esnek hibridi: phase'ler arasında kayıtlı thread sayısı runtime'da **değişebilir**.
 
 ```java
 Phaser phaser = new Phaser(1);   // 1 main thread registered
@@ -416,13 +435,11 @@ for (int i = 0; i < 5; i++) {
 phaser.arriveAndAwaitAdvance();   // diğerlerinin bitmesini bekle
 ```
 
-Banking: Dinamik worker pool, runtime'da hesabı değişen senaryolar.
-
-Genelde Phaser **karmaşık** — `CountDownLatch` veya `CyclicBarrier` yeterse onları tercih et.
+Banking: dinamik worker pool, runtime'da sayısı değişen senaryolar. **Tuzak:** Phaser karmaşıktır — `CountDownLatch` veya `CyclicBarrier` yetiyorsa onları tercih et.
 
 ### 13. `Exchanger` — iki thread arası nesne takası
 
-İki thread aynı `Exchanger`'da `exchange(x)` çağırır → birinin verdiği X, diğerine; diğerinin verdiği Y, birinciye.
+Nadir ama zarif bir araç: iki thread aynı `Exchanger`'da `exchange(x)` çağırır, verdikleri nesneleri değiş tokuş ederler.
 
 ```java
 Exchanger<Buffer> exchanger = new Exchanger<>();
@@ -431,25 +448,18 @@ Exchanger<Buffer> exchanger = new Exchanger<>();
 Buffer filled = exchanger.exchange(filledBuffer);   // boş bir tane al
 
 // Drainer thread
-Buffer empty = exchanger.exchange(emptyBuffer);   // dolu bir tane al
+Buffer empty = exchanger.exchange(emptyBuffer);     // dolu bir tane al
 ```
 
-Banking: Nadiren gerekir. Double-buffering pattern.
+Banking: nadiren gerekir, tipik kullanım double-buffering pattern'idir.
 
 ### 14. Banking anti-pattern'leri
 
-**Anti-pattern 1: `HashMap` concurrent kullanımı**
+Mülakatta "bu kodda ne yanlış?" sorusunun cephaneliği. Altı klasik:
 
-```java
-// ❌ Tehlike
-private final Map<UUID, Account> cache = new HashMap<>();
-```
+**Anti-pattern 1 — `HashMap` concurrent kullanımı:** Paylaşılan `new HashMap<>()` corruption, infinite loop, NPE üretir. **Çözüm:** `ConcurrentHashMap` veya `ThreadLocal`.
 
-Hangi thread çağırırsa çağırsın → corruption, infinite loop, NPE.
-
-**Çözüm:** `ConcurrentHashMap` veya local-thread cache (`ThreadLocal`).
-
-**Anti-pattern 2: Iteration sırasında modification**
+**Anti-pattern 2 — Iteration sırasında modification:**
 
 ```java
 for (Map.Entry<UUID, Account> entry : accounts.entrySet()) {
@@ -459,42 +469,21 @@ for (Map.Entry<UUID, Account> entry : accounts.entrySet()) {
 }
 ```
 
-**Çözüm:** `accounts.entrySet().removeIf(...)` veya `ConcurrentHashMap` ile concurrent iteration (weakly consistent).
+**Çözüm:** `accounts.entrySet().removeIf(...)` veya `ConcurrentHashMap`'in weakly-consistent iteration'ı.
 
-**Anti-pattern 3: Unbounded queue**
+**Anti-pattern 3 — Unbounded queue:** `new LinkedBlockingQueue<>()` production'da OOM eder. **Çözüm:** her zaman capacity belirle.
 
-```java
-new LinkedBlockingQueue<>()   // OOM ediyor production'da
-```
+**Anti-pattern 4 — `CountDownLatch` reuse:** Sıfıra düşmüş latch'i ikinci faz için beklemek — `await()` anında döner. **Çözüm:** yeni latch veya `CyclicBarrier`.
 
-**Çözüm:** Her zaman bounded, capacity belirle.
+**Anti-pattern 5 — `Collections.synchronizedXxx` modern banking'de:** Tüm map için tek lock → contention. **Çözüm:** `ConcurrentHashMap`.
 
-**Anti-pattern 4: `CountDownLatch` reuse**
-
-```java
-CountDownLatch latch = new CountDownLatch(3);
-// ... await
-// İkinci faz için aynı latch kullanmak istiyorsun
-latch.await();   // ❌ HÂLÂ 0, anında dönecek
-```
-
-**Çözüm:** Yeni `CountDownLatch` veya `CyclicBarrier` kullan.
-
-**Anti-pattern 5: `Collections.synchronizedXxx` modern banking'de**
-
-```java
-Map<UUID, Account> map = Collections.synchronizedMap(new HashMap<>());
-```
-
-Çalışır ama tüm map için tek lock → contention. **`ConcurrentHashMap` tercih et.**
-
-**Anti-pattern 6: Heavy operation in `computeIfAbsent` lambda**
+**Anti-pattern 6 — `computeIfAbsent` lambda'sında ağır iş:**
 
 ```java
 accounts.computeIfAbsent(id, k -> repository.findById(k).orElseThrow());   // DB call!
 ```
 
-Bin lock tutuluyor, DB call yavaş, başka thread'ler bekler. **Çözüm:** Lambda hızlı olsun, DB call dışarıda.
+Bin lock tutulurken yavaş DB call = diğer thread'ler bekler. **Çözüm:** lambda hızlı olsun, DB call dışarıda.
 
 ---
 
@@ -510,95 +499,145 @@ Bin lock tutuluyor, DB call yavaş, başka thread'ler bekler. **Çözüm:** Lamb
 
 ---
 
-## Mini task'ler
+## Kendini Sına
 
-### Task 3.6.1 — `ConcurrentHashMap.merge` ile balance tracker (30 dk)
+Aşağıdaki soruları önce **cevaba bakmadan** kendi cümlelerinle yanıtlamayı dene — hepsi TR bank mülakatlarında karşına çıkabilecek tarzda. Takıldığın soru olursa ilgili Kavramlar başlığına dön, sonra tekrar dene.
 
-`InMemoryBalanceCache` yaz:
+**S1. Paylaşılan `HashMap`'i concurrent kullanmak neden tehlikeli, ve `Collections.synchronizedMap` bu sorunu neden tam çözmez?**
 
-```java
-public class InMemoryBalanceCache {
-    private final ConcurrentHashMap<UUID, BigDecimal> balances = new ConcurrentHashMap<>();
-    
-    public void credit(UUID accountId, BigDecimal amount) {
-        balances.merge(accountId, amount, BigDecimal::add);
-    }
-    
-    public void debit(UUID accountId, BigDecimal amount) {
-        // önce mevcut bakiye kontrol et, sonra eksilt — atomik olmalı
-    }
-}
-```
+<details>
+<summary>Cevabı göster</summary>
 
-Debit metodunu `compute` ile yaz. Yetersiz bakiyede `InsufficientFundsException`.
+`HashMap` concurrent yazmaya dayanıksızdır: lost update (iki put'tan biri kaybolur), Java 7 resize'ında infinite loop, ve iteration sırasında `ConcurrentModificationException`. `synchronizedMap` her metodu tek bir lock'la sarar; bu iki yeni sorun getirir: tüm map için tek lock olduğundan paralel okumalar bile sıraya girer (contention), ve `get + put` gibi compound action'lar hâlâ atomik değildir — aralarında race açıktır.
 
-100 thread'le paralel credit/debit testi, son bakiyenin doğru olduğunu doğrula.
+Compound action'ı doğru yapmak için kullanıcının `synchronized (map) { ... }` ile external lock koyması gerekir, bu da kolayca unutulur. Modern çözüm `ConcurrentHashMap`: bin-level lock ile contention'ı kırar, `merge`/`compute` gibi atomic metotlarla compound action'ı tek adıma indirir.
 
-### Task 3.6.2 — Bounded transfer queue + worker (45 dk)
+</details>
 
-Producer/consumer pattern:
+**S2. `computeIfAbsent` ile `putIfAbsent` arasındaki fark nedir? Yüksek volume bir map'te hangisini seçersin ve neden?**
 
-```java
-public class TransferQueue {
-    private final BlockingQueue<TransferRequest> queue = new ArrayBlockingQueue<>(1000);
-    private final ExecutorService workers;
-    
-    public void submit(TransferRequest req) throws InterruptedException {
-        queue.put(req);   // blocks if full
-    }
-    
-    public void start(int workerCount) {
-        // n worker thread başlat, queue.take() ile işle
-    }
-}
-```
+<details>
+<summary>Cevabı göster</summary>
 
-`CallerRunsPolicy` benzeri: queue dolu, ana thread işlesin.
+`putIfAbsent(key, new ExpensiveObject())` çağrısında `new ExpensiveObject()` argüman olarak **her zaman** değerlendirilir; atomicity sadece put içindir. Key zaten varsa yarattığın nesne çöpe gider. `computeIfAbsent(key, k -> new ExpensiveObject())` ise lambda'yı **lazy** çağırır — yalnızca key yoksa yaratır.
 
-### Task 3.6.3 — Priority fraud queue (45 dk)
+Yüksek volume bir map'te (her transaction için per-customer state) `computeIfAbsent` seçilir; çünkü key genelde zaten mevcuttur ve gereksiz nesne yaratımı önlenir. `putIfAbsent`'ı sadece hazırda tuttuğun, üretim maliyeti olmayan bir değeri koyarken kullan.
 
-`PriorityBlockingQueue<FraudCheck>` ile yüksek-risk transaction'lar önce işlensin.
+</details>
 
-```java
-record FraudCheck(UUID txId, int riskScore) implements Comparable<FraudCheck> {
-    @Override
-    public int compareTo(FraudCheck o) {
-        return Integer.compare(o.riskScore, this.riskScore);   // descending
-    }
-}
-```
+**S3. `ConcurrentHashMap.size()` neden "yaklaşık" kabul edilir? Bu hangi durumda seni yanıltır?**
 
-10 random FraudCheck koy, take() ile sırayla al — yüksek skor önce gelmeli.
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 3.6.4 — Token bucket rate limiter (45 dk)
+`ConcurrentHashMap` global bir kilit tutmadığından, `size()` çağrıldığı anda başka thread'ler aynı anda ekliyor/siliyor olabilir. Dönen değer o anlık bir tahmindir (weakly consistent), çağrının bittiği an bile eskimiş olabilir. Ayrıca `size()` int döner; çok büyük map'lerde `mappingCount()` (long) tercih edilir.
 
-`Semaphore` + `ScheduledExecutorService` ile yukarıdaki örneği yaz.
+Seni yanıltacağı yer: kesin sayıma dayalı kontrol mantığı — "tam 1000 kayıt olunca dur" veya `size()` ile capacity kararı. Concurrent ortamda böyle kontroller için `size()`'a güvenme; atomik sayaç (`AtomicLong`) veya bounded queue gibi yapısal sınırlar kullan.
 
-Test: 10 token, sn'de 5 refill. 20 paralel `tryAcquire()` çağrısı yap, 10'unun başarılı, 10'unun fail olmasını gözle.
+</details>
 
-### Task 3.6.5 — `CountDownLatch` ile EOD reconciliation (30 dk)
+**S4. `BlockingQueue` ailesinde `ArrayBlockingQueue`, `LinkedBlockingQueue`, `SynchronousQueue` ve `PriorityBlockingQueue` hangi senaryoda tercih edilir?**
 
-3 sistem rapor üretir (Account, Transfer, Card). Hepsi bitince `ReconciliationEngine.start()` tetiklensin.
+<details>
+<summary>Cevabı göster</summary>
 
-```java
-CountDownLatch latch = new CountDownLatch(3);
+`ArrayBlockingQueue`: kapasite tahmin edilebilir, sabit bounded queue gerektiğinde — array-backed, FIFO, opsiyonel fairness. `LinkedBlockingQueue`: linked node-based, opsiyonel bounded; ama default'u unbounded olduğu için banking'de mutlaka capacity vererek kullanılır. `SynchronousQueue`: 0 kapasite, direct handoff — producer ile consumer'ı birebir eşlemek ve sıkı back-pressure istediğinde. `PriorityBlockingQueue`: elemanların önceliğe göre alınması gerektiğinde (fraud check queue'da yüksek risk skoru öne).
 
-ExecutorService exec = Executors.newFixedThreadPool(3);
-exec.submit(() -> { Account.report(); latch.countDown(); });
-exec.submit(() -> { Transfer.report(); latch.countDown(); });
-exec.submit(() -> { Card.report(); latch.countDown(); });
+Ortak kural: banking'de queue her zaman bounded olmalı. Unbounded queue consumer yavaşlayınca sınırsız büyür ve OOM ile sistemi düşürür.
 
-latch.await();
-ReconciliationEngine.start();
-```
+</details>
 
-### Task 3.6.6 — `DelayQueue` ile retry scheduler (45 dk)
+**S5. `CopyOnWriteArrayList` ne zaman doğru seçimdir, ne zaman felaket olur?**
 
-Failed transaction'lar `DelayQueue`'a 5 sn sonra retry için konulsun. Worker thread `take()` ile çekip retry yapsın.
+<details>
+<summary>Cevabı göster</summary>
+
+Doğru olduğu yer: read çok, write neredeyse hiç (örn. 1000:1). Yazma yapıldığında tüm internal array kopyalanır ama okuma tamamen lock'suzdur — event subscriber listesi gibi "nadiren değişir, her event'te iterate edilir" senaryosunda mükemmeldir; iteration sırasında `ConcurrentModificationException` de riski yoktur (snapshot üzerinde iterate eder).
+
+Felaket olduğu yer: sık yazılan collection. Her `add`/`remove` full array copy demek — O(n) yazma maliyeti. Yüksek write hacminde CPU ve GC'yi öldürür. Böyle durumda `ConcurrentLinkedQueue` veya lock'lu yapılar tercih edilir.
+
+</details>
+
+**S6. `CountDownLatch` ile `CyclicBarrier` arasındaki temel fark nedir? `CountDownLatch`'i reuse etmeye çalışırsan ne olur?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+`CountDownLatch` one-shot'tır: bir thread'in n event'in bitmesini beklemesi için, sayaç sıfıra düşünce açılır ve bir daha kullanılamaz — tipik olarak "n görev bitince başla" (EOD reconciliation). `CyclicBarrier` yeniden kullanılabilir: n thread aynı noktaya geldiğinde birlikte devam eder, her turda sıfırlanır — multi-phase batch'te her adımda senkronizasyon için.
+
+`CountDownLatch`'i reuse etmeye çalışırsan: sayaç zaten 0 olduğu için ikinci `await()` anında döner, hiç beklemez. Bu sessiz bir bug'dır. Tekrarlı senkronizasyon gerekiyorsa ya her fazda yeni bir latch yarat ya da `CyclicBarrier` kullan.
+
+</details>
+
+**S7. `Semaphore` ile rate limiter nasıl kurulur? `acquire()` yerine `tryAcquire()` kullanmak neyi değiştirir?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+`Semaphore` n izinle başlar; her çağrı `acquire()` ile izin alır, işini bitince `release()` ile iade eder — böylece aynı anda en fazla n thread kaynağa erişir. Token bucket rate limiter'da izin sayısı token'ları temsil eder; bir `ScheduledExecutorService` periyodik olarak `release(toAdd)` ile token'ları geri doldurur (max'ı aşmadan).
+
+`acquire()` izin yoksa **bloklar** (thread bekler), `tryAcquire()` ise **hemen `false` döner**. Rate limiter'da `tryAcquire()` bilinçli seçilir: limite takılan isteği bekletmek yerine anında reddetmek istersin (fail-fast). Fairness gerekiyorsa `new Semaphore(n, true)` FIFO garantiler; default `false` throughput odaklıdır.
+
+</details>
+
+**S8. `computeIfAbsent` lambda'sının içinde DB call yapmak neden ciddi bir sorundur?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+`computeIfAbsent` lambda'sı ilgili bin'in lock'u tutulurken çalışır. İçine `repository.findById(...)` gibi yavaş bir DB call koyarsan, o bin'e hash'lenen tüm diğer thread'ler lambda bitene kadar beklemek zorunda kalır — throughput çöker, latency patlar. Ağır I/O'da bu pratikte bir mikro-deadlock gibi davranır.
+
+Çözüm: lambda'yı hafif ve hızlı tut (sadece bellekte nesne üretimi). DB call gibi ağır işi lock dışında yap; örneğin önce `get` ile kontrol et, yoksa lock dışında yükle, sonra `putIfAbsent` ile yerleştir — veya cache-aside pattern kullan.
+
+</details>
 
 ---
 
-## Test yazma rehberi
+## Tamamlama kriterleri
+
+- [ ] `HashMap` concurrent kullanımının 3 somut riskini (lost update, resize infinite loop, `ConcurrentModificationException`) sayabiliyorum
+- [ ] `synchronizedMap`'in iki zayıflığını (tek lock contention + compound action atomik değil) açıklayabiliyorum
+- [ ] `ConcurrentHashMap` Java 8+ iç mekanizmasını (bin array, CAS, bin-level lock, lock-free read) 2 dakikada anlatabilirim
+- [ ] `merge`, `compute`, `computeIfAbsent`, `putIfAbsent`'ın atomicity garantisini ve `computeIfAbsent` vs `putIfAbsent` lazy farkını biliyorum
+- [ ] `BlockingQueue` ailesinin her üyesi için doğru banking senaryosunu ve bounded vs unbounded kararını söyleyebilirim
+- [ ] `CountDownLatch` vs `CyclicBarrier` farkını ve `CountDownLatch`'in one-shot olduğunu açıklayabiliyorum
+- [ ] `Semaphore` ile token bucket rate limiter pattern'ini ve `tryAcquire`/`acquire` farkını biliyorum
+- [ ] `CopyOnWriteArrayList`'in ne zaman doğru ne zaman felaket olduğunu ayırt edebiliyorum
+- [ ] `computeIfAbsent` lambda'sında DB call yapmamamın sebebini (bin lock) açıklayabiliyorum
+- [ ] (Opsiyonel) "Pratik yapmak istersen" bölümündeki testleri yazdım ve Claude-verify prompt'uyla doğrulattım
+
+---
+
+## Defter notları
+
+1. "`ConcurrentHashMap` Java 8 öncesi vs sonrası iç farkı: ____."
+2. "`merge`, `compute`, `computeIfAbsent`'ın atomic guarantee'si: ____."
+3. "`putIfAbsent` ile `computeIfAbsent` farkı (lazy yaratım): ____."
+4. "`Collections.synchronizedMap`'i neden production'da kullanmıyorum: ____."
+5. "`BlockingQueue` ailesinde her birinin en uygun senaryosu: ____."
+6. "Bounded vs unbounded queue: banking için doğru karar: ____."
+7. "`CountDownLatch` ile `CyclicBarrier` farkı + reuse: ____."
+8. "`Semaphore` ile rate limiter pattern (token bucket): ____."
+9. "`CopyOnWriteArrayList` ne zaman doğru, ne zaman felaket: ____."
+10. "`computeIfAbsent` lambda'sında DB call yapmamamın sebebi: ____."
+
+```admonish success title="Bölüm Özeti"
+- Paylaşılan state'te `HashMap`/`ArrayList` asla kullanılmaz; `synchronizedMap` tek lock contention'ı ve atomik olmayan compound action nedeniyle yetersizdir
+- `ConcurrentHashMap` bin-level CAS lock ile write'ları paralelleştirir, read'i lock-free yapar; `merge`/`compute`/`computeIfAbsent`/`putIfAbsent` compound action'ı tek atomik adıma indirir (`computeIfAbsent` lazy, `putIfAbsent` değil)
+- `BlockingQueue` producer/consumer'ı ayırır ve doğal backpressure verir — banking'de her queue bounded, tercihen `CallerRunsPolicy` ile
+- Senkronizasyon aidleri: `CountDownLatch` one-shot (n event bekle), `CyclicBarrier` reusable (n thread buluş), `Semaphore` kaynak sınırı + rate limiter, `Phaser` dinamik
+- `CopyOnWriteArrayList` yalnızca read >>> write; sık yazımda O(n) copy ile felaket. `ConcurrentSkipListMap` sıra + concurrency gerekince, çoğu app'te gereksiz
+- Anti-pattern'ler: concurrent `HashMap`, iteration'da modification, unbounded queue, latch reuse, `synchronizedMap`, `computeIfAbsent` lambda'sında DB call — hepsi production'da corruption ya da OOM getirir
+```
+
+---
+
+## Pratik yapmak istersen
+
+Kavramları koda dökmek istersen aşağıdaki iki ek hazır: test yazma rehberi `ConcurrentHashMap` thread safety, BlockingQueue back-pressure, priority ordering, `CountDownLatch` ve `Semaphore` davranışları için örnek testler içerir; Claude-verify prompt'u ile yazdığın concurrent collections kodunu banking-grade perspektiften denetletebilirsin.
+
+<details>
+<summary>Test yazma rehberi</summary>
 
 ### Test 3.6.1 — `ConcurrentHashMap` thread safety
 
@@ -609,11 +648,11 @@ void mergeShouldBeAtomicUnderConcurrency() throws InterruptedException {
     UUID accountId = UUID.randomUUID();
     int threadCount = 100;
     int incrementsPerThread = 1000;
-    
+
     ExecutorService exec = Executors.newFixedThreadPool(threadCount);
     CountDownLatch start = new CountDownLatch(1);
     CountDownLatch done = new CountDownLatch(threadCount);
-    
+
     for (int i = 0; i < threadCount; i++) {
         exec.submit(() -> {
             try {
@@ -628,11 +667,11 @@ void mergeShouldBeAtomicUnderConcurrency() throws InterruptedException {
             }
         });
     }
-    
+
     start.countDown();   // herkes aynı anda başlasın
     done.await();
     exec.shutdown();
-    
+
     BigDecimal expected = BigDecimal.valueOf((long) threadCount * incrementsPerThread);
     assertThat(cache.getBalance(accountId)).isEqualByComparingTo(expected);
 }
@@ -646,7 +685,7 @@ void boundedQueueShouldBlockWhenFull() throws InterruptedException {
     BlockingQueue<Integer> queue = new ArrayBlockingQueue<>(2);
     queue.put(1);
     queue.put(2);
-    
+
     AtomicBoolean blocked = new AtomicBoolean(true);
     Thread producer = new Thread(() -> {
         try {
@@ -657,10 +696,10 @@ void boundedQueueShouldBlockWhenFull() throws InterruptedException {
         }
     });
     producer.start();
-    
+
     Thread.sleep(100);
     assertThat(blocked).isTrue();   // hâlâ block
-    
+
     queue.take();   // birini al, producer kurtulsun
     producer.join(1000);
     assertThat(blocked).isFalse();
@@ -676,10 +715,21 @@ void priorityQueueShouldDeliverHighestRiskFirst() throws InterruptedException {
     queue.put(new FraudCheck(UUID.randomUUID(), 3));
     queue.put(new FraudCheck(UUID.randomUUID(), 9));
     queue.put(new FraudCheck(UUID.randomUUID(), 1));
-    
+
     assertThat(queue.take().riskScore()).isEqualTo(9);
     assertThat(queue.take().riskScore()).isEqualTo(3);
     assertThat(queue.take().riskScore()).isEqualTo(1);
+}
+```
+
+`FraudCheck` `Comparable`'ını descending (yüksek risk önce) sıralayacak şekilde yaz:
+
+```java
+record FraudCheck(UUID txId, int riskScore) implements Comparable<FraudCheck> {
+    @Override
+    public int compareTo(FraudCheck o) {
+        return Integer.compare(o.riskScore, this.riskScore);   // descending
+    }
 }
 ```
 
@@ -690,7 +740,7 @@ void priorityQueueShouldDeliverHighestRiskFirst() throws InterruptedException {
 void latchShouldReleaseWhenCountReachesZero() throws InterruptedException {
     CountDownLatch latch = new CountDownLatch(3);
     AtomicBoolean released = new AtomicBoolean(false);
-    
+
     Thread waiter = new Thread(() -> {
         try {
             latch.await();
@@ -698,11 +748,11 @@ void latchShouldReleaseWhenCountReachesZero() throws InterruptedException {
         } catch (InterruptedException e) { /* */ }
     });
     waiter.start();
-    
+
     latch.countDown();
     Thread.sleep(50);
     assertThat(released).isFalse();
-    
+
     latch.countDown();
     latch.countDown();
     waiter.join(1000);
@@ -718,10 +768,10 @@ void semaphoreShouldLimitConcurrentAccess() throws InterruptedException {
     Semaphore sem = new Semaphore(2);
     AtomicInteger maxConcurrent = new AtomicInteger();
     AtomicInteger currentConcurrent = new AtomicInteger();
-    
+
     ExecutorService exec = Executors.newFixedThreadPool(10);
     CountDownLatch done = new CountDownLatch(10);
-    
+
     for (int i = 0; i < 10; i++) {
         exec.submit(() -> {
             try {
@@ -735,20 +785,21 @@ void semaphoreShouldLimitConcurrentAccess() throws InterruptedException {
             finally { done.countDown(); }
         });
     }
-    
+
     done.await();
     exec.shutdown();
-    
+
     assertThat(maxConcurrent.get()).isLessThanOrEqualTo(2);
 }
 ```
 
----
+</details>
 
-## Claude-verify prompt
+<details>
+<summary>Claude-verify prompt</summary>
 
 ```
-Aşağıdaki Java concurrent collections kodumu banking-grade kriterlere göre 
+Aşağıdaki Java concurrent collections kodumu banking-grade kriterlere göre
 değerlendir. Sadece eksikleri ve yanlışları işaretle, kod yazma:
 
 1. ConcurrentHashMap kullanımı:
@@ -790,32 +841,4 @@ değerlendir. Sadece eksikleri ve yanlışları işaretle, kod yazma:
 Her madde için PASS / FAIL / EKSIK işaretle.
 ```
 
----
-
-## Tamamlama kriterleri
-
-- [ ] `InMemoryBalanceCache` `ConcurrentHashMap.merge` ile race condition'a karşı dirençli
-- [ ] Bounded `BlockingQueue` ile producer/consumer çalışıyor
-- [ ] `PriorityBlockingQueue` ile fraud queue
-- [ ] Token bucket rate limiter `Semaphore` ile
-- [ ] `CountDownLatch` ile EOD coordination
-- [ ] `DelayQueue` ile retry scheduler
-- [ ] 100 thread'le stress test geçiyor (final balance doğru)
-- [ ] `Collections.synchronizedMap` modern code'da kullanmıyorum
-- [ ] `computeIfAbsent` lambda'sında DB call yapmıyorum
-- [ ] `LinkedBlockingQueue` unbounded production'da kullanmıyorum
-
----
-
-## Defter notları
-
-1. "`ConcurrentHashMap` Java 8 öncesi vs sonrası iç farkı: ____."
-2. "`merge`, `compute`, `computeIfAbsent`'ın atomic guarantee'si: ____."
-3. "`putIfAbsent` ile `computeIfAbsent` farkı (lazy yaratım): ____."
-4. "`Collections.synchronizedMap`'i neden production'da kullanmıyorum: ____."
-5. "`BlockingQueue` ailesinde her birinin en uygun senaryosu: ____."
-6. "Bounded vs unbounded queue: banking için doğru karar: ____."
-7. "`CountDownLatch` ile `CyclicBarrier` farkı + reuse: ____."
-8. "`Semaphore` ile rate limiter pattern (token bucket): ____."
-9. "`CopyOnWriteArrayList` ne zaman doğru, ne zaman felaket: ____."
-10. "`computeIfAbsent` lambda'sında DB call yapmamamın sebebi: ____."
+</details>

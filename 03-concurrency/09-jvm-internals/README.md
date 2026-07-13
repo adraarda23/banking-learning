@@ -1,12 +1,20 @@
 # Topic 3.9 — JVM Internals: Memory, GC, JIT
 
+```admonish info title="Bu bölümde"
+- JVM memory area'ları: heap (Young=Eden+Survivor / Old), Metaspace, Code Cache, thread stack, native memory
+- Generational hypothesis ve bir objenin Eden → Survivor → Old promotion yolculuğu
+- Banking için GC seçimi: Serial, Parallel, G1, ZGC, Shenandoah — hangi profile hangisi ve neden
+- JIT tiered compilation (interpreter → C1 → C2) + escape analysis, scalar replacement, inlining
+- Production GC log'unu okuyup tune etme ve JFR, Native Memory Tracking ile heap dışını görme
+```
+
 ## Hedef
 
-JVM'in **iç mekanizmasını** banking-grade derinlikte anlamak. Heap layout, garbage collector seçimi (G1, ZGC, Shenandoah), JIT compilation (tiered), escape analysis ve memory area'larını öğrenmek. Production'da bir banking servisinin GC log'unu okuyup tune edebilmek.
+JVM'in **iç mekanizmasını** banking-grade derinlikte anlamak. Heap layout, garbage collector seçimi, JIT compilation ve memory area'larını sebep-sonuç olarak kavramak. Production'da bir banking servisinin GC log'unu okuyup tune edebilmek, OOM anında kanıtı toplayabilmek.
 
 ## Süre
 
-Okuma: 2.5 saat • Mini task: 2 saat • Test: 1 saat • Toplam: ~5.5 saat
+Okuma: ~2 saat • Kendini Sına: 45 dk • Pratik (opsiyonel): 3-4 saat • Toplam: ~2.5 saat (+ pratik)
 
 ## Önbilgi
 
@@ -20,21 +28,29 @@ Okuma: 2.5 saat • Mini task: 2 saat • Test: 1 saat • Toplam: ~5.5 saat
 
 ### 1. JVM memory areas — büyük resim
 
-```
-JVM Process
-├── Heap                       ← objelerin yaşadığı yer
-│   ├── Young Generation
-│   │   ├── Eden Space
-│   │   └── Survivor Space (S0, S1)
-│   └── Old Generation (Tenured)
-├── Metaspace                  ← class metadata (Java 8+, eski PermGen)
-├── Code Cache                 ← JIT'in derlediği native kod
-├── Thread Stack (per-thread)  ← method call stack, primitive değerler
-├── Native Memory              ← direct buffer, JNI
-└── PC Register (per-thread)
+Tune etmeden önce neyi tune ettiğini bilmelisin: JVM belleği tek bir "heap" değildir, birkaç ayrı bölgeden oluşur. **Heap** objelerin yaşadığı yerdir; gerisi (Metaspace, Code Cache, stack'ler, native memory) heap dışındadır ama OS belleğini yer.
+
+Heap'in kendisi generational olarak bölünür: **Young Generation** (Eden + Survivor S0/S1) yeni objeler için, **Old Generation** uzun yaşayanlar için.
+
+```mermaid
+flowchart LR
+    subgraph JVM["JVM Process"]
+        subgraph Heap["Heap"]
+            subgraph Young["Young Generation"]
+                Eden["Eden"]
+                S0["Survivor S0"]
+                S1["Survivor S1"]
+            end
+            Old["Old Generation Tenured"]
+        end
+        Meta["Metaspace class metadata"]
+        Code["Code Cache JIT native"]
+        Stack["Thread Stacks per thread"]
+        Native["Native DirectBuffer JNI"]
+    end
 ```
 
-**Banking servisi tipik bellek dağılımı:**
+Bir banking servisinin 8GB'lık tipik dağılımı, heap'in toplam belleğin sadece bir parçası olduğunu gösterir:
 
 ```
 8GB JVM:
@@ -47,91 +63,66 @@ JVM Process
 - Native (DirectByteBuffer): 500MB
 ```
 
+Tuzak: `-Xmx6g` verdin diye process 6GB tüketmez — Metaspace, thread stack'ler ve native buffer'lar üstüne biner. Container memory limit'ini sadece heap'e göre ayarlarsan **OOMKilled** yersin.
+
 ### 2. Heap — generational hypothesis
 
-**Generational hypothesis:** "Objelerin çoğu kısa ömürlüdür."
+GC'nin neden "generation"lara böldüğünü anlamak için tek bir gözleme dayanır: **generational hypothesis** — "objelerin çoğu kısa ömürlüdür."
 
-Banking örneği: bir HTTP request boyunca yaratılan DTO'lar, mapper sonuçları, intermediate hesaplama nesneleri — request bitince **çöp**. Sadece az sayıda obje "uzun yaşar" (cache entry'leri, connection pool, vb.).
+Banking'de bu birebir doğru. Bir HTTP request boyunca yaratılan DTO'lar, mapper sonuçları, ara hesaplama nesneleri request bitince çöptür. Sadece azınlık uzun yaşar: cache entry'leri, connection pool objeleri, singleton'lar. <mark>GC ömrü kısa objeleri ucuza toplayabilmek için heap'i yaşa göre böler</mark>.
 
-GC bu varsayımdan beslenir:
+Bu yüzden heap iki bölgeye ayrılır. **Young Generation**: yeni objeler burada doğar, sık ve hızlı GC (minor GC). **Old Generation**: Young'dan promote olan azınlık, nadir ama maliyetli GC (major GC).
 
-1. **Young Generation:** Yeni objeler buraya yaratılır. Sık ve hızlı GC.
-2. **Old Generation:** Young'dan **promote** olan objeler. Nadir ve maliyetli GC.
+Young'ın içinde de yapı var: **Eden** (yeni allocation buraya) ve iki **Survivor** space (S0, S1). Minor GC'de yaşayan objeler Survivor'lar arasında kopyalanır, ölüler toplanır. Bir objenin Old'a terfisi (promotion) bir eşiğe bağlıdır:
 
-**Young layout:**
-
+```mermaid
+flowchart LR
+    New["Yeni obje"] --> Eden["Eden"]
+    Eden -->|"minor GC survive"| Surv["Survivor S0 S1"]
+    Surv -->|"tekrar survive"| Surv
+    Surv -->|"yas esigi asildi"| Old["Old Generation"]
+    Eden -->|"olu obje"| Dead["Cop toplandi"]
 ```
-┌──────────┬────────┬────────┐
-│   Eden   │   S0   │   S1   │
-└──────────┴────────┴────────┘
-```
 
-- **Eden:** Yeni allocation buraya.
-- **S0/S1:** Survivor space'ler. Minor GC'de yaşayan objeler S0/S1 arasında kopyalanır.
+Minor GC akışı adım adım:
 
-**Minor GC akışı:**
+1. Eden + dolu Survivor → boş Survivor'a canlı objeleri kopyala
+2. Eden ve eski Survivor'ı boşalt
+3. Bir sonraki minor GC'de rolleri swap et (S0 ↔ S1)
+4. Bir obje N kez survive ederse (default tenuring threshold ~15) → **Old**'a promote
 
-1. Eden + S0 → S1'e canlı objeleri kopyala
-2. Eden + S0 boşalt
-3. Bir sonraki minor GC'de Eden + S1 → S0'a (swap)
-4. Bir obje N kez survive ederse (default ~15) → **Old** generation'a promote
-
-**Major GC (Old GC):** Old generation'da yer tükenince. Çok daha yavaş.
+Major GC (Old GC) Old'da yer tükenince tetiklenir ve çok daha yavaştır. Sağlıklı bir serviste minor GC saniyeler içinde, major GC dakikalar-onlarca dakika arayla çalışır.
 
 ### 3. Garbage collectors — banking için seçim
 
-#### Serial GC (`-XX:+UseSerialGC`)
+GC seçimi tek bir takasın kararıdır: **latency mı, throughput mu?** Banking'de servis profiline göre değişir, o yüzden adayları tek tek tanı.
 
-- Single-thread GC
-- Stop-the-world (STW)
-- Banking için **uygun değil** (latency yüksek)
-- Sadece embedded, küçük heap senaryoları
+**Serial GC** (`-XX:+UseSerialGC`) tek thread'li ve tamamen stop-the-world'dür. Banking için uygun değil (latency yüksek); sadece embedded ve çok küçük heap senaryoları içindir.
 
-#### Parallel GC (`-XX:+UseParallelGC`)
+**Parallel GC** (`-XX:+UseParallelGC`) çok thread'li ve throughput odaklıdır. Hâlâ STW pause var ama daha kısa. Banking'de **batch job'larda** iyi tercih (EOD reconciliation, raporlama); online işlemler için yetersizdir çünkü pause > 1s görülebilir.
 
-- Çok thread'li, throughput odaklı
-- STW pause var ama daha kısa
-- Banking için **batch job'larda** OK (EOD reconciliation, raporlama)
-- Online işlemler için yetersiz (pause >1s görülür)
-
-#### G1 GC (Garbage First) — Java 9+ default
-
-- **Banking standardı.**
-- Heap'i **region**'lara böler (1-32MB her biri).
-- Young + Old aynı heap'te dağıtılır.
-- Concurrent marking + STW pause kısa (genelde <200ms)
-- **Tuning:**
+**G1 GC** (Garbage First, Java 9+ default) **banking standardıdır**. Heap'i 1-32MB'lık **region**'lara böler, Young ve Old'u aynı heap içinde dağıtır. Concurrent marking yapar ve STW pause'u kısa tutar (genelde < 200ms):
 
 ```bash
 -XX:+UseG1GC
 -XX:MaxGCPauseMillis=200    # hedef max pause
--Xms4g -Xmx4g                # heap sabit (banking pratiği)
+-Xms4g -Xmx4g               # heap sabit (banking pratiği)
 ```
 
-`MaxGCPauseMillis` **target** — guarantee değil. Çok düşük (50ms) verirsen GC daha sık çalışır, throughput düşer.
+Kritik nüans: `MaxGCPauseMillis` bir **target**'tır, guarantee değil. <mark>Çok düşük bir hedef (50ms) verirsen G1 Young'ı küçültür, daha sık GC yapar ve throughput düşer</mark>.
 
-#### ZGC (Z Garbage Collector) — Java 11+ stable, Java 21 generational
-
-- **Pause-less.** Pauseları **<10ms** garantili (concurrent marking + relocation).
-- **TB-ölçek** heap support (16TB'ye kadar).
-- **CPU overhead:** ~15% throughput maliyeti.
-- Banking için **düşük-latency** servisler (örn. fraud detection real-time) için ideal.
+**ZGC** (Z Garbage Collector, Java 11+ stable) neredeyse pause-less'tir: pause'ları **< 10ms** garanti eder (concurrent marking + relocation). **TB-ölçek** heap destekler (16TB'ye kadar) ama karşılığında ~%15 throughput maliyeti getirir. Banking'de düşük-latency servisler (örn. real-time fraud detection) için idealdir:
 
 ```bash
 -XX:+UseZGC
 -Xmx16g
 ```
 
-Java 21'den itibaren **Generational ZGC** (`-XX:+ZGenerational`) — Young/Old ayrımı, throughput daha iyi.
+Java 21'den itibaren **Generational ZGC** (`-XX:+ZGenerational`) gelir — Young/Old ayrımı ekleyerek throughput'u belirgin iyileştirir; modern JVM'de tercih edilen moddur.
 
-#### Shenandoah — Red Hat
+**Shenandoah** (Red Hat) ZGC benzeri pause-less bir GC'dir, daha düşük CPU overhead'i vardır. Java 12+ ile resmî (özellikle Red Hat build'lerinde) ve OpenJDK + Red Hat ekosisteminde tercih edilir.
 
-- ZGC benzeri, pause-less
-- Daha düşük CPU overhead
-- Java 12+ official (Red Hat builds'te)
-- Banking'de OpenJDK + Red Hat ekosisteminde tercih
-
-#### Banking için karar matrisi
+Banking için karar özeti:
 
 | Profil | GC |
 |---|---|
@@ -141,25 +132,46 @@ Java 21'den itibaren **Generational ZGC** (`-XX:+ZGenerational`) — Young/Old a
 | Düşük heap (<2GB) servisleri | G1 yine OK |
 | Mevcut prod stable, dokunma | G1 |
 
+Karar ağacını tek bakışta görmek istersen:
+
+```mermaid
+flowchart LR
+    Start["Servis profili"] --> Q{"p99 hedefi"}
+    Q -->|"under 10ms"| ZGC["ZGC fraud realtime"]
+    Q -->|"under 200ms"| G1["G1 default banking API"]
+    Q -->|"throughput oncelik"| Par["Parallel EOD batch"]
+```
+
 ### 4. GC tuning flag'leri
 
-```bash
-# Heap boyutu
--Xms6g -Xmx6g                          # initial = max (production)
--XX:NewRatio=2                         # Old:Young = 2:1
+Doğru GC'yi seçtikten sonra iş boyutlandırma ve gözlemlenebilirliğe kalır. Önce heap boyutu ve generation oranı:
 
-# G1
+```bash
+-Xms6g -Xmx6g          # initial = max (production)
+-XX:NewRatio=2         # Old:Young = 2:1
+```
+
+G1 için ince ayar flag'leri — çoğu servis default'la iyi çalışır, bunlara ancak GC log kanıt gösterince dokun:
+
+```bash
 -XX:+UseG1GC
 -XX:MaxGCPauseMillis=200
 -XX:G1HeapRegionSize=8m
--XX:G1NewSizePercent=20                # Young min %
--XX:G1MaxNewSizePercent=40             # Young max %
--XX:G1ReservePercent=10                # promotion için yedek
+-XX:G1NewSizePercent=20      # Young min %
+-XX:G1MaxNewSizePercent=40   # Young max %
+-XX:G1ReservePercent=10      # promotion için yedek
+```
 
-# ZGC
+ZGC tarafında ayar minimaldir; boyut ver ve generational modu aç:
+
+```bash
 -XX:+UseZGC
--XX:+ZGenerational                     # Java 21+
+-XX:+ZGenerational           # Java 21+
+```
 
+En kritik ikisi tuning değil, **gözlemlenebilirlik** flag'leridir. Production'da bunlar olmadan çalışmak, kaza anında kayıt cihazı kapalı uçmaktır:
+
+```bash
 # GC log (production critical!)
 -Xlog:gc*:file=/var/log/banking/gc.log:time,uptime:filecount=10,filesize=100M
 
@@ -168,97 +180,80 @@ Java 21'den itibaren **Generational ZGC** (`-XX:+ZGenerational`) — Young/Old a
 -XX:HeapDumpPath=/var/log/banking/heapdump.hprof
 ```
 
-**Banking kural:** Production'da **`Xms = Xmx`**. Heap dinamik büyümesin — GC pause'a sebep olur.
+```admonish warning title="Banking kuralı: Xms = Xmx"
+Production'da heap'i sabitle: `-Xms` ile `-Xmx` aynı olsun. Heap dinamik büyürken JVM ekstra GC pause ve OS'ten memory commit maliyeti öder; sabit heap bu belirsizliği ortadan kaldırır. `-Xms512m -Xmx16g` gibi bir konfig, yük artınca tam en kötü anda pause üretir.
+```
 
 ### 5. GC log analizi
 
-G1 GC log örneği:
+GC log'u okuyamıyorsan tune de edemezsin — önce sağlıklı bir satırın anatomisini çöz. Tipik bir G1 minor GC satırı:
 
 ```
-[2.143s][info][gc] GC(0) Pause Young (Normal) (G1 Evacuation Pause) 
+[2.143s][info][gc] GC(0) Pause Young (Normal) (G1 Evacuation Pause)
   100M->20M(2048M) 5.231ms
 ```
 
-Açıklama:
-- `Pause Young (Normal)`: Minor GC
-- `100M->20M`: Heap kullanımı 100MB'tan 20MB'ye düştü
-- `(2048M)`: Toplam heap kapasitesi
-- `5.231ms`: Pause süresi
+Parçalar: `Pause Young (Normal)` minor GC'dir; `100M->20M` heap kullanımının 100MB'tan 20MB'ye düştüğünü, `(2048M)` toplam kapasiteyi, `5.231ms` pause süresini gösterir. Sağlıklı pattern'de minor GC pause < 100ms, major GC pause < 1s, minor sıklık 10-30 sn, major 5-30 dk.
 
-**Sağlıklı pattern:**
-- Minor GC pause < 100ms
-- Major GC pause < 1s (G1 mixed GC)
-- Frequency: minor 10-30 sn, major 5-30 dk
-
-**Sorunlu pattern'ler:**
+Sorunlu pattern'leri tanımak asıl beceridir. Full GC + uzun pause fragmentation veya memory leak şüphesidir:
 
 ```
 GC(42) Pause Full (Allocation Failure) 1800M->1750M(2048M) 8500ms
 ```
 
-Full GC + uzun pause → heap çok dolu, fragmentation, memory leak şüphesi.
+8.5 saniyelik full GC + heap'in neredeyse boşalamaması (1800M → 1750M) klasik leak sinyalidir. Bir başka sorunlu pattern, Young'daki objelerin çoğunun toplanamayıp Old'a akması:
 
 ```
 GC(43) Pause Young (Normal) 90M->85M(2048M) 250ms
 ```
 
-Young space çoğu obje promote olmaya gidiyor → tenuring threshold çok düşük veya Young çok küçük.
-
-**Araçlar:**
-
-- **GCViewer** — open source, gc.log parse edip görselleştirir
-- **GCEasy.io** — web tabanlı, ücretsiz, AI öneri verir
-- **JClarity Censum** — ticari, derin analiz
-- **gcplot.com** — alternative
+90M → 85M yani çok az obje ölüyor, gerisi promote oluyor → tenuring threshold çok düşük veya Young çok küçük demektir. Manuel okuma iyidir ama ölçekte araç kullan: **GCViewer** (open source), **GCEasy.io** (web, ücretsiz, AI öneri), **JClarity Censum** (ticari), **gcplot.com**.
 
 ### 6. JIT compilation — interpreter → C1 → C2
 
-Java kod execution'ın yaşam döngüsü:
+Java'nın "yavaş başlayıp hızlanması" JIT yüzündendir; bunu bilmezsen "servis warmup'ta neden yavaş" sorusuna cevap veremezsin. Yaşam döngüsü şöyledir: `javac` bytecode üretir, JVM önce bytecode'u **interpret** eder (yavaş), sıcak method'ları derler.
 
-```
-1. javac → .class (bytecode)
-2. JVM bytecode'u INTERPRET eder (yavaş)
-3. "Hot" method (>10000 invocation) → C1 (client compiler) — basit, hızlı compile
-4. Çok hot → C2 (server compiler) — agresif optimization, yavaş compile
-5. Code Cache'e yerleşir, native execution
+```mermaid
+flowchart LR
+    BC["Bytecode"] --> Int["Interpreter yavas"]
+    Int -->|"hot method"| C1["C1 hizli compile"]
+    C1 -->|"cok hot"| C2["C2 agresif optimize"]
+    C2 -->|"assumption fail"| Int
+    C2 --> Cache["Code Cache native"]
 ```
 
-**Tiered compilation** (default Java 8+): Hem C1 hem C2 birlikte.
+Bir method yeterince çağrılınca (>10000 invocation) önce **C1** (client compiler) ile hızlı ama basit derlenir; çok daha sıcaksa **C2** (server compiler) ile agresif optimize edilir. **Tiered compilation** (Java 8+ default) ikisini birlikte kullanır: erken C1 ile hız kazanılır, ısındıkça C2 devreye girer.
 
 ```bash
 -XX:+TieredCompilation       # default
 -XX:CompileThreshold=10000   # interpret → compiled (default)
 ```
 
-#### Optimization'lar
-
-**Inlining:** Küçük method'ları çağrı yerine kopyala.
+C2'nin uyguladığı optimizasyonların banking'de doğrudan karşılığı vardır. **Inlining** küçük method'ları çağrı yerine kopyalar, method call overhead'ini siler:
 
 ```java
 public BigDecimal getAmount() { return amount; }   // 5 satır method
-// JIT bunu çağıran kod'a inline eder, method call yok
+// JIT bunu çağıran kod'a inline eder, method call kalmaz
 ```
 
-**Escape analysis:** Bir nesne sadece bir method içinde kullanılıyorsa, **heap yerine stack'te** yarat.
+**Escape analysis** bir nesne sadece tek method içinde kullanılıp dışarı "kaçmıyorsa" onu heap yerine stack'te yaratır — allocation ve GC yükü sıfırlanır:
 
 ```java
 public BigDecimal compute() {
-    Money temp = Money.of("100", "TRY");   // sadece burada kullanılıyor
+    Money temp = Money.of("100", "TRY");   // sadece burada
     return temp.amount();
 }
-// JIT: temp object'i stack'te yarat, GC yok, allocation cost yok
+// JIT: temp'i stack'te yarat, heap allocation yok, GC yok
 ```
 
-**Scalar replacement:** Bir objeyi field'larına böl.
+**Scalar replacement** ise objeyi field'larına parçalar; obje hiç yaratılmaz, alanları local değişkene döner:
 
 ```java
 Money m = Money.of("100", "TRY");
-// JIT: m.amount → local variable, m.currency → local variable, m heap'te değil
+// JIT: m.amount ve m.currency birer local variable, m heap'te yok
 ```
 
-**Banking impact:** Banking app'inde inner loop'lardaki `BigDecimal` operasyonları — eğer ara değişkenler **leak etmiyor**sa JIT bunları stack'e koyar, allocation yükü kaybolur.
-
-#### JIT log'lama
+Banking etkisi somuttur: inner loop'lardaki `BigDecimal` ara değişkenleri **leak etmiyorsa** JIT bunları stack'e koyar, allocation yükü kaybolur. JIT kararlarını gözlemlemek istersen log aç:
 
 ```bash
 -XX:+PrintCompilation         # her compile event'i
@@ -266,77 +261,65 @@ Money m = Money.of("100", "TRY");
 -XX:+PrintInlining            # inline kararları
 ```
 
+`PrintCompilation` çıktısında tier numarası derlemeyi anlatır — `3` = C1, `4` = C2:
+
 ```
 123  45    3   com.mavibank.banking.Money::add (12 bytes)
 124  46    4   com.mavibank.banking.Account::deposit (45 bytes)
 ```
 
-`3` = C1 tier, `4` = C2 tier. Method compile edildi.
-
 ### 7. Class loading & Metaspace
 
-Java 7 ve öncesi: **PermGen** (sabit boyut, OOM kaynağı).
-Java 8+: **Metaspace** (native memory, dynamic grow).
+Class metadata'sının nerede tutulduğu Java 8 ile değişti ve bu bir OOM kaynağını yer değiştirdi. Java 7 ve öncesi **PermGen** kullanırdı (sabit boyut, klasik OOM sebebi); Java 8+ ise **Metaspace** kullanır (native memory, dinamik büyür).
 
-Metaspace içerir:
-- Class metadata
-- Method bytecode
-- Reflection objeleri
-- Class loader'lar
+Metaspace class metadata'sını, method bytecode'unu, reflection objelerini ve class loader'ları tutar. Boyutunu sınırlamak senin işin:
 
 ```bash
 -XX:MaxMetaspaceSize=512m    # üst limit
--XX:MetaspaceSize=128m        # initial
+-XX:MetaspaceSize=128m       # initial
 ```
 
-**Banking tuzağı:** Çok class yüklenen app'ler (Spring + JPA + ek lib'ler) Metaspace shrink **OOM** olabilir. Default unbounded ama **MaxMetaspaceSize set et**.
-
-**Class loader leak:** Spring DevTools restart ile classloader leak — Metaspace büyür, OOM. Production'da DevTools yok.
+```admonish warning title="Metaspace tuzağı"
+Metaspace default'ta unbounded'dır — sınır koymazsan class'ları sürekli yükleyen bir app (Spring + JPA + ek lib'ler) native memory'yi yiyip OOM olabilir. Her zaman `MaxMetaspaceSize` set et. Klasik leak: Spring DevTools restart'ta classloader leak eder, Metaspace büyür — bu yüzden production'da DevTools bulunmaz.
+```
 
 ### 8. Code Cache
 
-JIT'in compile ettiği native kod buraya gider.
+JIT'in derlediği native kod **Code Cache**'e gider ve bu alan dolarsa derleme sessizce durur. Boyut flag'leri:
 
 ```bash
 -XX:ReservedCodeCacheSize=240m   # default
 -XX:InitialCodeCacheSize=64m
 ```
 
-**Banking tuzağı:** Code cache full → JIT compilation durur, performance düşer (sessiz).
+Tuzak sessiz olduğu için tehlikelidir: Code Cache full → JIT compilation durur → sıcak method'lar interpreter'da kalır → performans düşer ve hata log'u görmezsin. Doluluğu şu satırdan tanı:
 
 ```
 CodeCache: size=245760Kb used=243512Kb max_used=245456Kb free=2248Kb
 ```
 
-`used` ≈ `size` → genişlet:
-
-```bash
--XX:ReservedCodeCacheSize=512m
-```
+`used` ≈ `size` ise genişlet: `-XX:ReservedCodeCacheSize=512m`.
 
 ### 9. Thread stack
 
-Her thread için ayrı stack. Default size **1MB**.
+Her thread kendi stack'ini taşır (method call stack + primitive değerler) ve default boyutu **1MB**'dır. Bu, çok thread'li serviste ciddi native memory demektir:
 
 ```bash
 -Xss512k   # her thread 512KB stack
 ```
 
-**Banking impact:** 1000 platform thread × 1MB = 1GB native memory.
-
-Virtual thread'lerde stack çok küçük (~kbyte) — Loom'un en büyük kazancı.
+Banking etkisi: 1000 platform thread × 1MB = 1GB native memory, sadece stack için. Virtual thread'lerde stack çok küçüktür (~kilobyte mertebesi) — Loom'un en büyük kazancı tam da budur.
 
 ### 10. Native memory tracking
 
-JVM'in heap dışı memory kullanımını görmek:
+Heap OK görünse bile process belleği şişebilir; heap dışını görmenin yolu **Native Memory Tracking**'tir. Aç ve sorgula:
 
 ```bash
 java -XX:NativeMemoryTracking=detail ...
-
 jcmd <pid> VM.native_memory
 ```
 
-Output:
+Çıktı belleği kategorilere böler ve heap'in sadece bir dilim olduğunu gösterir:
 
 ```
 Total: reserved=8GB, committed=6GB
@@ -348,39 +331,28 @@ Total: reserved=8GB, committed=6GB
 - Direct (reserved=512MB, committed=300MB)  ← DirectByteBuffer
 ```
 
-**Banking tuzağı:** Off-heap memory (DirectByteBuffer, Netty) heap'te görünmez ama OS belleği yer. **Track et.**
+```admonish tip title="Off-heap'i takip et"
+DirectByteBuffer ve Netty gibi off-heap kullanan bileşenler heap dump'ta görünmez ama OS belleğini tüketir. Container'ın memory limit'ini heap + Metaspace + thread + direct toplamına göre boyutla; yoksa heap boşken bile OOMKilled olursun. `jcmd VM.native_memory` bu gizli tüketimi ortaya çıkarır.
+```
 
 ### 11. JDK Flight Recorder (JFR) — production-safe profiling
 
-JFR JVM'in **dahili** profiling sistemi. Production'da %1-2 overhead ile çalışır.
+Production'da profiler açmaktan korkarsın çünkü çoğu profiler yavaşlatır; JFR bu korkuyu ortadan kaldırır. JFR JVM'in **dahili** profiling sistemidir ve production'da ~%1-2 overhead ile çalışır.
 
 ```bash
 # Continuous recording
 -XX:StartFlightRecording=duration=60s,filename=banking.jfr
 
-# Dump anlık
+# Anlık dump
 jcmd <pid> JFR.start name=banking
 jcmd <pid> JFR.dump name=banking filename=banking.jfr
 ```
 
-JFR events:
-- Allocation (TLAB, outside TLAB)
-- GC events
-- Lock contention
-- Thread states
-- File I/O
-- Network I/O
-- JIT compilation
-- Class loading
-
-**Banking pratiği:** Production'da JFR sürekli açık olabilir, sorun yaşanınca son N dakikalık recording'i indirip JMC'de incele.
+JFR zengin event toplar: allocation (TLAB içi/dışı), GC events, lock contention, thread state'leri, file/network I/O, JIT compilation, class loading. Banking pratiği: production'da JFR sürekli açık kalır; bir sorun yaşanınca son N dakikanın recording'ini indirip JMC (JDK Mission Control) ile incelersin — canlı sistemi hiç durdurmadan.
 
 ### 12. JIT decompile & deoptimization
 
-JIT compile ettiği kodu bazen **deoptimize** eder (interpreter'e geri döner):
-
-- Type assumption fail (örn. virtual method monomorphic compile, sonra polymorphic geldi)
-- Uncommon trap (sıra dışı code path)
+JIT bazen kendi derlediği kodu **deoptimize** eder — yani interpreter'a geri döner. Sebebi genellikle bir varsayımın bozulmasıdır: bir virtual method monomorphic derlendi ama sonra polymorphic çağrı geldi, ya da bir "uncommon trap" (sıra dışı code path) tetiklendi.
 
 ```bash
 -XX:+UnlockDiagnosticVMOptions
@@ -388,11 +360,11 @@ JIT compile ettiği kodu bazen **deoptimize** eder (interpreter'e geri döner):
 -XX:+LogCompilation
 ```
 
-Banking impact: nadiren önemli ama "uygulamamız hızlandı sonra yavaşladı" gizemli senaryolarda bakman gerekebilir.
+Banking etkisi nadiren kritiktir ama "uygulama hızlandı, sonra sebepsiz yavaşladı" tipi gizemli senaryolarda deoptimization'a bakman gerekebilir.
 
 ### 13. Banking örnekleri — gerçek tuning
 
-#### Senaryo 1: API service, p99 hedef 100ms
+Şimdi her şeyi birleştirelim: aynı bilgiyi üç farklı servis profiline uygulayınca GC seçimi ve flag'ler nasıl değişir? Senaryo 1 — standart API servisi, p99 hedef 100ms, G1 ile:
 
 ```bash
 java -server \
@@ -406,7 +378,7 @@ java -server \
      -jar core-banking.jar
 ```
 
-#### Senaryo 2: Düşük-latency fraud detection (p99 hedef 10ms)
+Senaryo 2 — düşük-latency fraud detection, p99 hedef 10ms; burada latency her şeydir, ZGC generational:
 
 ```bash
 java -server \
@@ -419,7 +391,7 @@ java -server \
      -jar fraud-service.jar
 ```
 
-#### Senaryo 3: EOD batch (throughput maksimum)
+Senaryo 3 — EOD batch, throughput maksimum; latency önemsiz, Parallel GC + büyük heap:
 
 ```bash
 java -server \
@@ -430,56 +402,182 @@ java -server \
      -jar eod-job.jar
 ```
 
+Üçünde de ortak olan `HeapDumpOnOutOfMemoryError`'a dikkat et — profil ne olursa olsun bu bırakılmaz.
+
 ### 14. Anti-pattern'ler
 
-**Anti-pattern 1: `-Xmx` çok büyük, `-Xms` küçük**
+Mülakatta "bu JVM konfigünde ne yanlış?" sorusunun cephaneliği burasıdır. Beş klasik:
 
-```bash
--Xms512m -Xmx16g
-```
+**1 — `-Xmx` büyük, `-Xms` küçük** (`-Xms512m -Xmx16g`): heap büyürken GC pause olur, hep en kötü anda. Production'da `Xms = Xmx`.
 
-Sorun: Heap büyürken **GC pause** olur. Production'da `Xms = Xmx`.
+**2 — Production'da GC log kapalı**: OOM olunca neden olduğunu asla öğrenemezsin. GC log her zaman aktif ve rotate'li olmalı.
 
-**Anti-pattern 2: GC log kapalı production'da**
+**3 — `HeapDumpOnOutOfMemoryError` yok**: OOM → restart → kanıt yok. Heap dump'ı otomatik kaydet, yoksa aynı hatayı ikinci kez debug edersin.
 
-OOM olduğunda neden olduğunu bilemezsin. Her zaman GC log aktif.
+**4 — Yanlış GC seçimi**: düşük-latency servise Parallel takmak (uzun STW pause) veya batch job'a ZGC takmak (gereksiz %15 CPU overhead).
 
-**Anti-pattern 3: HeapDumpOnOutOfMemoryError yok**
-
-OOM oldu → process restart → kanıt yok. Heap dump otomatik kaydet.
-
-**Anti-pattern 4: Yanlış GC seçimi**
-
-Düşük-latency servise Parallel GC takmak (uzun STW pause), batch job'a ZGC takmak (CPU overhead).
-
-**Anti-pattern 5: `MaxGCPauseMillis` çok düşük**
-
-```bash
--XX:MaxGCPauseMillis=10
-```
-
-G1 buna ulaşmak için Young'ı küçültür, sık minor GC yapar, **throughput düşer**. Realistic hedef (50-200ms).
+**5 — `MaxGCPauseMillis` çok düşük** (`-XX:MaxGCPauseMillis=10`): G1 hedefe ulaşmak için Young'ı küçültür, sık minor GC yapar, throughput katlanarak düşer. Realistic hedef 50-200ms.
 
 ---
 
 ## Önemli olabilecek araştırma kaynakları
 
 - "Java Performance: The Definitive Guide" (Scott Oaks) — bütün JVM internals
-- "Garbage Collection Handbook" — derin GC teori
+- "The Garbage Collection Handbook" — derin GC teorisi
 - Oracle G1 GC tuning guide
-- "JVM Anatomy" by Aleksey Shipilev (blog series)
+- "JVM Anatomy Quark" serisi — Aleksey Shipilev (blog)
 - ZGC documentation (OpenJDK)
 - Shenandoah GC paper (Red Hat)
-- GCEasy.io blog post arşivi
+- GCEasy.io blog arşivi
 - JEP 439: Generational ZGC
 
 ---
 
-## Mini task'ler
+## Kendini Sına
 
-### Task 3.9.1 — GC log aktif et ve oku (30 dk)
+Aşağıdaki soruları önce **cevaba bakmadan** kendi cümlelerinle yanıtlamayı dene — hepsi TR bank ve performance mülakatlarında karşına çıkabilecek tarzda. Takıldığın soru olursa ilgili Kavramlar başlığına dön, sonra tekrar dene.
 
-`core-banking` app'inde:
+**S1. Generational hypothesis nedir ve bir banking servisinde neden geçerlidir? GC bu varsayımı nasıl kullanır?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Generational hypothesis "objelerin çoğu kısa ömürlüdür" gözlemidir. Banking'de birebir doğrudur: bir HTTP request boyunca yaratılan DTO'lar, mapper çıktıları ve ara hesaplama nesneleri request bitince çöp olur; sadece cache entry'leri, connection pool objeleri ve singleton'lar uzun yaşar.
+
+GC bu varsayımı heap'i yaşa göre bölerek kullanır: yeni objeler Young Generation'a doğar ve sık, hızlı minor GC ile toplanır; çoğu obje burada ölür, o yüzden tarama ucuzdur. Az sayıda "hayatta kalan" obje Old Generation'a promote olur ve orada nadir ama maliyetli major GC çalışır. Böylece kısa ömürlü objeler için ucuz, uzun ömürlüler için seyrek toplama yapılır.
+
+</details>
+
+**S2. Bir obje Eden'de doğduktan sonra Old Generation'a nasıl terfi eder? Minor GC ve tenuring akışını anlat.**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Yeni obje Eden'de yaratılır. Minor GC tetiklendiğinde (Eden dolunca) yaşayan objeler Eden ve dolu Survivor space'ten (S0) boş Survivor'a (S1) kopyalanır, ölüler toplanır ve Eden boşaltılır. Bir sonraki minor GC'de Survivor rolleri swap olur (S0 ↔ S1).
+
+Her survive edişte objenin "yaşı" (age) artar. Yaş default tenuring threshold'u (~15) aşınca obje Old Generation'a promote edilir. Old dolunca daha yavaş bir major GC çalışır. GC log'da 90M→85M gibi az objenin toplandığı Young pause'lar görüyorsan, objeler erken promote oluyor demektir — tenuring threshold düşük veya Young çok küçüktür.
+
+</details>
+
+**S3. Bir API gateway (p99 < 50ms hedef) ile bir fraud detection servisi için G1 mi ZGC mi seçersin? Farkı sebep-sonuç olarak açıkla.**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Standart banking API için G1 (Java 9+ default) yeterlidir: heap'i region'lara böler, concurrent marking yapar ve pause'u genelde < 200ms tutar. p99 200ms tolere edilebiliyorsa G1 en dengeli seçimdir, ekstra CPU maliyeti yoktur.
+
+Gerçekten düşük-latency gereken fraud detection gibi servislerde (p99 < 10ms) ZGC tercih edilir: pause'ları < 10ms garanti eder, TB ölçek heap destekler, ama ~%15 throughput/CPU overhead getirir. Yani takas nettir — ZGC latency alır, CPU verir. Java 21+ ise Generational ZGC (`-XX:+ZGenerational`) throughput cezasını belirgin azalttığı için modern default tercihtir. Batch job'a ise ikisini de takmazsın, Parallel GC (throughput) kullanırsın.
+
+</details>
+
+**S4. Stop-the-world (STW) pause nedir? Serial, Parallel, G1 ve ZGC bu açıdan nasıl farklılaşır?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Stop-the-world, GC'nin çalışabilmek için tüm uygulama thread'lerini durdurduğu andır; bu süre boyunca hiçbir request işlenmez, yani doğrudan latency'ye yansır. Amaç STW süresini ve sıklığını minimize etmektir.
+
+Serial GC tamamen tek thread'li ve tamamen STW'dir (en uzun pause). Parallel GC çok thread'li STW yapar — daha kısa ama hâlâ uzayabilir (>1s), o yüzden throughput odaklı batch'e uygundur. G1 işin çoğunu concurrent yapar, sadece kısa STW fazları bırakır (genelde <200ms). ZGC marking ve relocation'ın neredeyse tamamını concurrent yürütür ve STW'yi < 10ms'ye indirir — heap büyüse bile pause büyümez.
+
+</details>
+
+**S5. `-XX:MaxGCPauseMillis=200` ne anlama gelir? Bunu 10ms'ye çekersem ne olur?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+`MaxGCPauseMillis` bir hedeftir (target), garanti değil. G1 bu pause hedefini tutturmaya çalışarak Young generation boyutunu ve GC iş miktarını ayarlar, ama her koşulda 200ms altını garanti etmez.
+
+Çok düşük bir değer (10ms) verirsen G1 hedefe ulaşmak için Young'ı küçültür; küçük Young daha sık dolar, dolayısıyla minor GC sıklığı artar. Sonuç: pause başına süre düşse de toplamda daha çok GC çalışır ve throughput ciddi düşer — CPU'nun büyük kısmı GC'ye gider. Realistic banking hedefi 50-200ms arasıdır; 10ms gerçekten gerekiyorsa çözüm G1'i zorlamak değil, ZGC'ye geçmektir.
+
+</details>
+
+**S6. JIT warmup nedir? Interpreter → C1 → C2 akışını ve banking'de neden önemli olduğunu anlat.**
+
+<details>
+<summary>Cevabı göster</summary>
+
+JVM kodu önce bytecode olarak interpret eder (yavaş). Bir method yeterince çağrılınca (default ~10000 invocation) "hot" sayılır ve önce C1 (client compiler) ile hızlı ama basit derlenir; daha da sıcaksa C2 (server compiler) ile agresif optimize edilir. Tiered compilation (Java 8+ default) ikisini birlikte kullanır. Bu ısınma sürecine JIT warmup denir.
+
+Banking'de önemi: servis yeni ayağa kalktığında veya deploy sonrası ilk request'ler interpreter/C1 seviyesinde çalışır, bu yüzden ilk saniyelerde latency yüksektir. p99 SLA'i olan bir serviste warmup bitmeden trafik almak veya load balancer'a eklemek yanıltıcı yavaşlık üretir. Çözüm: readiness probe'u warmup'a bağlamak, synthetic warmup request'leri atmak veya kademeli trafik açmak.
+
+</details>
+
+**S7. Production'da neden `Xms = Xmx` kuralı vardır? Aksi durumda ne olur?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+`-Xms` (initial heap) ile `-Xmx` (max heap) farklı olduğunda JVM heap'i dinamik olarak büyütüp küçültür. Büyüme anında JVM OS'ten yeni memory commit eder ve genelde bir GC pause tetiklenir; bu tam da yük arttığı (yani heap'in büyüdüğü) en kötü anda olur.
+
+`Xms = Xmx` verince heap baştan tam boyutta commit edilir, bir daha resize olmaz — böylece resize kaynaklı öngörülemeyen pause'lar tamamen ortadan kalkar ve GC davranışı stabilleşir. `-Xms512m -Xmx16g` gibi bir konfig test ortamında sorunsuz görünüp production'da yük altında gizemli pause'lar üretir; banking'de heap sabittir.
+
+</details>
+
+**S8. Escape analysis ve scalar replacement banking kodunda nereden tasarruf sağlar? Kısa bir örnek ver.**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Escape analysis, JIT'in bir nesnenin yaratıldığı method dışına "kaçıp kaçmadığını" (başka thread'e, field'a, return'e verilip verilmediğini) analiz etmesidir. Nesne kaçmıyorsa JIT onu heap yerine stack'te yaratabilir; scalar replacement ise bir adım öteye gidip nesneyi hiç yaratmadan field'larını local değişkenlere böler.
+
+Banking etkisi: inner loop'larda bol `BigDecimal` / `Money` ara nesnesi üretilir. Bu ara değişkenler metottan dışarı sızmıyorsa (`Money temp = Money.of("100","TRY"); return temp.amount();` gibi) JIT allocation'ı tamamen eler — heap'e hiç dokunulmaz, GC baskısı ve allocation maliyeti kaybolur. Anahtar koşul objenin leak etmemesidir; bir field'a atarsan veya thread'e geçirirsen optimizasyon devre dışı kalır.
+
+</details>
+
+---
+
+## Tamamlama kriterleri
+
+- [ ] Generational hypothesis'i ve banking'de neden geçerli olduğunu açıklayabiliyorum
+- [ ] Bir objenin Eden → Survivor → Old promotion akışını (minor GC + tenuring) anlatabiliyorum
+- [ ] Banking için GC seçim matrisini (API/batch/real-time) ve G1 vs ZGC farkını biliyorum
+- [ ] `MaxGCPauseMillis` target vs guarantee farkını ve çok düşük vermenin sonucunu açıklayabiliyorum
+- [ ] Bir G1 GC log satırını (sağlıklı ve sorunlu) parse edebiliyorum
+- [ ] JIT tiered compilation'ı (interpreter → C1 → C2) ve JIT warmup'ın etkisini anlatabiliyorum
+- [ ] Escape analysis + scalar replacement'ın banking kodunda nereden tasarruf yaptığını biliyorum
+- [ ] Metaspace vs eski PermGen farkını ve `MaxMetaspaceSize` gereğini açıklayabiliyorum
+- [ ] Native Memory Tracking ile heap dışı belleği (Direct buffer, thread stack) görebiliyorum
+- [ ] `Xms = Xmx` kuralının ve production gözlemlenebilirlik flag'lerinin (GC log, HeapDumpOnOOM) gerekçesini biliyorum
+
+---
+
+## Defter notları
+
+1. "Generational hypothesis ve banking için neden geçerli: ____."
+2. "Young → Old promote akışı (minor GC + tenuring threshold): ____."
+3. "G1 vs ZGC vs Parallel — banking için karar kriterleri: ____."
+4. "MaxGCPauseMillis target vs guarantee farkı, çok düşük verince: ____."
+5. "Metaspace vs eski PermGen farkı: ____."
+6. "Code Cache full olunca ne olur (sessiz performans düşüşü): ____."
+7. "Native Memory Tracking ile heap dışı bellek (Direct buffer, thread stack): ____."
+8. "Escape analysis + scalar replacement banking kodunda nereden tasarruf yapar: ____."
+9. "JFR'ın production'da güvenli olmasının sebebi (overhead): ____."
+10. "Xms = Xmx neden production'da kural: ____."
+
+```admonish success title="Bölüm Özeti"
+- Heap generational bölünür (Young=Eden+Survivor / Old) çünkü objelerin çoğu kısa ömürlüdür; minor GC ucuz, major GC pahalıdır
+- Bir obje Eden → Survivor arası kopyalana kopyalana yaşlanır, tenuring threshold'u aşınca Old'a promote olur
+- GC seçimi latency-throughput takasıdır: standart API için G1 (default), düşük-latency için ZGC (< 10ms pause, ~%15 CPU), batch için Parallel
+- `MaxGCPauseMillis` bir target'tır; 10ms gibi düşük değer Young'ı küçültüp throughput'u katleder — gerçekten gerekiyorsa ZGC'ye geç
+- JIT interpreter → C1 → C2 tiered compilation ile ısınır; escape analysis + scalar replacement leak etmeyen ara nesnelerin allocation'ını tamamen eler
+- Production standardı: `Xms = Xmx`, `MaxMetaspaceSize` set, GC log + HeapDumpOnOutOfMemoryError açık, off-heap için Native Memory Tracking
+```
+
+---
+
+## Pratik yapmak istersen
+
+Kavramları elle görmek istersen aşağıdaki iki ek hazır: uygulamalı egzersizler GC log okuma, heap dump analizi, G1 vs ZGC karşılaştırma, JFR ve Native Memory Tracking için adım adım çalışmalar içerir; Claude-verify prompt'u ile yaptığın JVM tuning ve memory analizini banking-grade perspektiften denetletebilirsin.
+
+<details>
+<summary>Uygulamalı egzersizler</summary>
+
+> Her egzersizde önce sonucu **tahmin et**, sonra çalıştırıp doğrula. Tamamlanma ölçütü çıktı üretmek değil, çıktıyı **yorumlayabilmektir**.
+
+### Egzersiz 1 — GC log aktif et ve oku (~30 dk)
+
+`core-banking` app'ini GC log açık çalıştır:
 
 ```bash
 java -Xms2g -Xmx2g \
@@ -488,13 +586,13 @@ java -Xms2g -Xmx2g \
      -jar core-banking.jar
 ```
 
-100 transfer request gönder. `gc.log`'u aç, manuel oku.
+100 transfer request gönder, `gc.log`'u aç ve manuel oku: minor GC pause'ları < 100ms mi, heap her GC'de ne kadar boşalıyor? Sonra `gc.log`'u GCEasy.io'ya yükle ve rapordaki throughput + pause dağılımını yorumla.
 
-Sonra GCEasy.io'ya yükle, raporu **defterine kopyala**.
+Tamamlama ölçütü: bir Young pause satırını (`100M->20M(2048M) 5.2ms` gibi) parça parça açıklayabiliyorsun.
 
-### Task 3.9.2 — Heap dump on OOM (30 dk)
+### Egzersiz 2 — Heap dump on OOM (~30 dk)
 
-`-Xmx128m` ile çalıştır (kasten küçük). Bir endpoint ekle, OOM tetikle:
+Kasten küçük heap ve OOM tetikleyen bir endpoint ile heap dump üret:
 
 ```java
 @GetMapping("/_oom")
@@ -511,11 +609,13 @@ java -Xmx128m \
      -jar core-banking.jar
 ```
 
-OOM tetikle. `oom.hprof` dosyası oluştu mu? MAT (Eclipse Memory Analyzer) ile aç. **Defterine** dominator tree'yi yaz.
+OOM'u tetikle, `oom.hprof` oluştu mu kontrol et, MAT (Eclipse Memory Analyzer) ile aç.
 
-### Task 3.9.3 — G1 vs ZGC karşılaştırma (45 dk)
+Tamamlama ölçütü: dominator tree'de belleği tutan ana objeyi (burada `byte[]` listesi) tespit edebiliyorsun.
 
-`core-banking`'i iki konfigürasyonla çalıştır:
+### Egzersiz 3 — G1 vs ZGC karşılaştırma (~45 dk)
+
+`core-banking`'i iki config ile çalıştır ve aynı load altında latency'yi kıyasla:
 
 ```bash
 # G1
@@ -525,109 +625,82 @@ java -Xmx4g -XX:+UseG1GC -XX:MaxGCPauseMillis=100 ...
 java -Xmx4g -XX:+UseZGC -XX:+ZGenerational ...
 ```
 
-Aynı Gatling load test'i (200 req/sec, 5 dk) — her ikisinde p50, p95, p99 latency ölç. **Defterine** karşılaştırma yaz.
+Aynı Gatling load test'i (200 req/sec, 5 dk) ile her ikisinde p50, p95, p99 ölç.
 
-### Task 3.9.4 — JFR continuous recording (30 dk)
+Tamamlama ölçütü: ZGC'nin p99'u neden düşük tuttuğunu ve throughput/CPU tarafında ne ödediğini bir cümleyle söyleyebiliyorsun.
+
+### Egzersiz 4 — JFR continuous recording (~30 dk)
 
 ```bash
 java -XX:StartFlightRecording=duration=2m,filename=banking.jfr \
      -jar core-banking.jar
 ```
 
-200 transfer request gönder. JMC ile `banking.jfr` aç. İncele:
-- Allocation hot paths
-- Lock contention
-- GC events
+200 transfer request gönder, `banking.jfr`'ı JMC ile aç ve incele: allocation hot path'ler, lock contention, GC events.
 
-### Task 3.9.5 — Native memory tracking (15 dk)
+Tamamlama ölçütü: en çok allocation yapan bir call path'i ve bir lock contention noktasını isimlendirebiliyorsun.
+
+### Egzersiz 5 — Native memory tracking (~15 dk)
 
 ```bash
 java -XX:NativeMemoryTracking=detail ...
 jcmd <pid> VM.native_memory
 ```
 
-Output'u defterine yapıştır. Heap dışında ne kadar memory? (Class, Thread, Code, Direct).
+Çıktıyı incele: heap dışında (Class, Thread, Code, Direct) ne kadar bellek var?
 
-### Task 3.9.6 — JIT compile log (30 dk)
+Tamamlama ölçütü: process'in toplam belleğinin neden `-Xmx`'ten büyük olduğunu kategorilerle açıklayabiliyorsun.
+
+### Egzersiz 6 — JIT compile log (~30 dk)
 
 ```bash
 java -XX:+PrintCompilation ...
 ```
 
-Output'un ilk 50 satırını incele. Hangi method'lar C1, hangileri C2 oldu? Banking domain method'ları var mı (örn. `Money.add`, `Account.deposit`)?
+Çıktının ilk 50 satırını incele: hangi method'lar C1 (tier 3), hangileri C2 (tier 4) oldu? Banking domain method'ları (`Money.add`, `Account.deposit`) derlendi mi?
 
----
+Tamamlama ölçütü: bir satırdaki tier numarasından method'un hangi compiler'la derlendiğini okuyabiliyorsun.
 
-## Test yazma rehberi
+### Egzersiz 7 — Test iskeleti: allocation ve leak
 
-### Test 3.9.1 — Heap allocation tracking
-
-```java
-@Test
-void shouldNotAllocateExcessivelyInHotPath() {
-    // Allocation profile için JMH + -prof gc
-    // Manuel test zor, JMH ile yap (Topic 3.11)
-}
-```
-
-### Test 3.9.2 — Memory leak detection
+Heap davranışını test içinde gözlemlemek fragile'dır (System.gc() garanti değil) ama bir başlangıç iskeleti:
 
 ```java
 @Test
 void cacheShouldNotGrowUnboundedly() throws Exception {
     AccountBalanceCache cache = new AccountBalanceCache();
-    
-    long before = getUsedHeap();
-    
+    long before = usedHeap();
+
     for (int i = 0; i < 100_000; i++) {
         cache.put(UUID.randomUUID(), BigDecimal.valueOf(i));
     }
-    
-    System.gc();
-    Thread.sleep(100);
-    System.gc();
-    
-    long after = getUsedHeap();
-    long growth = after - before;
-    
-    // Cache bounded olmalı (örn. 10000 entry limit)
-    // 100k put sonrası heap büyümesi makul olmalı
-    assertThat(growth).isLessThan(50_000_000);   // 50MB threshold
+    System.gc(); Thread.sleep(100); System.gc();
+
+    long growth = usedHeap() - before;
+    assertThat(growth).isLessThan(50_000_000);   // cache bounded olmalı
 }
 
-private long getUsedHeap() {
+private long usedHeap() {
     Runtime r = Runtime.getRuntime();
     return r.totalMemory() - r.freeMemory();
 }
 ```
 
-Bu test fragile — System.gc() guarantee değil. Production'da MAT analizi tercih.
+Not: bu test kırılgandır; gerçek leak analizi için üretimde MAT + heap dump tercih edilir. Allocation profili için JMH + `-prof gc` (Topic 3.11) çok daha kontrollüdür.
 
-### Test 3.9.3 — TestContainers ile JVM flag karşılaştırma
+</details>
 
-Belirli bir endpoint için iki farklı JVM config ile timing karşılaştırma. CI/CD pipeline'da:
+<details>
+<summary>Claude-verify prompt</summary>
 
-```yaml
-# .github/workflows/perf.yml
-- name: Run with G1
-  run: java -Xmx2g -XX:+UseG1GC -jar app.jar &
-  
-- name: Run with ZGC
-  run: java -Xmx2g -XX:+UseZGC -jar app.jar &
-```
-
-Daha çok integration test. JMH (Topic 3.11) daha kontrollü.
-
----
-
-## Claude-verify prompt
+> Aşağıdaki prompt'u kendi JVM tuning ve memory analizi çalışmanı denetletmek için kullan. Amaç kod yazdırmak değil, eksik ve yanlışları banking-grade kriterle işaretletmek.
 
 ```
-Aşağıdaki JVM tuning ve memory analizi çalışmamı banking-grade kriterlere göre 
+Aşağıdaki JVM tuning ve memory analizi çalışmamı banking-grade kriterlere göre
 değerlendir. Sadece eksikleri ve yanlışları işaretle:
 
 1. Heap konfigürasyonu:
-   - `Xms = Xmx` mi (production)?
+   - Xms = Xmx mi (production)?
    - Heap size servisin profiline uygun mu (API vs batch)?
    - Heap dump on OOM aktif mi?
 
@@ -668,35 +741,7 @@ değerlendir. Sadece eksikleri ve yanlışları işaretle:
    - Cache'ler bounded mi?
    - ThreadLocal'lar cleanup edilmiş mi?
 
-Her madde için PASS / FAIL / EKSIK işaretle.
+Her madde için PASS / FAIL / EKSIK işaretle, kanıt göster, kod yazma.
 ```
 
----
-
-## Tamamlama kriterleri
-
-- [ ] GC log aktif `core-banking`'te
-- [ ] GCEasy.io ile GC raporu okudum
-- [ ] HeapDumpOnOutOfMemoryError eklendi
-- [ ] MAT ile heap dump analiz akışını **bir kez** uyguladım
-- [ ] G1 vs ZGC karşılaştırma yaptım (latency)
-- [ ] JFR continuous recording çalıştırdım, JMC ile inceledim
-- [ ] Native Memory Tracking ile heap dışı belleği gördüm
-- [ ] JIT compile log'unda C1 vs C2 method'ları tanıyabilirim
-- [ ] `Xms = Xmx` pattern'ini benimsedim
-- [ ] Banking için GC seçim matrisini biliyorum (API/batch/real-time)
-
----
-
-## Defter notları
-
-1. "Generational hypothesis ve banking için neden geçerli: ____."
-2. "Young → Old promote akışı (minor GC + tenuring): ____."
-3. "G1 vs ZGC vs Parallel — banking için karar kriterleri: ____."
-4. "MaxGCPauseMillis target vs guarantee farkı: ____."
-5. "Metaspace vs eski PermGen farkı: ____."
-6. "Code cache full olunca ne olur: ____."
-7. "Native memory tracking ile heap dışı bellek (Direct buffer, Thread stack): ____."
-8. "Escape analysis + scalar replacement banking kodunda nereden tasarruf yapar: ____."
-9. "JFR'ın production'da güvenli olmasının sebebi (overhead): ____."
-10. "Xms = Xmx neden production'da kural: ____."
+</details>

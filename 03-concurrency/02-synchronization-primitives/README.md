@@ -1,18 +1,26 @@
 # Topic 3.2 — Synchronization Primitives: synchronized, volatile, Atomics, CAS
 
+```admonish info title="Bu bölümde"
+- `synchronized` monitor lock semantiği: acquire/release, reentrancy, memory fence ve biased locking'in neden kaldırıldığı
+- `volatile`'in sınırı (atomicity yok) ve atomic class ailesi: `AtomicLong`, `AtomicReference`, FieldUpdater, `AtomicBoolean`
+- CAS'ın donanım seviyesi mekaniği, CAS-loop pattern'i ve lock-free progress
+- ABA problemi ve `AtomicStampedReference` / `AtomicMarkableReference` ile çözümü
+- High-contention counter (`LongAdder`), `LockSupport.park/unpark` ve modern `VarHandle` API
+```
+
 ## Hedef
 
-Java'nın **temel senkronizasyon araçlarını** banking-grade derinlikte öğrenmek. `synchronized`'ın monitor lock semantiğini, `volatile`'in sınırlarını (tekrar — Topic 3.1'i pekiştirerek), atomic class ailesini (`AtomicInteger`, `AtomicLong`, `AtomicReference`, `AtomicReferenceFieldUpdater`), **CAS** (Compare-And-Swap) primitivesi ve ABA problemini, modern eklenti olan `LongAdder` / `DoubleAdder`'ı, `LockSupport.park/unpark` ile düşük seviye thread durdurma/uyandırmayı, ve modern `VarHandle` API'sini kavramak. Banking'de gerçek bir **balance update race condition**'ını adım adım reproduce edip her primitivle çözmek.
+Java'nın **temel senkronizasyon araçlarını** banking-grade derinlikte kavramak. `synchronized`'ın monitor lock semantiğini, `volatile`'in sınırlarını, atomic class ailesini (`AtomicInteger`, `AtomicLong`, `AtomicReference`, FieldUpdater), **CAS** (Compare-And-Swap) ve ABA problemini, `LongAdder`/`DoubleAdder`'ı, `LockSupport.park/unpark`'ı ve modern `VarHandle` API'sini öğrenmek. Bir **balance update race condition**'ını adım adım reproduce edip her primitivle çözmek.
 
 ## Süre
 
-Okuma: 2.5 saat • Mini task'ler: 3 saat • Test: 1 saat • Toplam: ~6.5 saat
+Okuma: 2.5 saat • Kendini Sına: 45 dk • Pratik (opsiyonel): 3-4 saat • Toplam: ~3 saat (+ pratik)
 
 ## Önbilgi
 
 - Topic 3.1 (JMM, happens-before, volatile semantics) tamamlandı
 - `BigDecimal`, `Money` value object'i (Phase 1)
-- Spring Boot service'lerinde basit business logic yazılabiliyor
+- Spring Boot service'lerinde basit business logic yazabiliyorsun
 
 ---
 
@@ -20,23 +28,25 @@ Okuma: 2.5 saat • Mini task'ler: 3 saat • Test: 1 saat • Toplam: ~6.5 saat
 
 ### 1. `synchronized` — monitor lock derinlemesine
 
-`synchronized` Java'nın **dilden gelen** kilitleme primitivesi. Her object'in bir **intrinsic monitor (mutex)** vardır. `synchronized` block'a giren thread, o object'in monitor'unu **acquire** eder; bloktan çıkarken **release** eder.
+Kilitlemenin en temeli buysa, önce dilin kendi primitivesini tanı. `synchronized` Java'nın **dilden gelen** kilitleme aracıdır. Her object'in bir **intrinsic monitor** (mutex) vardır; block'a giren thread o monitor'u **acquire** eder, çıkarken **release** eder.
 
 #### Kullanım formları
+
+Üç biçimi de görmek, hangisini seçeceğine karar vermenin ön koşulu:
 
 ```java
 class AccountSafe {
     private long balance;
-    
-    // 1. Instance method'a sync: monitor = `this`
+
+    // Instance method'a sync: monitor = `this`
     public synchronized void deposit(long amount) {
         balance += amount;
     }
-    
-    // 2. Static method'a sync: monitor = Class object
+
+    // Static method'a sync: monitor = Class object
     public static synchronized void resetGlobalCounter() { /* ... */ }
-    
-    // 3. Block sync: explicit monitor
+
+    // Block sync: explicit monitor
     private final Object lock = new Object();
     public void slowDeposit(long amount) {
         synchronized (lock) {
@@ -46,126 +56,106 @@ class AccountSafe {
 }
 ```
 
-**Hangisini seç?**
+Karşılaştırma:
 
-- **`synchronized` instance method**: junior için en basit, ama monitor `this` olduğu için **dışarıdan** `synchronized (account) { ... }` ile aynı monitor üzerinde yarış oluşturulabilir. Disiplin gerekir.
-- **`synchronized` static method**: monitor `Class` object'i. Aynı sınıfın tüm static method çağrıları tek monitor'ı paylaşır. Genellikle istenmez.
-- **Block + private final Object lock**: **tercih edilen biçim**. Dışarıdan çakışmaz, scope dar tutulur, performans için kritik.
+- **Instance method**: en basit, ama monitor `this` olduğu için dışarıdan `synchronized (account) { ... }` ile aynı monitor'da yarış oluşturulabilir.
+- **Static method**: monitor `Class` object'i; sınıfın tüm static çağrıları tek monitor'ı paylaşır. Genellikle istenmez.
+- **Block + private final lock**: tercih edilen biçim. Dışarıdan çakışmaz, scope dar tutulur.
 
-Banking pratiği: kritik kaynak başına **kendi private lock object'i** kullan. `this`'i lock olarak kullanma — dış kod yanlışlıkla aynı monitor'da bekler.
+Banking pratiği: <mark>kritik kaynak başına kendi private final lock object'ini kullan, `this`'i asla lock yapma</mark> — dış kod yanlışlıkla aynı monitor'da bekler.
 
 #### Reentrant özelliği
 
-`synchronized` **reentrant**'tır: aynı thread, sahip olduğu monitor'ı tekrar acquire edebilir, deadlock olmaz.
+`synchronized` **reentrant**'tır: aynı thread sahip olduğu monitor'ı tekrar acquire edebilir, deadlock olmaz. İçeride bir lock count tutulur; her çıkış sayacı azaltır, sıfıra inince gerçekten release olur.
 
 ```java
 class Reentrant {
     public synchronized void outer() {
         inner();  // aynı monitor reacquire — OK
     }
-    public synchronized void inner() {
-        // ...
-    }
+    public synchronized void inner() { /* ... */ }
 }
 ```
 
-İçeride bir sayaç tutulur (lock count). Her çıkış sayacı azaltır. Sıfıra inince gerçekten release.
-
 #### Memory semantics (Topic 3.1 tekrar)
 
-`synchronized` block'a giriş → **acquire fence**: tüm sonraki okumalar bu noktadan sonra olur, monitor'un release tarafından yazılmış her şey görünür.
+Monitor sadece kilit değil, aynı zamanda bir memory fence'tir. Block'a **giriş → acquire fence**: sonraki okumalar, önceki release'in yazdığı her şeyi görür. Block'tan **çıkış → release fence**: önceki yazılar flush edilir, sonraki acquire eden görür.
 
-`synchronized` block'tan çıkış → **release fence**: tüm önceki yazılar bu noktadan önce flush edilir, sonraki acquire eden görür.
-
-Yani `synchronized` **hem mutual exclusion hem visibility** sağlar. `volatile` sadece visibility. `synchronized` daha güçlü ama daha pahalı.
+Yani `synchronized` **hem mutual exclusion hem visibility** sağlar; `volatile` sadece visibility. `synchronized` daha güçlü ama daha pahalıdır.
 
 #### Biased locking (HISTORICAL — JDK 15+ kaldırıldı)
 
-JDK 8-14 arası: aynı thread monitor'ı **tekrar tekrar** alıyorsa, monitor "biased to that thread" işaretlenir; sonraki acquire'lar **çok ucuz** olur (CAS bile değil).
+Bu bir mülakat klasiği, o yüzden tarihçesini bil. JDK 8-14 arası: aynı thread monitor'ı tekrar tekrar alıyorsa monitor "biased to that thread" işaretlenir, sonraki acquire'lar çok ucuz olurdu (CAS bile değil).
 
-JDK 15'te `-XX:UseBiasedLocking` **default kapalı**, JDK 18'de **kaldırıldı**. Sebep: modern multi-thread iş yüklerinde maintenance maliyeti faydadan büyük. Modern uygulamalar contention'a karşı `ReentrantLock`, atomic, veya lock-free yaklaşımları kullanır.
+JDK 15'te `-XX:UseBiasedLocking` default kapatıldı, JDK 18'de tamamen kaldırıldı. Sebep: modern multi-thread iş yüklerinde bakım maliyeti faydadan büyük. Bugünkü uygulamalar contention'a karşı `ReentrantLock`, atomic veya lock-free yaklaşımlar kullanır.
 
-Mülakat sorusu: "Biased locking nedir, neden kaldırıldı?" — JDK 15'te disabled, 18'de kaldırıldı; modern workload artık tek-thread'li mutex pattern'ini kullanmıyor.
+#### Monitor implementation seviyeleri
 
-#### Lightweight + heavyweight locks
-
-JVM monitor implementation'ında üç seviye var:
+JVM monitor'ı transparently üç seviyede yönetir; sen sadece `synchronized` yazarsın:
 
 - **Biased lock** (kaldırıldı)
-- **Lightweight lock**: contention yokken CAS ile object header'a thread ID yaz
-- **Heavyweight lock**: contention varsa OS-level mutex (futex / Mach kernel mutex), thread'ler **park**'a alınır
+- **Lightweight lock**: contention yokken CAS ile object header'a thread ID yazılır
+- **Heavyweight lock**: contention varsa OS-level mutex (futex / Mach kernel), thread'ler park'a alınır
 
-JIT bunları transparently yönetir. Sen sadece `synchronized` yaz.
+Monitor'a giriş/çıkışın kavramsal akışı şöyle:
 
-#### `synchronized` ne zaman seçilir?
+```mermaid
+flowchart LR
+    A["Thread synchronized bloğa gelir"] --> B{"Monitor boş mu"}
+    B -->|"Evet"| C["Monitor acquire"]
+    B -->|"Hayır"| D["Park ve bekle"]
+    D --> B
+    C --> E["Kritik bölge çalışır"]
+    E --> F["Monitor release"]
+```
 
-- **Kısa kritik bölge** (microsaniyeler), low contention
-- Kod basitliği önemli
-- Reentrant ihtiyaç var (zaten default)
-- Reader-writer ayrımı **yok** (her erişim mutual exclusive)
+#### Ne zaman `synchronized`, ne zaman değil?
 
-**Ne zaman değil:**
+**Seç:** kısa kritik bölge (mikrosaniye) + low contention, kod basitliği önemli, reader-writer ayrımı yok.
 
-- Yüksek contention (multi-thread çekişiyor) — `ReentrantLock` veya atomic daha hızlı
-- Lock timeout veya interrupt gerek — `synchronized` tryLock veya lockInterruptibly desteklemez
-- Reader > writer çok fazla — `ReentrantReadWriteLock`
-- Counter, gauge gibi tek bir field artırma — atomic
-- Virtual thread (Topic 3.7) içinde + JDBC çağrısı — **pinning** problemi (`synchronized` virtual thread'i carrier'a pinler)
-
----
+**Seçme:** yüksek contention (`ReentrantLock`/atomic daha hızlı), lock timeout/interrupt gerek (`synchronized` desteklemez), reader ≫ writer (`ReentrantReadWriteLock`), tek field artırma (atomic), virtual thread + JDBC (Topic 3.7 — `synchronized` virtual thread'i carrier'a **pinler**).
 
 ### 2. `volatile` — tekrar ama derin
 
-Topic 3.1'de gördük. Burada **pratik tuzaklar** üzerine duralım.
+Topic 3.1'de gördün; burada pratik tuzaklara odaklanalım, çünkü en sık hata `volatile`'i atomicity sanmaktan doğar.
 
 #### Atomicity'nin olmaması
+
+`volatile` sadece yazma → görünürlük ve okuma → en güncel garantisi verir. Read-modify-write **atomik değildir**:
 
 ```java
 volatile long counter;
 counter++;  // ❌ read, increment, write — üç adım
 ```
 
-İki thread aynı anda counter=5 okur, ikisi de 6 yazar. **Bir artış kaybedilir.**
+İki thread aynı anda `counter=5` okur, ikisi de `6` yazar; bir artış kaybolur. <mark>Read-modify-write veya check-and-act için `volatile` yetmez, CAS şarttır</mark>.
 
-`volatile` sadece **yazma → görünürlük** ve **yazma sonrası okuma → en güncel** garantisi. Read-modify-write atomic değil.
+#### Array ve compound check tuzakları
 
-#### Volatile array vs array of volatile
-
-```java
-volatile int[] arr;          // ✓ array referansı volatile, içerikler değil
-int[] arr2;                  // array reference normal
-// arr2[i] = x; volatile değil
-```
-
-Array elemanlarının her birini volatile yapmak için **`AtomicIntegerArray`** veya **`VarHandle`** kullan.
-
-#### Volatile + compound check
+`volatile` bir array referansını volatile yapar, elemanları değil:
 
 ```java
-volatile boolean enabled;
-
-if (enabled) {                     // okuma
-    enabled = false;               // yazma — başka thread arada başka bir şey yapmış olabilir
-    doWork();
-}
+volatile int[] arr;   // referans volatile, arr[i] değil
 ```
 
-`if-then-set` atomic değil. CAS gerekir.
+Eleman bazında atomicity için `AtomicIntegerArray` veya `VarHandle` kullan. Aynı şekilde `if (enabled) { enabled = false; ... }` gibi check-then-set atomic değildir — arada başka thread araya girer.
 
-#### Pratik kullanım örnekleri
+#### Nerede doğru kullanım
 
-- **Flag (boolean)**: shutdown signal, configuration reload trigger
-- **Configuration reference** tek-yazan (sahip thread güncellet) → `volatile Configuration config`
-- **Sequence number** — TEK thread artırıyorsa, ÇOK thread okuyorsa
-- **State machine state** — değişim atomic ise (single field)
+`volatile`'i tek-yazan / çok-okuyan ve tek-field senaryolarda kullan:
 
----
+- **Flag (boolean)**: shutdown signal, config reload trigger
+- **Configuration reference**: tek thread güncellet → `volatile Configuration config`
+- **Sequence number**: TEK thread artırır, ÇOK thread okur
+- **State machine state**: değişim tek field ise
 
 ### 3. Atomic class ailesi — `java.util.concurrent.atomic`
 
-Bu paket **lock-free** primitive'lerin sınıflarını içerir. Hepsi `Unsafe.compareAndSwap*` (veya yeni JDK'larda `VarHandle.compareAndSet`) üzerine inşa.
+Kilitten kaçınmak istiyorsan giriş kapın bu paket. Tüm sınıflar **lock-free**'dir ve `compareAndSet` (altında `VarHandle`/`Unsafe` CAS) üzerine kuruludur.
 
 #### `AtomicInteger` ve `AtomicLong`
+
+Zengin bir atomik operasyon seti sunarlar:
 
 ```java
 var counter = new AtomicLong(0);
@@ -178,43 +168,43 @@ counter.updateAndGet(v -> v * 2);       // counter = f(counter) atomically
 counter.accumulateAndGet(5, Long::sum); // counter = sum(counter, 5)
 ```
 
-**Banking örneği — atomic transfer counter:**
+Banking örneği — atomic transfer counter'ları tek bir metric holder'da:
 
 ```java
 public class TransferMetrics {
     private final AtomicLong successCount = new AtomicLong();
     private final AtomicLong failureCount = new AtomicLong();
     private final AtomicLong totalAmount = new AtomicLong();
-    
+
     public void recordSuccess(long amountKurus) {
         successCount.incrementAndGet();
         totalAmount.addAndGet(amountKurus);
     }
-    
+
     public void recordFailure() {
         failureCount.incrementAndGet();
     }
-    
+
     public Snapshot snapshot() {
         return new Snapshot(successCount.get(), failureCount.get(), totalAmount.get());
     }
-    
+
     public record Snapshot(long success, long failure, long total) {}
 }
 ```
 
-#### `AtomicReference<T>`
+#### `AtomicReference<T>` — lock-free state holder
 
-Referansa atomic CAS yapar. Banking için **immutable state holder** olarak çok kullanışlı:
+Referansa atomic CAS yapar; banking'de **immutable state holder** olarak çok değerlidir. `synchronized` olmadan lock-free bir debit yazmanı sağlar:
 
 ```java
 public class AccountStateHolder {
     private final AtomicReference<AccountState> ref;
-    
+
     public AccountStateHolder(AccountState initial) {
         this.ref = new AtomicReference<>(initial);
     }
-    
+
     public boolean tryDebit(long amount) {
         while (true) {
             var current = ref.get();
@@ -226,7 +216,7 @@ public class AccountStateHolder {
             // CAS fail → retry
         }
     }
-    
+
     public record AccountState(long balance, long version) {
         AccountState withBalance(long newBalance) {
             return new AccountState(newBalance, version + 1);
@@ -235,14 +225,15 @@ public class AccountStateHolder {
 }
 ```
 
-Bu **lock-free** bir debit. `synchronized` yok. Concurrent transfer'lar CAS ile yarışır; başarısız olan retry yapar.
+Concurrent transfer'lar CAS ile yarışır; başarısız olan retry yapar. Pratik notlar:
 
-**Pratik notlar:**
-- Retry loop'u **bounded** yapmak iyi olabilir (örn. max 1000 retry, sonra fall-back to lock)
-- `updateAndGet(Function<T,T>)` aynı şeyi içinde retry loop ile yapar; daha kısa kod
-- Lambda **side-effect free** olmalı — CAS fail'de tekrar çağrılır
+- Retry loop'u **bounded** yapmak iyi olabilir (örn. max 1000 retry, sonra lock fallback).
+- `updateAndGet(Function<T,T>)` aynı işi içinde retry ile yapar; daha kısa kod.
+- Lambda **side-effect free** olmalı — CAS fail'de tekrar çağrılır.
 
-#### `AtomicIntegerArray`, `AtomicLongArray`, `AtomicReferenceArray`
+#### Atomic array'ler
+
+`AtomicIntegerArray`, `AtomicLongArray`, `AtomicReferenceArray` her eleman için atomicity verir:
 
 ```java
 var slots = new AtomicLongArray(16);
@@ -250,40 +241,37 @@ slots.incrementAndGet(5);     // index 5
 slots.compareAndSet(0, expected, newValue);
 ```
 
-Banking'de örnek: ledger account balance'ları için **fixed-size cache**:
+Banking'de örnek: ledger balance'ları için fixed-size cache. Dikkat, `getAndUpdate` **eski** değeri döner:
 
 ```java
 public class AccountBalanceCache {
     private final AtomicLongArray balances;
-    private final int size;
-    
+
     public AccountBalanceCache(int size) {
-        this.size = size;
         this.balances = new AtomicLongArray(size);
     }
-    
+
     public boolean tryDebit(int accountIdx, long amount) {
-        return balances.getAndUpdate(accountIdx, b -> 
+        return balances.getAndUpdate(accountIdx, b ->
             b >= amount ? b - amount : b
-        ) >= amount;
-        // Dikkat: getAndUpdate döndüğü ESKI değer; check ona göre.
+        ) >= amount;  // dönen değer ESKI balance; check ona göre
     }
 }
 ```
 
-(Production'da bu kadar primitiv değil ama atomic array fikrini gösteriyor.)
+(Production'da bu kadar primitif değil ama fikri gösteriyor.)
 
-#### `AtomicReferenceFieldUpdater` ve `AtomicIntegerFieldUpdater`
+#### `AtomicReferenceFieldUpdater` / `AtomicLongFieldUpdater`
 
-`AtomicReference<T>` her field için ekstra wrapper allocation maliyeti. Eğer **var olan** bir field'a atomic CAS yapmak istiyorsan, **FieldUpdater** kullan:
+`AtomicReference` her field için ekstra wrapper allocation demektir. Var olan bir field'a atomic CAS yapmak istersen **FieldUpdater** allocation'dan kurtarır — field `volatile` olmak zorundadır:
 
 ```java
 class Account {
     private volatile long balance;  // ← volatile zorunlu
-    
+
     private static final AtomicLongFieldUpdater<Account> BALANCE_UPDATER =
         AtomicLongFieldUpdater.newUpdater(Account.class, "balance");
-    
+
     public boolean tryDebit(long amount) {
         while (true) {
             long current = balance;
@@ -296,41 +284,35 @@ class Account {
 }
 ```
 
-**Avantaj:** Bir tane static `FieldUpdater`, milyon Account için tek. Memory tasarrufu.
+**Avantaj:** tek static updater milyon Account için yeter (memory tasarrufu). **Dezavantaj:** reflection kullanır, yanlış field ismi runtime'da patlar. Modern alternatif **`VarHandle`** (madde 8).
 
-**Dezavantaj:** Reflection kullanır, hatalı field ismi runtime fail. Modern alternatif: **`VarHandle`** (madde 9).
+#### `AtomicBoolean` — tek-sefer garantisi
 
-#### `AtomicBoolean`
-
-CAS'lı boolean. Singleton initialization, "tek-sefer-çalıştır" kontrolünde kullanışlı:
+Singleton init veya "tek kez çalıştır" kontrolünde CAS'lı boolean idealdir:
 
 ```java
 class OnceInitializer {
     private final AtomicBoolean initialized = new AtomicBoolean(false);
-    
+
     public void initialize() {
         if (initialized.compareAndSet(false, true)) {
-            // sadece BIR kez çalışacak
-            doExpensiveInit();
+            doExpensiveInit();   // sadece BIR kez çalışır
         }
     }
 }
 ```
 
----
+```admonish tip title="Atomic seçim ipucu"
+İlişkili birden çok değeri (balance + version + timestamp) tek bir `record` içine al ve `AtomicReference<record>` kullan. İki ayrı `AtomicLong` her biri atomiktir ama ikisi birlikte tutarlı okunmaz.
+```
 
 ### 4. CAS (Compare-And-Swap) — donanım seviyesinde
 
-CAS, modern CPU'ların sağladığı **atomik talimat**:
+Tüm lock-free dünyanın tek bir enstrüksiyona dayandığını görmeden atomic'leri gerçekten anlamış sayılmazsın. CAS, modern CPU'ların sağladığı **atomik talimattır**:
 
-> "Eğer bellek konumundaki değer X ise, Y yap. Aksi halde yapma. Tek bir atomik adımda."
+> "Bellek konumundaki değer X ise Y yaz, değilse yapma — tek atomik adımda."
 
-x86: `CMPXCHG` (ve `LOCK CMPXCHG` multi-core için).
-ARM: `LDREX/STREX` (Load-Exclusive/Store-Exclusive) çiftleri.
-
-Java'da `Atomic*.compareAndSet(expected, new)` direkt bu enstrüksiyona iner.
-
-#### CAS semantiği
+x86 bunu `CMPXCHG` (multi-core için `LOCK CMPXCHG`), ARM `LDREX/STREX` çiftiyle yapar. Java'da `Atomic*.compareAndSet(expected, new)` doğrudan bu enstrüksiyona iner:
 
 ```
 boolean cas(memory, expected, newValue) {
@@ -338,14 +320,15 @@ boolean cas(memory, expected, newValue) {
         if (memory == expected) {
             memory = newValue;
             return true;
-        } else {
-            return false;
         }
+        return false;
     }
 }
 ```
 
 #### CAS-loop pattern
+
+Tüm lock-free algoritmaların temeli budur: oku, hesapla, CAS; başarısızsa retry.
 
 ```java
 long current;
@@ -355,33 +338,30 @@ do {
 } while (!atom.compareAndSet(current, next));
 ```
 
-Bu pattern lock-free algoritmaların temelidir. CAS başarısız ise retry. Başarısız olan **diğer bir thread başarılı oldu** demek; yani **progress garantili** (lock-free).
+Başarısız CAS "**başka bir thread başarılı oldu**" demektir; yani en az bir thread her zaman ilerler — buna **lock-free progress** denir. Akış şöyle görünür:
 
-#### CAS pros/cons
+```mermaid
+flowchart LR
+    A["current oku"] --> B["next hesapla"]
+    B --> C{"compareAndSet current next"}
+    C -->|"Başarılı"| D["İşlem tamam"]
+    C -->|"Başarısız"| A
+```
 
-**Pros:**
-- Lock yok → blocking yok → priority inversion, deadlock yok
-- Yüksek contention'da bile bazı thread'ler ilerler (lock-free progress)
-- Çok hızlı (donanım enstrüksiyon)
+#### Artı ve eksileri
 
-**Cons:**
-- High contention'da çok retry → CPU spinning, faydasız iş
-- ABA problemi (sonraki madde)
-- Read-modify-write tek bir field'la sınırlı (kompleks transaction zor)
-- Karmaşık kod (lock-free veri yapıları korkunç zor)
+**Artı:** lock yok → blocking, priority inversion, deadlock yok; yüksek contention'da bile bazı thread'ler ilerler; donanım hızında.
 
----
+**Eksi:** high contention'da çok retry → CPU spinning; ABA problemi (sıradaki madde); read-modify-write tek field'la sınırlı; lock-free veri yapıları yazmak çok zordur.
 
 ### 5. ABA problemi ve `AtomicStampedReference`
 
-CAS'ın ünlü tuzağı: bir değişken A→B→A olabilir, CAS bunu fark etmez (sadece **mevcut değer == beklenen** kontrol eder).
-
-**Klasik örnek — lock-free stack:**
+CAS'ın ünlü tuzağı: bir değişken A→B→A olabilir ve CAS bunu fark etmez, çünkü sadece "**mevcut değer == beklenen**" kontrol eder. Klasik örnek lock-free stack:
 
 ```java
 class LockFreeStack<T> {
     private final AtomicReference<Node<T>> head = new AtomicReference<>();
-    
+
     public void push(T value) {
         var newNode = new Node<>(value);
         Node<T> oldHead;
@@ -390,10 +370,9 @@ class LockFreeStack<T> {
             newNode.next = oldHead;
         } while (!head.compareAndSet(oldHead, newNode));
     }
-    
+
     public T pop() {
-        Node<T> oldHead;
-        Node<T> newHead;
+        Node<T> oldHead, newHead;
         do {
             oldHead = head.get();
             if (oldHead == null) return null;
@@ -404,16 +383,25 @@ class LockFreeStack<T> {
 }
 ```
 
-**ABA senaryo:**
-1. Thread T1: `pop()` çağırır. `head = A`, `newHead = B` hesaplar.
-2. T1 preempted (OS scheduler).
-3. T2: `pop()` → A çıkar (head=B).
-4. T2: `pop()` → B çıkar (head=C).
-5. T2: `push(A)` → head=A (recycled).
-6. T1 uyanır, `head.compareAndSet(A, B)` → **başarılı!** Ama B artık valid değil (zaten pop edilmiş).
-7. head=B (kullanılmaz değer). Stack korupte.
+**ABA senaryosu:** T1 `pop()` içinde `head=A`, `newHead=B` hesaplar, sonra preempt edilir. T2 A ve B'yi pop eder, sonra A'yı geri push eder (recycled). T1 uyanır, `compareAndSet(A, B)` **başarılı** olur — ama B artık geçersiz, stack korupte.
 
-**Çözüm:** `AtomicStampedReference` — değer + versiyon:
+Aynı tuzak banking'de balance üzerinde de yaşanır:
+
+```mermaid
+sequenceDiagram
+    participant T1 as Thread 1
+    participant M as Balance
+    participant T2 as Thread 2
+    T1->>M: oku 1000 ve 500 planla
+    Note over T1: preempt edildi
+    T2->>M: withdraw 500 sonra balance 500
+    T2->>M: deposit 500 sonra balance 1000
+    Note over M: değer yine 1000 ama iki iş arada oldu
+    T1->>M: CAS 1000 to 500 başarılı
+    Note over T1: ABA fark edilmedi balance yanlış
+```
+
+**Çözüm — `AtomicStampedReference`:** değere bir version (stamp) ekle; her güncelleme stamp'i artırır, ABA artık yakalanır:
 
 ```java
 var ref = new AtomicStampedReference<Node<T>>(initialHead, 0);
@@ -425,77 +413,50 @@ int currentStamp = stampHolder[0];
 boolean success = ref.compareAndSet(current, newHead, currentStamp, currentStamp + 1);
 ```
 
-Versiyon her güncellemede artar, ABA artık yakalanır.
+Banking'de pratik çözümler: <mark>eş zamanlı balance güncellemesinde ya `version`'lı state ya da lock kullan</mark> — `AtomicStampedReference`, record içinde `version` field, `synchronized`/`ReentrantLock`, veya JPA `@Version` optimistic lock (Phase 2, distributed çözüm).
 
-#### Banking ABA senaryosu
+#### `AtomicMarkableReference` — alternatif
 
-```
-Account.balance:
-  T1 reads 1000 (planning to subtract 500 → 500)
-  T2 reads 1000, withdraws 500 → balance 500
-  T2 deposits 500 → balance 1000
-  T1 CAS(1000, 500) → success
-  Sonuç: T1 ve T2 birlikte 500 + 500 = 1000 çekti, ama balance hâlâ 500
-```
-
-Bu kritik bir hata. Çözüm:
-- **Versiyon**: `AtomicStampedReference<Long>` veya record içinde `version` field
-- **Lock**: `synchronized` veya `ReentrantLock` ile read+write tek transaction
-- **JPA optimistic lock**: `@Version` (Phase 2'de gördük, distributed çözüm)
-
-#### `AtomicMarkableReference` — alternative
-
-ABA'nın özel hali — bir field'ı `(value, boolean marked)` olarak tut. Versiyon yerine "deleted/active" flag. CAS hem değeri hem flag'i kontrol eder. Linked list'lerden node logical delete için kullanılır.
-
----
+ABA'nın özel hâli: field'ı `(value, boolean marked)` olarak tut. Version yerine "deleted/active" flag; CAS hem değeri hem flag'i kontrol eder. Linked list'lerde node'u logical delete etmek için kullanılır.
 
 ### 6. `LongAdder`, `DoubleAdder` — high-contention counter
 
-`AtomicLong.incrementAndGet()` yüksek contention'da yavaş çünkü tüm thread'ler **aynı cache line**'a yarışır. CAS retry'lar artar.
-
-**`LongAdder`** çözümü: değeri **birden çok cell**'e böler (striped sum). Her thread kendi cell'ine yazar. `sum()` çağrısında tüm cell'leri toplar.
+`AtomicLong.incrementAndGet()` yüksek contention'da yavaşlar, çünkü tüm thread'ler **aynı cache line**'a yarışır ve CAS retry'ları patlar. `LongAdder` çözümü değeri **birçok cell**'e böler (striped sum): her thread kendi cell'ine yazar, `sum()` hepsini toplar.
 
 ```java
 var counter = new LongAdder();
 counter.increment();
 counter.add(5);
 counter.sum();      // tüm cell'lerin toplamı
-counter.reset();    // sıfırla (test/metric reset)
+counter.reset();    // sıfırla
 ```
 
-**Banking örneği:** her saniyede 50k TPS'lik bir sistem için **istatistik counter**:
+50k TPS'lik bir sistemde istatistik counter için idealdir:
 
 ```java
 public class HighThroughputMetrics {
     private final LongAdder transferCount = new LongAdder();
     private final LongAdder failureCount = new LongAdder();
-    private final DoubleAdder totalAmount = new DoubleAdder();  // dikkat: double money değil!
-    // burada total long olabilir; sadece example
-    
+    private final DoubleAdder totalAmount = new DoubleAdder();  // dikkat: gerçek para long!
+
     public void recordTransfer(long amount) {
         transferCount.increment();
         totalAmount.add(amount);
     }
-    
+
     public Snapshot snapshot() {
-        return new Snapshot(
-            transferCount.sum(), 
-            failureCount.sum(), 
-            totalAmount.sum()
-        );
+        return new Snapshot(transferCount.sum(), failureCount.sum(), totalAmount.sum());
     }
 }
 ```
 
-**Trade-off:**
-- `AtomicLong`: kesin "şu an" değer alma kolay, low contention'da daha hızlı
-- `LongAdder`: high contention'da çok daha hızlı, **`sum()`** kesin "anlık" snapshot vermeyebilir (tutarlı ama point-in-time aproximate)
+```admonish warning title="LongAdder ile check-and-act yapma"
+`LongAdder.sum()` tutarlı ama point-in-time yaklaşık bir değerdir; kesin anlık snapshot vermez. Bu yüzden `if (balance.sum() >= amount) balance.add(-amount)` gibi check-then-act **yanlıştır** — overdraft'a yol açar. Sayaç (TPS, error count) için `LongAdder`; check + action (rate limiter, withdraw) için `AtomicLong` CAS veya `Semaphore`.
+```
 
-**Karar:** Banking metrik counter (TPS, error count) → `LongAdder`. Sayaç check + action (rate limiter) → `AtomicLong` veya `Semaphore`.
+#### `LongAccumulator` / `DoubleAccumulator`
 
-#### `LongAccumulator` ve `DoubleAccumulator`
-
-Generalize edilmiş Adder. Custom combine function alır.
+Generalize edilmiş Adder; custom combine function alır. Örneğin en uzun transfer süresi (latency monitoring):
 
 ```java
 var maxLatency = new LongAccumulator(Long::max, 0);
@@ -505,49 +466,42 @@ maxLatency.accumulate(30);
 maxLatency.get();  // 120
 ```
 
-Banking örneği: en uzun transfer süresi (latency monitoring).
-
----
-
 ### 7. `LockSupport.park` ve `unpark`
 
-**Düşük seviye** thread durdurma/uyandırma primitivesi. `ReentrantLock`, `Semaphore`, `BlockingQueue` gibi yüksek seviye sınıfların **altında** bu yatar.
+`ReentrantLock`, `Semaphore`, `BlockingQueue` gibi yüksek seviye sınıfların altında ne olduğunu merak ediyorsan cevap burada. `LockSupport` **düşük seviye** thread durdurma/uyandırma primitivesidir:
 
 ```java
-LockSupport.park();         // mevcut thread'i parka al
-LockSupport.unpark(thread); // belirli thread'i uyandır
+LockSupport.park();                  // mevcut thread'i parka al
+LockSupport.unpark(thread);          // belirli thread'i uyandır
 LockSupport.parkNanos(100_000_000);  // 100ms timeout
 ```
 
-#### `park`/`unpark` vs `wait`/`notify` farkları
+Anahtar kavram **permit modeli**: her thread'in 0 veya 1 permit'i vardır. `unpark` permit'i 1 yapar; `park` permit varsa hemen alır (parka girmez), yoksa bekler. Bu yüzden `unpark` önce gelirse "hatırlanır" — `notify`'da böyle değildir.
 
 | Özellik | park/unpark | wait/notify |
 |---|---|---|
 | Monitor gereksinimi | YOK | Monitor sahibi olmak gerek |
-| Permit semantics | ✓ (unpark önce gelirse hatırlanır) | ✗ (notify, wait'i bekleyen yoksa kaybolur) |
-| Spesifik thread'i uyandırma | ✓ (unpark(t)) | ✗ (notify random; notifyAll hepsi) |
-| Interrupt'a duyarlı | ✓ (park çıkar, status set) | ✓ (InterruptedException) |
+| Permit semantics | ✓ (unpark önce gelirse hatırlanır) | ✗ (dinleyen yoksa notify kaybolur) |
+| Spesifik thread uyandırma | ✓ (`unpark(t)`) | ✗ (notify random; notifyAll hepsi) |
+| Interrupt'a duyarlı | ✓ (park çıkar, status set) | ✓ (`InterruptedException`) |
 
-Permit modeli: her thread'in bir **permit**'i vardır (0 veya 1). `unpark` permit'i 1 yapar. `park` permit varsa hemen alır, yoksa bekler.
-
-**Tipik kullanım — custom lock:**
+Tipik kullanım basit bir custom lock iskeletidir (production-grade değil — spurious wakeup ve cancellation eksik):
 
 ```java
 class SimpleLock {
     private final AtomicReference<Thread> owner = new AtomicReference<>();
     private final Queue<Thread> waiters = new ConcurrentLinkedQueue<>();
-    
+
     public void lock() {
         while (!owner.compareAndSet(null, Thread.currentThread())) {
             waiters.add(Thread.currentThread());
-            // double-check after enqueueing
             if (!owner.compareAndSet(null, Thread.currentThread())) {
                 LockSupport.park(this);
             }
             waiters.remove(Thread.currentThread());
         }
     }
-    
+
     public void unlock() {
         owner.set(null);
         var next = waiters.peek();
@@ -556,22 +510,16 @@ class SimpleLock {
 }
 ```
 
-Bu **production-grade değil** (spurious wakeup, cancellation handling eksik). `ReentrantLock`'un Doug Lea implementation'ı çok daha sofistike. Ama park/unpark'ın motivasyonunu gösterir.
-
-#### Banking'de doğrudan kullanım nadiren olur
-
-Sen muhtemelen `LockSupport`'u doğrudan çağırmazsın. **Concurrent kütüphane içinde** görürsün. Mülakat sorusu: "ReentrantLock altında nasıl çalışır?" → AQS (AbstractQueuedSynchronizer) + park/unpark.
-
----
+Banking'de `LockSupport`'u doğrudan çağırmazsın; concurrent kütüphane içinde görürsün. Mülakat sorusu: "`ReentrantLock` altında nasıl çalışır?" → AQS (AbstractQueuedSynchronizer) + park/unpark.
 
 ### 8. `VarHandle` — modern `Unsafe` replacement
 
-Java 9'da geldi. `sun.misc.Unsafe` yerine **standart, güvenli** memory access API.
+Field-level CAS'a ihtiyacın olduğunda 2026'da doğru araç FieldUpdater değil, Java 9'la gelen `VarHandle`'dır — `sun.misc.Unsafe`'in standart ve güvenli halefidir:
 
 ```java
 class Account {
     private long balance;
-    
+
     private static final VarHandle BALANCE_VH;
     static {
         try {
@@ -581,420 +529,7 @@ class Account {
             throw new ExceptionInInitializerError(e);
         }
     }
-    
-    public boolean tryDebit(long amount) {
-        while (true) {
-            long current = (long) BALANCE_VH.getAcquire(this);  // volatile-like read
-            if (current < amount) return false;
-            if (BALANCE_VH.compareAndSet(this, current, current - amount)) {
-                return true;
-            }
-        }
-    }
-}
-```
 
-#### Access modes
-
-VarHandle çeşitli "ne kadar güçlü senkronizasyon" seçenekleri sunar:
-
-| Mode | Açıklama |
-|---|---|
-| `get`, `set` | Plain — JMM garantisi yok |
-| `getOpaque`, `setOpaque` | Aynı thread'de bitness garantisi (rarely needed) |
-| `getAcquire`, `setRelease` | C++ acquire/release semantics — bazı barrier'lar |
-| `getVolatile`, `setVolatile` | Full volatile semantics |
-| `compareAndSet`, `compareAndExchange` | CAS varyantları |
-| `getAndAdd`, `getAndSet`, `getAndBitwiseOr` | atomik RMW |
-
-Çoğu banking kodunda `getVolatile/setVolatile` ve `compareAndSet` yeterli. Acquire/release pattern'i performance-critical concurrent veri yapılarında.
-
-#### `VarHandle` vs `Atomic*FieldUpdater`
-
-VarHandle:
-- Tip güvenli (cast var ama compile-time check yok — runtime'da exact match)
-- Daha hızlı (JIT için optimize edilir)
-- Array element'lerine de erişebilir
-- `static` field'lara da erişebilir
-
-FieldUpdater:
-- Reflection-based, eski API
-- Java 8'de kullanılırdı
-- Modern kodda **VarHandle tercih**
-
----
-
-### 9. Banking race condition reproduction — adım adım
-
-Senaryo: `Account.balance` field'ı, eş zamanlı 100 thread'in `deposit(10)` çağırması.
-
-#### Versiyon 1 — naif, race kaybı
-
-```java
-public class RaceyAccount {
-    private long balance = 0;
-    
-    public void deposit(long amount) {
-        balance += amount;  // ❌ race
-    }
-    
-    public long getBalance() {
-        return balance;
-    }
-}
-```
-
-Test:
-
-```java
-@Test
-void shouldShowRaceCondition() throws Exception {
-    var account = new RaceyAccount();
-    int threads = 100;
-    int perThread = 1000;
-    
-    var pool = Executors.newFixedThreadPool(threads);
-    var latch = new CountDownLatch(threads);
-    for (int i = 0; i < threads; i++) {
-        pool.submit(() -> {
-            for (int j = 0; j < perThread; j++) {
-                account.deposit(1);
-            }
-            latch.countDown();
-        });
-    }
-    latch.await();
-    pool.shutdown();
-    
-    long expected = (long) threads * perThread;
-    long actual = account.getBalance();
-    System.out.println("Expected: " + expected + ", Actual: " + actual);
-    // Actual genellikle expected'tan ÇOK az (race kayıpları)
-}
-```
-
-Çıktı (örnek): `Expected: 100000, Actual: 87432`. ~12% kaybı.
-
-#### Versiyon 2 — synchronized
-
-```java
-public synchronized void deposit(long amount) {
-    balance += amount;
-}
-```
-
-Test: balance == 100000. ✓
-
-Performans: lock contention nedeniyle yavaş, ama doğru.
-
-#### Versiyon 3 — AtomicLong
-
-```java
-private final AtomicLong balance = new AtomicLong();
-
-public void deposit(long amount) {
-    balance.addAndGet(amount);
-}
-
-public long getBalance() {
-    return balance.get();
-}
-```
-
-Test: 100000. ✓
-
-Performans: synchronized'tan daha hızlı (CAS-based, lock-free).
-
-#### Versiyon 4 — LongAdder (high throughput)
-
-```java
-private final LongAdder balance = new LongAdder();
-
-public void deposit(long amount) {
-    balance.add(amount);
-}
-
-public long getBalance() {
-    return balance.sum();
-}
-```
-
-Test: 100000. ✓
-
-Performans: çok yüksek contention'da en hızlı. **Ama** withdraw / check-before-write için uygun değil (sum atomic single snapshot vermez).
-
-#### Versiyon 5 — withdraw + check (compound op)
-
-Burada `balance >= amount` kontrolü + subtract atomic olmalı. `LongAdder` **yetersiz**. `AtomicLong` ile CAS-loop:
-
-```java
-private final AtomicLong balance = new AtomicLong();
-
-public boolean tryWithdraw(long amount) {
-    while (true) {
-        long current = balance.get();
-        if (current < amount) return false;
-        if (balance.compareAndSet(current, current - amount)) {
-            return true;
-        }
-    }
-}
-```
-
-Veya kısa hali:
-
-```java
-public boolean tryWithdraw(long amount) {
-    long previous = balance.getAndUpdate(b -> b >= amount ? b - amount : b);
-    return previous >= amount;
-}
-```
-
-**Test:** 100 thread aynı anda `tryWithdraw(10)` çağırsın. Başlangıç balance 500.
-
-```java
-@Test
-void noOverdraftAllowed() throws Exception {
-    var account = new AtomicAccount(500);
-    int threads = 100;
-    var successes = new AtomicInteger();
-    var pool = Executors.newFixedThreadPool(threads);
-    var latch = new CountDownLatch(threads);
-    
-    for (int i = 0; i < threads; i++) {
-        pool.submit(() -> {
-            if (account.tryWithdraw(10)) successes.incrementAndGet();
-            latch.countDown();
-        });
-    }
-    latch.await();
-    pool.shutdown();
-    
-    assertThat(successes.get()).isEqualTo(50);  // 500 / 10
-    assertThat(account.getBalance()).isZero();
-}
-```
-
-50 başarı, 50 başarısızlık. Hiç overdraft yok.
-
----
-
-### 10. Anti-pattern'ler
-
-**Anti-pattern 1: "synchronized + this leak"**
-
-```java
-class Account {
-    public synchronized void deposit(long a) { ... }
-}
-
-// Dış kod:
-synchronized (account) {     // ❌ aynı monitor!
-    // yanlışlıkla iç metotları bloke ediyor
-}
-```
-
-Çözüm: private final lock object kullan.
-
-**Anti-pattern 2: "Atomic ama atomic değil"**
-
-```java
-private final AtomicInteger count = new AtomicInteger();
-private final AtomicLong total = new AtomicLong();
-
-public void record(long amount) {
-    count.incrementAndGet();      // atomik
-    total.addAndGet(amount);      // atomik
-    // ama (count, total) PAIR atomik değil
-}
-
-public Snapshot snapshot() {
-    return new Snapshot(count.get(), total.get());
-    // count okundu, sonra total okundu — arada record yapılmış olabilir
-}
-```
-
-Eğer snapshot **kesinlikle** consistent olmalıysa: `synchronized` veya `AtomicReference<record>`.
-
-**Anti-pattern 3: "Volatile + read-modify-write"**
-
-```java
-volatile int counter;
-counter++;     // ❌ race
-```
-
-**Anti-pattern 4: "CAS retry'da side-effect"**
-
-```java
-ref.updateAndGet(state -> {
-    log.info("Updating state");  // ❌ retry'da çoklu log!
-    sendNotification();           // ❌ retry'da çoklu mail!
-    return state.withBalance(...);
-});
-```
-
-CAS lambda **pure function** olmalı. Yan etkileri retry loop sonrası yap.
-
-**Anti-pattern 5: "LongAdder ile check-and-act"**
-
-```java
-private final LongAdder balance = new LongAdder();
-
-public boolean tryWithdraw(long amount) {
-    if (balance.sum() >= amount) {       // ❌ sum() snapshot atomic değil
-        balance.add(-amount);
-        return true;
-    }
-    return false;
-}
-```
-
-LongAdder counter için. Check-and-act için AtomicLong CAS.
-
-**Anti-pattern 6: "Biased locking için optimize etme"**
-
-Modern JDK'larda biased locking yok. "Biased locking için fast path" varsayımı yapma. Genel concurrent veri yapıları + atomic kullan.
-
-**Anti-pattern 7: "Atomic field tek başına yeterli sanma"**
-
-```java
-class Account {
-    private final AtomicLong balance = new AtomicLong();
-    private LocalDateTime lastTxn;    // ❌ atomic değil + ilişkili!
-    
-    public void deposit(long amount) {
-        balance.addAndGet(amount);
-        lastTxn = LocalDateTime.now();
-    }
-}
-```
-
-balance ve lastTxn iki bağımsız field; tutarsız okunabilir. State'i bir `record` içine al, `AtomicReference<State>` kullan.
-
----
-
-### 11. Banking pratik karar matrisi
-
-| Senaryo | Primitif |
-|---|---|
-| Tek bir sayaç (TPS metrics) | `LongAdder` |
-| Balance read-modify-write | `AtomicLong` + CAS / `synchronized` |
-| Konfigürasyon flag (hot reload) | `volatile boolean` |
-| Account state (balance + version + lastUpdated) | `AtomicReference<record>` |
-| Singleton initialization (tek-sefer) | `AtomicBoolean.compareAndSet` |
-| Shutdown signal | `volatile boolean` |
-| Stack/Queue lock-free | `ConcurrentLinkedQueue` (yapma kendin) |
-| Çok-thread yazar, çok-thread okur (compound state) | `synchronized` blok veya `ReentrantLock` (Topic 3.3) |
-| Tek-thread yazar, çok-thread okur (görünürlük) | `volatile` |
-| Field-level CAS, allocation kaçınma | `VarHandle` |
-
----
-
-## Önemli olabilecek araştırma kaynakları
-
-- "Java Concurrency in Practice" Brian Goetz, Chapter 15 (atomics)
-- "The Art of Multiprocessor Programming" Maurice Herlihy, Nir Shavit (kitap, lock-free algorithms)
-- Doug Lea j.u.concurrent kaynak kodu (`AtomicLong`, `LongAdder` source)
-- `VarHandle` JEP 193
-- Aleksey Shipilev — "Atomic*::lazySet is a Special Tool" (article)
-- "Compare-and-Swap" Wikipedia
-- Maurice Herlihy — "Wait-free synchronization" (1991 paper, hazır okursan derin)
-- ABA problem Wikipedia
-- "Lock-free programming considerations" Microsoft article (Bizans karmaşıklığını gösterir)
-- jcstress test örnekleri
-
----
-
-## Mini task'ler
-
-### Task 3.2.1 — Race condition reproduction (30 dk)
-
-`concurrency-playground/synch/RaceyAccount.java` — yukarıdaki naif versiyonu yaz. `synchronized` versiyonu da yan dosyada (`SyncAccount.java`). 100 thread × 1000 deposit testi koş. Race kaybını gör. Defterine "expected vs actual" yaz.
-
-### Task 3.2.2 — Atomic ailesi karşılaştırma (45 dk)
-
-Aynı 100 thread × 1000 deposit senaryosunu 4 farklı sınıfla yaz:
-
-- `RaceyAccount` (long)
-- `SyncAccount` (synchronized)
-- `AtomicAccount` (`AtomicLong`)
-- `AdderAccount` (`LongAdder`)
-
-Her birinin elapsed time'ını ölç (`System.nanoTime()`). Defterine tabloyu yaz:
-
-```
-Variant      | Final balance | Elapsed (ms)
--------------|---------------|-------------
-Racey        | 87432         | 120
-Synchronized | 100000        | 850
-AtomicLong   | 100000        | 220
-LongAdder    | 100000        | 180
-```
-
-Yorumla.
-
-### Task 3.2.3 — `tryWithdraw` CAS-loop (45 dk)
-
-`AtomicAccount.tryWithdraw(long amount)` — yukarıdaki CAS-loop versiyonu. Başlangıç balance 500, 100 thread her biri `tryWithdraw(10)` denesin. Beklenen: 50 başarı, 50 başarısızlık, balance 0.
-
-Test'i yaz (JUnit 5 + AssertJ).
-
-### Task 3.2.4 — `AccountStateHolder` (60 dk)
-
-`record AccountState(long balance, long version, Instant lastUpdated)`.
-
-`AccountStateHolder` class'ı, `AtomicReference<AccountState>` ile state tutar:
-
-- `tryDebit(long amount)` — CAS-loop, lock-free
-- `credit(long amount)` — updateAndGet
-- `snapshot()` — anlık state döner
-- Her başarılı update'te `version` artar
-
-Test:
-- Concurrent debit (50 thread × 100 transfer)
-- Toplam balance kaybı yok
-- Version monotonic artıyor
-- Hiçbir negative balance'a düşmüyor (initial 50000, her debit 10 → 50 başarısız debit)
-
-### Task 3.2.5 — `AtomicStampedReference` ile ABA tuzağı (45 dk)
-
-`abrasion/AbaDemo.java`:
-
-1. `AtomicReference<Integer>` ile basit CAS senaryosu
-2. ABA tuzağını **manuel** üret (T1 oku → uyu → T2 değiştir-geri al → T1 CAS) — sleep ile yapay senaryo
-3. Bu kodun naif AtomicReference ile **başarılı** olduğunu (yanlışlıkla) göster
-4. `AtomicStampedReference` ile aynı senaryo: T1 CAS başarısız
-
-Defterine "ABA neden tehlikeli, stamp neden gerekli" yaz.
-
-### Task 3.2.6 — `LongAdder` vs `AtomicLong` benchmark (30 dk)
-
-`metrics/CounterBenchmark.java`:
-
-- 200 thread, her biri 10000 increment
-- Bir kez `AtomicLong`, bir kez `LongAdder`
-- Elapsed time karşılaştır
-- Beklenen: yüksek contention'da `LongAdder` 2-5x hızlı
-
-(JMH gerçek benchmark için Topic 3.11'de. Burada **sanity check**.)
-
-### Task 3.2.7 — `VarHandle` ile field CAS (30 dk)
-
-`varhandle/VarHandleAccount.java`:
-
-```java
-public class VarHandleAccount {
-    private volatile long balance;
-    private static final VarHandle BALANCE_VH;
-    static {
-        try {
-            BALANCE_VH = MethodHandles.lookup()
-                .findVarHandle(VarHandleAccount.class, "balance", long.class);
-        } catch (ReflectiveOperationException e) {
-            throw new ExceptionInInitializerError(e);
-        }
-    }
-    
     public boolean tryDebit(long amount) {
         while (true) {
             long current = (long) BALANCE_VH.getVolatile(this);
@@ -1007,21 +542,46 @@ public class VarHandleAccount {
 }
 ```
 
-Test'ini yaz. AtomicAccount ile aynı behavior beklenir.
+#### Access modes
 
----
+`VarHandle` "ne kadar güçlü senkronizasyon" seçenekleri sunar; çoğu banking kodunda `getVolatile/setVolatile` + `compareAndSet` yeter:
 
-## Test yazma rehberi
+| Mode | Açıklama |
+|---|---|
+| `get`, `set` | Plain — JMM garantisi yok |
+| `getOpaque`, `setOpaque` | Aynı thread'de bitwise garanti (nadiren gerekir) |
+| `getAcquire`, `setRelease` | C++ acquire/release semantics — kısmi barrier |
+| `getVolatile`, `setVolatile` | Full volatile semantics |
+| `compareAndSet`, `compareAndExchange` | CAS varyantları |
+| `getAndAdd`, `getAndSet`, `getAndBitwiseOr` | atomik RMW |
 
-### Test 3.2.1 — Race condition gösteren test (eğitici, kasten flaky)
+Acquire/release pattern'i performance-critical concurrent veri yapılarında işe yarar; sıradan kodda `getVolatile`/`compareAndSet` yeterli.
+
+#### `VarHandle` vs `Atomic*FieldUpdater`
+
+`VarHandle` tip güvenli (runtime exact match), JIT için daha optimize, hem array element'lerine hem static field'lara erişebilir. `FieldUpdater` reflection-based eski API'dir; Java 8'de kullanılırdı. Modern kodda tercih **`VarHandle`**.
+
+### 9. Banking race condition reproduction — adım adım
+
+Teoriyi tek bir senaryoda pekiştirelim: `Account.balance`'a eş zamanlı 100 thread × 1000 `deposit`. Aynı problemi beş versiyonla çözeceğiz.
+
+#### Versiyon 1 — naif, race kaybı
+
+```java
+public class RaceyAccount {
+    private long balance = 0;
+    public void deposit(long amount) { balance += amount; }  // ❌ race
+    public long getBalance() { return balance; }
+}
+```
+
+Test 100 thread × 1000 artışla koşulur; beklenen `100000` ama çıktı genelde çok daha az (ör. `Actual: 87432`, ~%12 kayıp) çünkü `balance += amount` read-modify-write yarışır:
 
 ```java
 @Test
-void naiveAccountLosesUpdates() throws Exception {
+void shouldShowRaceCondition() throws Exception {
     var account = new RaceyAccount();
-    int threads = 100;
-    int perThread = 1000;
-    
+    int threads = 100, perThread = 1000;
     var pool = Executors.newFixedThreadPool(threads);
     var latch = new CountDownLatch(threads);
     for (int i = 0; i < threads; i++) {
@@ -1032,45 +592,75 @@ void naiveAccountLosesUpdates() throws Exception {
     }
     latch.await();
     pool.shutdown();
-    
-    // Bu test KASTEN race gösteriyor — flaky olabilir
-    assertThat(account.getBalance()).isLessThan((long) threads * perThread);
+    long expected = (long) threads * perThread;
+    System.out.println("Expected: " + expected + ", Actual: " + account.getBalance());
 }
 ```
 
-### Test 3.2.2 — AtomicAccount kesin doğru
+#### Versiyon 2 — synchronized
+
+Doğru ama lock contention nedeniyle yavaş:
 
 ```java
-@Test
-void atomicAccountIsCorrect() throws Exception {
-    var account = new AtomicAccount(0);
-    int threads = 100;
-    int perThread = 1000;
-    
-    var pool = Executors.newFixedThreadPool(threads);
-    var latch = new CountDownLatch(threads);
-    for (int i = 0; i < threads; i++) {
-        pool.submit(() -> {
-            for (int j = 0; j < perThread; j++) account.deposit(1);
-            latch.countDown();
-        });
+public synchronized void deposit(long amount) { balance += amount; }
+```
+
+Test: `balance == 100000` ✓
+
+#### Versiyon 3 — AtomicLong
+
+CAS-based, lock-free; `synchronized`'tan hızlı:
+
+```java
+private final AtomicLong balance = new AtomicLong();
+public void deposit(long amount) { balance.addAndGet(amount); }
+public long getBalance() { return balance.get(); }
+```
+
+Test: `100000` ✓
+
+#### Versiyon 4 — LongAdder (high throughput)
+
+Çok yüksek contention'da en hızlı. **Ama** withdraw / check-before-write için uygun değil (`sum()` tek anlık snapshot vermez):
+
+```java
+private final LongAdder balance = new LongAdder();
+public void deposit(long amount) { balance.add(amount); }
+public long getBalance() { return balance.sum(); }
+```
+
+Test: `100000` ✓
+
+#### Versiyon 5 — withdraw + check (compound op)
+
+Burada `balance >= amount` kontrolü + subtract **atomik** olmalı; `LongAdder` yetersiz, `AtomicLong` CAS-loop şart. Uzun ve kısa hâli aynı işi yapar:
+
+```java
+private final AtomicLong balance = new AtomicLong();
+
+public boolean tryWithdraw(long amount) {
+    while (true) {
+        long current = balance.get();
+        if (current < amount) return false;
+        if (balance.compareAndSet(current, current - amount)) return true;
     }
-    latch.await();
-    pool.shutdown();
-    
-    assertThat(account.getBalance()).isEqualTo((long) threads * perThread);
+}
+
+// Kısa hâli:
+public boolean tryWithdrawShort(long amount) {
+    long previous = balance.getAndUpdate(b -> b >= amount ? b - amount : b);
+    return previous >= amount;
 }
 ```
 
-### Test 3.2.3 — `tryWithdraw` no-overdraft invariant
+Başlangıç balance 500, 100 thread `tryWithdraw(10)` çağırırsa sonuç **kesin** 50 başarı, 50 başarısızlık, balance 0 — hiç overdraft yok:
 
 ```java
 @Test
-void noOverdraftEvenUnderContention() throws Exception {
+void noOverdraftAllowed() throws Exception {
     var account = new AtomicAccount(500);
     int threads = 100;
     var successes = new AtomicInteger();
-    
     var pool = Executors.newFixedThreadPool(threads);
     var latch = new CountDownLatch(threads);
     for (int i = 0; i < threads; i++) {
@@ -1081,143 +671,188 @@ void noOverdraftEvenUnderContention() throws Exception {
     }
     latch.await();
     pool.shutdown();
-    
     assertThat(successes.get()).isEqualTo(50);
     assertThat(account.getBalance()).isZero();
 }
 ```
 
-### Test 3.2.4 — `AccountStateHolder` version monotonicity
+Doğru primitivi seçmenin özeti bir karar akışıdır:
+
+```mermaid
+flowchart LR
+    Q{"İhtiyaç ne"} -->|"Sadece görünürlük"| V["volatile"]
+    Q -->|"Tek field read modify write"| A["AtomicLong CAS"]
+    Q -->|"Sadece sayaç yüksek TPS"| L["LongAdder"]
+    Q -->|"İlişkili state grubu"| R["AtomicReference record"]
+```
+
+### 10. Anti-pattern'ler
+
+Mülakatta "bu kodda ne yanlış?" sorusunun cephaneliği burasıdır; yedi klasik:
+
+**1 — synchronized + this leak:** `public synchronized void deposit(...)` yazıp dışarıdan `synchronized (account) { ... }` ile aynı monitor'da yarış oluşturmak. Çözüm: private final lock object.
+
+**2 — Atomic ama atomic değil:** iki ayrı atomic field tek tek atomiktir ama PAIR olarak değil:
 
 ```java
-@Test
-void versionMonotonicUnderConcurrentUpdates() throws Exception {
-    var holder = new AccountStateHolder(new AccountState(10000, 0, Instant.now()));
-    int writers = 10;
-    int readers = 10;
-    var stop = new AtomicBoolean(false);
-    var versionViolations = new AtomicInteger();
-    
-    var pool = Executors.newFixedThreadPool(writers + readers);
-    for (int i = 0; i < writers; i++) {
-        pool.submit(() -> {
-            while (!stop.get()) holder.credit(1);
-        });
-    }
-    for (int i = 0; i < readers; i++) {
-        pool.submit(() -> {
-            long lastVersion = 0;
-            while (!stop.get()) {
-                var snap = holder.snapshot();
-                if (snap.version() < lastVersion) versionViolations.incrementAndGet();
-                lastVersion = snap.version();
-            }
-        });
-    }
-    
-    Thread.sleep(2000);
-    stop.set(true);
-    pool.shutdown();
-    pool.awaitTermination(5, TimeUnit.SECONDS);
-    
-    assertThat(versionViolations.get()).isZero();
+public void record(long amount) {
+    count.incrementAndGet();   // atomik
+    total.addAndGet(amount);   // atomik — ama (count, total) çifti atomik değil
+}
+public Snapshot snapshot() {
+    return new Snapshot(count.get(), total.get());  // arada record yapılmış olabilir
 }
 ```
 
-### Test 3.2.5 — `AtomicStampedReference` ABA fix
+Tutarlı snapshot şartsa `synchronized` veya `AtomicReference<record>`.
+
+**3 — Volatile + read-modify-write:** `volatile int counter; counter++;` → race.
+
+**4 — CAS retry'da side-effect:** lambda retry'da tekrar çağrılır; yan etki çoğalır. <mark>CAS lambda'sı pure function olmalı, yan etkileri (log, notification) retry loop'unun dışına al</mark>:
 
 ```java
-@Test
-void atomicStampedRefDetectsAba() {
-    var ref = new AtomicStampedReference<Integer>(100, 0);
-    int[] stamp = new int[1];
-    
-    Integer initial = ref.get(stamp);
-    int initialStamp = stamp[0];
-    
-    // başka thread A → B → A yaptı (simulated)
-    ref.compareAndSet(initial, 200, initialStamp, initialStamp + 1);
-    ref.compareAndSet(200, 100, initialStamp + 1, initialStamp + 2);
-    
-    // T1 hâlâ initial gözlemiyle CAS denesin
-    boolean success = ref.compareAndSet(100, 999, initialStamp, initialStamp + 1);
-    assertThat(success).isFalse();  // stamp uyumsuz, ABA tespit edildi
-}
+ref.updateAndGet(state -> {
+    log.info("Updating");  // ❌ retry'da çoklu log
+    return state.withBalance(...);
+});
 ```
+
+**5 — LongAdder ile check-and-act:** `if (balance.sum() >= amount) balance.add(-amount)` → `sum()` snapshot atomik değil. Check-and-act için `AtomicLong` CAS.
+
+**6 — Biased locking için optimize etme:** modern JDK'da biased locking yok; "fast path" varsayımı yapma, genel atomic/concurrent yapıları kullan.
+
+**7 — Atomic field tek başına yeterli sanma:** `AtomicLong balance` + normal `LocalDateTime lastTxn` birlikte tutarsız okunur. State'i bir `record` içine al, `AtomicReference<State>` kullan.
+
+### 11. Banking pratik karar matrisi
+
+Ezberlenmesi gereken tablo bu; hangi senaryoda hangi primitif:
+
+| Senaryo | Primitif |
+|---|---|
+| Tek bir sayaç (TPS metrics) | `LongAdder` |
+| Balance read-modify-write | `AtomicLong` + CAS / `synchronized` |
+| Konfigürasyon flag (hot reload) | `volatile boolean` |
+| Account state (balance + version + lastUpdated) | `AtomicReference<record>` |
+| Singleton initialization (tek-sefer) | `AtomicBoolean.compareAndSet` |
+| Shutdown signal | `volatile boolean` |
+| Stack/Queue lock-free | `ConcurrentLinkedQueue` (kendin yazma) |
+| Çok-thread yazar+okur (compound state) | `synchronized` / `ReentrantLock` (Topic 3.3) |
+| Tek-thread yazar, çok-thread okur | `volatile` |
+| Field-level CAS, allocation kaçınma | `VarHandle` |
 
 ---
 
-## Claude-verify prompt
+## Önemli olabilecek araştırma kaynakları
 
-```
-Aşağıdaki kod synchronization primitives'i öğrenmek için yazıldı. Lütfen şu 
-kriterlere göre değerlendir ve EKSİKLERİ söyle, kod yazma:
+- "Java Concurrency in Practice" Brian Goetz, Chapter 15 (atomics)
+- "The Art of Multiprocessor Programming" Herlihy & Shavit (lock-free algorithms)
+- Doug Lea `j.u.concurrent` kaynak kodu (`AtomicLong`, `LongAdder` source)
+- `VarHandle` JEP 193
+- Aleksey Shipilev — "Atomic*::lazySet is a Special Tool"
+- "Compare-and-Swap" ve "ABA problem" (Wikipedia)
+- Maurice Herlihy — "Wait-free synchronization" (1991 paper)
+- "Lock-free programming considerations" (Microsoft article)
+- jcstress test örnekleri
 
-1. RaceyAccount + SyncAccount:
-   - Race condition gösteren naif versiyon var mı?
-   - synchronized'lı versiyon test ile karşılaştırılmış mı?
-   - synchronized block veya method tercihi (this leak var mı) doğru mu?
+---
 
-2. AtomicAccount:
-   - AtomicLong kullanılmış mı?
-   - tryWithdraw için CAS-loop veya getAndUpdate kullanılmış mı?
-   - Negative balance'a düşmüyor mu (CAS koşulu doğru mu)?
+## Kendini Sına
 
-3. AccountStateHolder:
-   - AtomicReference<record> kullanılmış mı?
-   - State record immutable mi (record + final field'lar)?
-   - updateAndGet veya compareAndSet ile state transition var mı?
-   - Lambda pure function mı (side-effect free)?
-   - Version monotonic artıyor mu (test ile)?
+Aşağıdaki soruları önce **cevaba bakmadan** kendi cümlelerinle yanıtlamayı dene — hepsi TR bank mülakatlarında karşına çıkabilecek tarzda. Takıldığın soruda ilgili Kavramlar başlığına dön, sonra tekrar dene.
 
-4. ABA problem:
-   - AbaDemo'da naif AtomicReference'ın ABA'ya açık olduğu gösterilmiş mi?
-   - AtomicStampedReference ile fix yapılmış mı?
-   - Defter notuna "neden ABA tehlikeli" yazılmış mı?
+**S1. `synchronized`'ın memory semantics'ini açıkla. Neden `volatile`'den daha güçlüdür?**
 
-5. LongAdder:
-   - Counter senaryosu için LongAdder kullanılmış mı?
-   - LongAdder yerine AtomicLong'un yetersiz kaldığı durum açıklanmış mı?
-   - check-and-act için LongAdder kullanma anti-pattern'i farkında mı?
+<details>
+<summary>Cevabı göster</summary>
 
-6. VarHandle:
-   - Field VarHandle ile bağlanmış mı?
-   - getVolatile / compareAndSet access modes kullanılmış mı?
-   - Field volatile zorunluluğu (VarHandle ile birlikte) anlaşılmış mı?
+`synchronized` block'a giriş bir **acquire fence**, çıkış bir **release fence**'tir. Release eden thread'in yaptığı tüm yazılar, aynı monitor'ı sonra acquire eden thread'e görünür olur (happens-before). Bu sayede `synchronized` hem **mutual exclusion** hem **visibility** sağlar.
 
-7. Anti-pattern kontrolü:
-   - volatile counter increment YAPMIŞ MI? (yapmamalı)
-   - synchronized + this leak var mı?
-   - CAS retry lambda'sında side-effect var mı?
-   - İki bağımsız atomic field'ı tutarlı snapshot için kullanmaya çalışılmış mı?
+`volatile` yalnızca visibility verir — bir thread'in yazdığını diğeri güncel okur — ama mutual exclusion yoktur, dolayısıyla read-modify-write'ı atomik yapmaz. `synchronized` daha güçlüdür ama monitor acquire/release maliyeti yüzünden daha pahalıdır; sadece görünürlük yetiyorsa `volatile` daha ucuzdur.
 
-8. Banking perspektifi:
-   - Balance race condition reproduce edilmiş mi?
-   - Tüm 4 versiyon (Racey/Sync/Atomic/Adder) karşılaştırılmış mı?
-   - no-overdraft invariant test edilmiş mi?
+</details>
 
-Her madde için PASS / FAIL / EKSIK. Kod yazma, sadece eksiklikleri söyle.
-```
+**S2. `volatile long counter; counter++;` neden thread-safe değil? Nasıl düzeltirsin?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+`counter++` tek işlem değil, üç adımdır: read, increment, write. `volatile` her adımın görünürlüğünü garanti eder ama üçünü tek atomik birim yapmaz. İki thread aynı anda `5` okur, ikisi de `6` yazar — bir artış kaybolur (lost update).
+
+Düzeltme: read-modify-write'ı atomik yapan bir primitif kullan. Tek sayaç için `AtomicLong.incrementAndGet()` veya yüksek contention'da `LongAdder.increment()`; genel bir dönüşüm için `AtomicLong` + CAS-loop.
+
+</details>
+
+**S3. CAS (Compare-And-Swap) donanım seviyesinde nasıl çalışır? CAS-loop pattern'i neden "lock-free progress" garanti eder?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+CAS tek bir atomik CPU enstrüksiyonudur (x86 `CMPXCHG`, ARM `LDREX/STREX`): "bellekteki değer beklenen X ise Y yaz ve true dön, değilse dokunma ve false dön". Java'da `Atomic*.compareAndSet(expected, new)` doğrudan buna iner.
+
+CAS-loop `do { current = get(); next = f(current); } while (!compareAndSet(current, next))` şeklindedir. Bir CAS başarısız olduysa, bu **başka bir thread'in başarılı olduğu** anlamına gelir — yani sistemde her zaman en az bir thread ilerler. Lock yoktur; bu yüzden deadlock ve priority inversion olmaz, buna lock-free progress denir.
+
+</details>
+
+**S4. ABA problemi nedir, banking'de neden tehlikeli? `AtomicStampedReference` bunu nasıl çözer?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+CAS sadece "mevcut değer == beklenen" kontrolü yapar; değer A→B→A döndüyse bunu fark etmez. Banking örneği: T1 balance'ı 1000 okur ve 500'e düşürmeyi planlar, preempt edilir. T2 500 çekip 500 yatırır (balance yine 1000). T1 uyanır, `CAS(1000, 500)` başarılı olur — ama arada iki işlem oldu, sonuç tutarsız (iki çekiliş kayboldu).
+
+`AtomicStampedReference` değere bir **stamp/version** ekler ve CAS hem değeri hem stamp'i kontrol eder. Her güncelleme stamp'i artırdığı için A→B→A'da stamp değişmiş olur; T1'in eski stamp'li CAS'ı başarısız olur ve retry eder. Alternatifler: record içinde `version` field, `synchronized`/`ReentrantLock` ile read+write'ı tek transaction yapmak, ya da JPA `@Version`.
+
+</details>
+
+**S5. `AtomicLong` ile `synchronized` performansını karşılaştır. `LongAdder` bu resme nerede giriyor?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+`synchronized` blocking bir mutex'tir: contention'da thread'ler park'a alınır, OS-level bekleme maliyeti yüksektir. `AtomicLong` lock-free CAS kullanır; low/orta contention'da `synchronized`'tan belirgin hızlıdır çünkü blocking yoktur. Ama çok yüksek contention'da tüm thread'ler aynı cache line'a yarışır, CAS retry'ları artar ve `AtomicLong` da yavaşlar.
+
+İşte burada `LongAdder` devreye girer: değeri birçok cell'e böler (striped sum), her thread kendi cell'ine yazar, contention dağılır — yüksek contention'da `AtomicLong`'tan 2-5x hızlı olabilir. Bedeli: `sum()` kesin anlık snapshot vermez ve read-modify-write/check-and-act için uygun değildir. Yani: saf sayaç → `LongAdder`; check + action → `AtomicLong` CAS; kısa kritik bölge + basitlik → `synchronized`.
+
+</details>
+
+**S6. İki bağımsız `AtomicLong` field'ı (count ve total) tutarlı bir snapshot için okumak neden yanlış? Doğru yaklaşım ne?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Her field tek başına atomiktir ama ikisi **birlikte** atomik değildir. `snapshot()` içinde `count.get()` ile `total.get()` arasında başka thread `record()` çağırıp ikisini de değiştirebilir; sonuç iki farklı ana ait tutarsız bir çift olur.
+
+Doğru yaklaşım: ilişkili değerleri tek bir immutable `record` içinde toplayıp `AtomicReference<record>` kullanmak. Tek referans atomik olarak set/CAS edildiği için okuma her zaman tutarlı bir bütün görür. Güncelleme `updateAndGet` veya CAS-loop ile yapılır; lambda side-effect free olmalı.
+
+</details>
+
+**S7. Field-level CAS için `AtomicReferenceFieldUpdater`, `VarHandle` ve `Unsafe` arasında nasıl seçersin? Biased locking neden kaldırıldı?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+`Unsafe` internal/desteklenmeyen bir API'dir, doğrudan kullanılmamalı. `FieldUpdater` reflection-based eski çözümdür (field `volatile` olmalı) ve `AtomicReference` wrapper allocation'ından kaçınır. Modern seçim **`VarHandle`**'dır: JIT için daha optimize, hem array hem static field'a erişir, `getVolatile`/`compareAndSet`/`getAcquire` gibi access mode'lar sunar.
+
+Biased locking, tek thread'in bir monitor'ı tekrar tekrar aldığı senaryoyu ucuzlatan bir optimizasyondu. JDK 15'te default kapatıldı, 18'de kaldırıldı; çünkü modern multi-thread iş yüklerinde faydası azaldı, JVM'deki bakım/karmaşıklık maliyeti ise büyüktü. Bugün contention'a karşı doğru cevap atomic/lock-free veya `ReentrantLock`'tur.
+
+</details>
 
 ---
 
 ## Tamamlama kriterleri
 
-- [ ] `synchronized` instance method / static method / block farkını anlatabiliyorum
-- [ ] Reentrant özelliği örnekle açıklayabiliyorum
+- [ ] `synchronized` instance / static / block farkını ve `this` leak riskini anlatabiliyorum
+- [ ] Reentrant özelliğini ve monitor'ın acquire/release memory semantics'ini açıklayabiliyorum
 - [ ] `volatile`'in 3 garantisi ve 1 NON-garantisi (atomicity yok) ezberimde
-- [ ] `AtomicLong` ile race-free counter yazdım
-- [ ] CAS-loop pattern'ini açıklayabiliyorum ve yazabiliyorum
-- [ ] ABA problemini örnekle anlatabiliyorum
-- [ ] `AtomicStampedReference` ile ABA fix gösterdim
-- [ ] `LongAdder` ile `AtomicLong` arasında benchmark çalıştırdım
-- [ ] `AtomicReference<record>` pattern'i ile state holder yazdım
-- [ ] `VarHandle` ile field CAS yaptım
-- [ ] Biased locking'in JDK 15+ kaldırıldığını biliyorum, sebebini açıklayabiliyorum
-- [ ] `LockSupport.park/unpark`'ın permit semantik özelliğini biliyorum
+- [ ] `AtomicLong` ile race-free counter ve `tryWithdraw` CAS-loop'unu yazabiliyorum
+- [ ] CAS'ın donanım mekaniğini ve lock-free progress'i açıklayabiliyorum
+- [ ] ABA problemini örnekle anlatıp `AtomicStampedReference` ile fix'i gösterebiliyorum
+- [ ] `LongAdder` vs `AtomicLong` trade-off'unu (contention, snapshot, check-and-act) biliyorum
+- [ ] `AtomicReference<record>` ile tutarlı snapshot pattern'ini uygulayabiliyorum
+- [ ] `VarHandle` ile field CAS yapabiliyorum ve neden `Unsafe`/FieldUpdater'dan iyi olduğunu biliyorum
+- [ ] Biased locking'in JDK 15/18 hikâyesini ve `LockSupport` permit semantics'ini biliyorum
 - [ ] Banking karar matrisini ezberledim (hangi senaryoda hangi primitif)
-
-Hepsi onaylı → Topic 3.3'e geç → [03-locks/](../03-locks/index.md)
+- [ ] (Opsiyonel) "Pratik yapmak istersen" testlerini yazdım ve Claude-verify prompt'uyla doğrulattım
 
 ---
 
@@ -1232,4 +867,209 @@ Hepsi onaylı → Topic 3.3'e geç → [03-locks/](../03-locks/index.md)
 7. "Biased locking JDK ____ kaldırıldı. Sebep: ____."
 8. "`VarHandle` neden `Unsafe`'ten daha iyi: ____, ____, ____."
 9. "`AtomicReference<State>` pattern'inin tutarlı snapshot avantajı: ____."
-10. "Banking'de balance update için 100 thread eşzamanlı çağırırsam, `synchronized`/`AtomicLong`/`LongAdder` karşılaştırması (final değer + hız): ____."
+10. "100 thread balance update: `synchronized`/`AtomicLong`/`LongAdder` karşılaştırması (final değer + hız): ____."
+
+```admonish success title="Bölüm Özeti"
+- `synchronized` hem mutual exclusion hem visibility verir (acquire/release fence); `volatile` sadece visibility — read-modify-write'ı atomik yapmaz
+- Atomic sınıflar CAS üzerine kuruludur: `compareAndSet` başarısızsa retry, başarısız olan thread "başkası ilerledi" demektir (lock-free progress)
+- ABA problemi CAS'ın "değer aynı ama durum değişti" tuzağıdır; çözüm version'lı `AtomicStampedReference` veya lock
+- Yüksek contention'da tek sayaç için `LongAdder` (striped sum); read-modify-write ve check-and-act için `AtomicLong` + CAS-loop
+- İlişkili field'ları tek `AtomicReference<record>`'ta topla — iki bağımsız atomic field tutarlı snapshot vermez
+- Field-level CAS için modern seçim `VarHandle`; biased locking JDK 15'te disabled, 18'de kaldırıldı
+```
+
+---
+
+## Pratik yapmak istersen
+
+Kavramları koda dökmek istersen aşağıdaki iki ek hazır: test yazma rehberi race condition, CAS-loop, ABA ve `LongAdder` benchmark için örnek testler içerir; Claude-verify prompt'u ile yazdığın synchronization kodunu banking-grade perspektiften denetletebilirsin.
+
+<details>
+<summary>Test yazma rehberi</summary>
+
+> Süre rehberi: her testi ~30-45 dk'da yazabilirsin; tamamı bittiğinde bir race condition'ı beş primitivle çözmüş olursun.
+
+### Test 3.2.1 — Race condition gösteren test (eğitici, kasten flaky)
+
+```java
+@Test
+void naiveAccountLosesUpdates() throws Exception {
+    var account = new RaceyAccount();
+    int threads = 100, perThread = 1000;
+    var pool = Executors.newFixedThreadPool(threads);
+    var latch = new CountDownLatch(threads);
+    for (int i = 0; i < threads; i++) {
+        pool.submit(() -> {
+            for (int j = 0; j < perThread; j++) account.deposit(1);
+            latch.countDown();
+        });
+    }
+    latch.await();
+    pool.shutdown();
+    // KASTEN race gösteriyor — flaky olabilir
+    assertThat(account.getBalance()).isLessThan((long) threads * perThread);
+}
+```
+
+### Test 3.2.2 — AtomicAccount kesin doğru
+
+```java
+@Test
+void atomicAccountIsCorrect() throws Exception {
+    var account = new AtomicAccount(0);
+    int threads = 100, perThread = 1000;
+    var pool = Executors.newFixedThreadPool(threads);
+    var latch = new CountDownLatch(threads);
+    for (int i = 0; i < threads; i++) {
+        pool.submit(() -> {
+            for (int j = 0; j < perThread; j++) account.deposit(1);
+            latch.countDown();
+        });
+    }
+    latch.await();
+    pool.shutdown();
+    assertThat(account.getBalance()).isEqualTo((long) threads * perThread);
+}
+```
+
+### Test 3.2.3 — `tryWithdraw` no-overdraft invariant
+
+```java
+@Test
+void noOverdraftEvenUnderContention() throws Exception {
+    var account = new AtomicAccount(500);
+    int threads = 100;
+    var successes = new AtomicInteger();
+    var pool = Executors.newFixedThreadPool(threads);
+    var latch = new CountDownLatch(threads);
+    for (int i = 0; i < threads; i++) {
+        pool.submit(() -> {
+            if (account.tryWithdraw(10)) successes.incrementAndGet();
+            latch.countDown();
+        });
+    }
+    latch.await();
+    pool.shutdown();
+    assertThat(successes.get()).isEqualTo(50);
+    assertThat(account.getBalance()).isZero();
+}
+```
+
+### Test 3.2.4 — `AccountStateHolder` version monotonicity
+
+`record AccountState(long balance, long version, Instant lastUpdated)` ve `AtomicReference<AccountState>` ile state tut; `tryDebit` (CAS-loop), `credit` (updateAndGet), `snapshot` yaz. Her başarılı update'te version artsın.
+
+```java
+@Test
+void versionMonotonicUnderConcurrentUpdates() throws Exception {
+    var holder = new AccountStateHolder(new AccountState(10000, 0, Instant.now()));
+    int writers = 10, readers = 10;
+    var stop = new AtomicBoolean(false);
+    var versionViolations = new AtomicInteger();
+    var pool = Executors.newFixedThreadPool(writers + readers);
+    for (int i = 0; i < writers; i++) {
+        pool.submit(() -> { while (!stop.get()) holder.credit(1); });
+    }
+    for (int i = 0; i < readers; i++) {
+        pool.submit(() -> {
+            long lastVersion = 0;
+            while (!stop.get()) {
+                var snap = holder.snapshot();
+                if (snap.version() < lastVersion) versionViolations.incrementAndGet();
+                lastVersion = snap.version();
+            }
+        });
+    }
+    Thread.sleep(2000);
+    stop.set(true);
+    pool.shutdown();
+    pool.awaitTermination(5, TimeUnit.SECONDS);
+    assertThat(versionViolations.get()).isZero();
+}
+```
+
+### Test 3.2.5 — `AtomicStampedReference` ABA fix
+
+Önce naif `AtomicReference` ile ABA'nın yanlışlıkla **başarılı** olduğunu üret (T1 oku → uyu → T2 A→B→A → T1 CAS), sonra `AtomicStampedReference` ile aynı senaryonun **başarısız** olduğunu göster:
+
+```java
+@Test
+void atomicStampedRefDetectsAba() {
+    var ref = new AtomicStampedReference<Integer>(100, 0);
+    int[] stamp = new int[1];
+    Integer initial = ref.get(stamp);
+    int initialStamp = stamp[0];
+
+    // başka thread A → B → A yaptı (simulated)
+    ref.compareAndSet(initial, 200, initialStamp, initialStamp + 1);
+    ref.compareAndSet(200, 100, initialStamp + 1, initialStamp + 2);
+
+    // T1 hâlâ initial stamp'iyle CAS denesin
+    boolean success = ref.compareAndSet(100, 999, initialStamp, initialStamp + 1);
+    assertThat(success).isFalse();  // stamp uyumsuz, ABA tespit edildi
+}
+```
+
+### Test 3.2.6 — `LongAdder` vs `AtomicLong` benchmark (sanity check)
+
+200 thread, her biri 10000 increment; bir kez `AtomicLong`, bir kez `LongAdder`. `System.nanoTime()` ile elapsed karşılaştır — yüksek contention'da `LongAdder` 2-5x hızlı beklenir. (Gerçek JMH benchmark Topic 3.11.)
+
+### Test 3.2.7 — `VarHandle` ile field CAS
+
+`private volatile long balance` + `findVarHandle` ile bağlanmış bir `VarHandleAccount.tryDebit` yaz; `getVolatile` + `compareAndSet` kullan. `AtomicAccount` ile aynı behavior beklenir (no-overdraft invariant testini tekrar koş).
+
+</details>
+
+<details>
+<summary>Claude-verify prompt</summary>
+
+Yazdığın kodu doğrulatmak istersen, aşağıdaki prompt'u kodunla birlikte Claude'a ver. Kriter listesi task referansı değil, kavram bazlıdır; her madde için PASS / FAIL / EKSIK ister.
+
+```
+Aşağıdaki kod synchronization primitives'i öğrenmek için yazıldı. Şu kriterlere
+göre değerlendir ve EKSİKLERİ söyle, kod yazma:
+
+1. RaceyAccount + SyncAccount:
+   - Race condition gösteren naif versiyon var mı?
+   - synchronized'lı versiyon test ile karşılaştırılmış mı?
+   - synchronized block/method tercihi (this leak var mı) doğru mu?
+
+2. AtomicAccount:
+   - AtomicLong kullanılmış mı?
+   - tryWithdraw için CAS-loop veya getAndUpdate var mı?
+   - Negative balance'a düşmüyor mu (CAS koşulu doğru mu)?
+
+3. AccountStateHolder:
+   - AtomicReference<record> kullanılmış mı, state record immutable mi?
+   - updateAndGet/compareAndSet ile state transition var mı?
+   - Lambda pure function mı? Version monotonic artıyor mu (test ile)?
+
+4. ABA problem:
+   - Naif AtomicReference'ın ABA'ya açık olduğu gösterilmiş mi?
+   - AtomicStampedReference ile fix yapılmış mı?
+   - "Neden ABA tehlikeli" not edilmiş mi?
+
+5. LongAdder:
+   - Counter senaryosu için LongAdder kullanılmış mı?
+   - AtomicLong'un check-and-act için gerekli olduğu durum açıklanmış mı?
+   - check-and-act için LongAdder kullanma anti-pattern'i farkında mı?
+
+6. VarHandle:
+   - Field VarHandle ile bağlanmış mı, field volatile mı?
+   - getVolatile / compareAndSet access modes kullanılmış mı?
+
+7. Anti-pattern kontrolü:
+   - volatile counter increment yapılmış mı? (yapılmamalı)
+   - synchronized + this leak var mı?
+   - CAS retry lambda'sında side-effect var mı?
+   - İki bağımsız atomic field tutarlı snapshot için kullanılmaya çalışılmış mı?
+
+8. Banking perspektifi:
+   - Balance race condition reproduce edilmiş mi?
+   - Racey/Sync/Atomic/Adder dört versiyon karşılaştırılmış mı?
+   - no-overdraft invariant test edilmiş mi?
+
+Her madde için PASS / FAIL / EKSIK. Kod yazma, sadece eksiklikleri söyle.
+```
+
+</details>

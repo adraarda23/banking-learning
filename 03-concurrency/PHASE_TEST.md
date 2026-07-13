@@ -1,6 +1,10 @@
 # Faz 3 — PHASE TEST
 
-Faz 4'e geçmeden önce kendini sına.
+```admonish question title="Bu test ne işe yarar?"
+Faz 4'e geçmeden önce kendini sına. Bu bir sınav değil, **dürüstlük kontrolü**:
+işaretleyemediğin her madde, hangi topic'e geri döneceğini gösterir.
+Hepsine "evet" diyebiliyorsan hazırsın.
+```
 
 ## Pratik test
 
@@ -107,4 +111,8 @@ Phase 3'ü bitirdiğinde, şu cümleleri rahatça söyleyebilirsen mid-level con
 
 Bunlar mid-level Java developer'ın bilmesi gereken şeyler. Phase 3 sonrasında bunları **derinden** biliyorsun.
 
-Phase 4 SQL/Oracle daha kuru ama TR bank tarafında **mutlaka** sorulan konular: index, PL/SQL, partitioning. Phase 3'ten sonra rahat geçeceksin.
+```admonish success title="Sonraki durak: Faz 4"
+Phase 4 SQL/Oracle daha kuru ama TR bank tarafında **mutlaka** sorulan konular:
+index, PL/SQL, partitioning. Phase 3'ten sonra rahat geçeceksin.
+→ [Faz 4 — SQL & Oracle](../04-sql-oracle/index.md)
+```
