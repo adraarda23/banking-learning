@@ -1217,7 +1217,7 @@ Her madde için PASS / FAIL / EKSIK. Kod yazma, sadece eksiklikleri söyle.
 - [ ] `LockSupport.park/unpark`'ın permit semantik özelliğini biliyorum
 - [ ] Banking karar matrisini ezberledim (hangi senaryoda hangi primitif)
 
-Hepsi onaylı → Topic 3.3'e geç → [03-locks/](../03-locks/README.md)
+Hepsi onaylı → Topic 3.3'e geç → [03-locks/](../03-locks/index.md)
 
 ---
 

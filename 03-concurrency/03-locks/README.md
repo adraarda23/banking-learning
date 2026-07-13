@@ -1170,7 +1170,7 @@ Her madde için PASS / FAIL / EKSIK. Kod yazma, sadece eksiklikleri söyle.
 - [ ] tryLock + timeout + retry ile fix yaptım
 - [ ] Livelock'u deadlock'tan ayırt edebiliyorum
 
-Hepsi onaylı → Topic 3.4'e geç → [04-executor-framework/](../04-executor-framework/README.md)
+Hepsi onaylı → Topic 3.4'e geç → [04-executor-framework/](../04-executor-framework/index.md)
 
 ---
 

@@ -166,6 +166,6 @@ Faz boyunca bu kaynaklara döneceğiz.
 
 ## Başlama
 
-→ Topic 1: [01-spring-security-architecture/](01-spring-security-architecture/README.md)
+→ Topic 1: [01-spring-security-architecture/](01-spring-security-architecture/index.md)
 
 İyi öğrenmeler. Bu fazda kod yazmak kadar **düşünmek** de önemli — bir güvenlik kararı verirken "saldırgan ne yapabilir?" sorusunu sürekli kendine sor.

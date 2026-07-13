@@ -1084,7 +1084,7 @@ Her madde için PASS / FAIL / EKSIK ve kısa gerekçe. Kod yazma.
 - [ ] Banking workload tipi (API/Batch/Reporting) için pool farklılaşması düşünülmüş
 - [ ] Anti-pattern listesi rahat — özellikle "TX içinde external call", "pool size > 100"
 
-Hepsi onaylı → Topic 2.7'ye geç → [07-hibernate-performance/](../07-hibernate-performance/README.md)
+Hepsi onaylı → Topic 2.7'ye geç → [07-hibernate-performance/](../07-hibernate-performance/index.md)
 
 ---
 

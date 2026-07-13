@@ -35,11 +35,11 @@ Bu fazın sonunda şunları yapabileceksin:
 
 | # | Topic | Süre | Çıktı |
 |---|-------|------|-------|
-| 1 | [Docker for Java](./01-docker-for-java/README.md) | ~4-5 saat | Multi-stage Dockerfile, JIB, CDS, distroless |
-| 2 | [Docker Compose](./02-docker-compose/README.md) | ~3-4 saat | Tam lokal banking stack `compose.yml` |
-| 3 | [Kubernetes Basics](./03-kubernetes-basics/README.md) | ~6-8 saat | Pod/Deployment/Service/Ingress/CM/Secret/HPA manifests |
-| 4 | [CI/CD](./04-ci-cd/README.md) | ~5-6 saat | GitHub Actions + Jenkinsfile + SonarQube + deploy |
-| MP | [Mini-Project](./mini-project/README.md) | 2-3 gün | E2E containerized + K8s deploy + CI/CD pipeline |
+| 1 | [Docker for Java](./01-docker-for-java/index.md) | ~4-5 saat | Multi-stage Dockerfile, JIB, CDS, distroless |
+| 2 | [Docker Compose](./02-docker-compose/index.md) | ~3-4 saat | Tam lokal banking stack `compose.yml` |
+| 3 | [Kubernetes Basics](./03-kubernetes-basics/index.md) | ~6-8 saat | Pod/Deployment/Service/Ingress/CM/Secret/HPA manifests |
+| 4 | [CI/CD](./04-ci-cd/index.md) | ~5-6 saat | GitHub Actions + Jenkinsfile + SonarQube + deploy |
+| MP | [Mini-Project](./mini-project/index.md) | 2-3 gün | E2E containerized + K8s deploy + CI/CD pipeline |
 
 ## Faz çıktısı
 

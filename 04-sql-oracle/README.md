@@ -27,13 +27,13 @@ Mini-project: **core-banking projesini PostgreSQL'den Oracle'a migrate** edeceks
 
 | # | Topic | Süre tahmini | Konu |
 |---|---|---|---|
-| 4.1 | [Index Internals](01-index-internals/README.md) | ~5 saat | B-tree derinlik, bitmap, composite, function-based, selectivity |
-| 4.2 | [Execution Plan & Tuning](02-execution-plan-tuning/README.md) | ~5 saat | `EXPLAIN PLAN`, `EXPLAIN ANALYZE`, join algoritmaları, CBO, histogram, hints |
-| 4.3 | [Window Functions & Advanced SQL](03-window-functions-advanced-sql/README.md) | ~5 saat | ROW_NUMBER, LAG, LEAD, frame clause, CTE, recursive CTE, MERGE, CONNECT BY |
-| 4.4 | [PL/SQL](04-plsql/README.md) | ~7 saat | Block yapısı, cursor, exception, BULK COLLECT, FORALL, package, autonomous transaction |
-| 4.5 | [Oracle-Specific Features](05-oracle-specific/README.md) | ~5 saat | Sequence, partitioning, materialized view, MVCC, ORA-01555, redo/undo |
-| 4.6 | [DB Concurrency & Locking](06-db-concurrency-locking/README.md) | ~5 saat | Isolation level, `FOR UPDATE`, `SKIP LOCKED`, deadlock, enqueue, DBMS_LOCK |
-| 4.7 | [Mini-Project: PostgreSQL → Oracle Migration](mini-project/README.md) | ~7 gün | core-banking'in Oracle versiyonu + 3 PL/SQL package + index analizi + worker queue |
+| 4.1 | [Index Internals](01-index-internals/index.md) | ~5 saat | B-tree derinlik, bitmap, composite, function-based, selectivity |
+| 4.2 | [Execution Plan & Tuning](02-execution-plan-tuning/index.md) | ~5 saat | `EXPLAIN PLAN`, `EXPLAIN ANALYZE`, join algoritmaları, CBO, histogram, hints |
+| 4.3 | [Window Functions & Advanced SQL](03-window-functions-advanced-sql/index.md) | ~5 saat | ROW_NUMBER, LAG, LEAD, frame clause, CTE, recursive CTE, MERGE, CONNECT BY |
+| 4.4 | [PL/SQL](04-plsql/index.md) | ~7 saat | Block yapısı, cursor, exception, BULK COLLECT, FORALL, package, autonomous transaction |
+| 4.5 | [Oracle-Specific Features](05-oracle-specific/index.md) | ~5 saat | Sequence, partitioning, materialized view, MVCC, ORA-01555, redo/undo |
+| 4.6 | [DB Concurrency & Locking](06-db-concurrency-locking/index.md) | ~5 saat | Isolation level, `FOR UPDATE`, `SKIP LOCKED`, deadlock, enqueue, DBMS_LOCK |
+| 4.7 | [Mini-Project: PostgreSQL → Oracle Migration](mini-project/index.md) | ~7 gün | core-banking'in Oracle versiyonu + 3 PL/SQL package + index analizi + worker queue |
 | | [PHASE_TEST.md](PHASE_TEST.md) | 1 saat | Self-assessment |
 
 Toplam ~30 saat öğrenme + 7 gün proje. Acele etme. Oracle, sabırla derinleşilen bir dünya.
@@ -97,4 +97,4 @@ Bu fazda iki paralel okuma yap:
 
 Topic 4.1 ve 4.2 (index + execution plan) **tüm fazın temeli**. Onları sıkı çalış. PL/SQL (4.4) **en uzun** topic, sabırlı ol — bankada bu tek başına bir lisans değeri taşıyor.
 
-→ Başla: [01-index-internals/README.md](01-index-internals/README.md)
+→ Başla: [01-index-internals/README.md](01-index-internals/index.md)

@@ -16,8 +16,22 @@
         }
     }
 
-    const theme = lastThemeWasLight ? 'default' : 'dark';
-    mermaid.initialize({ startOnLoad: true, theme });
+    const theme = lastThemeWasLight ? 'neutral' : 'dark';
+    mermaid.initialize({
+        startOnLoad: true,
+        theme,
+        // Kitap görünümü: düz, temiz çizgiler; markdown-parse sürprizlerini kapat
+        markdownAutoWrap: false,
+        flowchart: { curve: 'linear', useMaxWidth: true, htmlLabels: true },
+        sequence: { useMaxWidth: true },
+        themeVariables: lastThemeWasLight ? {
+            primaryColor: '#f4f6fa',
+            primaryBorderColor: '#4a5568',
+            primaryTextColor: '#1a202c',
+            lineColor: '#4a5568',
+            fontSize: '15px'
+        } : { fontSize: '15px' }
+    });
 
     // Simplest way to make mermaid re-render the diagrams in the new theme is via refreshing the page
 

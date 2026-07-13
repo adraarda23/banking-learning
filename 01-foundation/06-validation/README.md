@@ -10,7 +10,7 @@
 
 ## Hedef
 
-Input validasyonunu **kod-temiz** ve **deklaratif** bir biçimde uygulamak. Jakarta Bean Validation'ın derin özelliklerini öğrenmek. Banking-specific validator'lar (IBAN, TC Kimlik No, IBAN-currency uyumu) yazmak. Validation group'larıyla aynı DTO'yu farklı senaryolarda farklı kurallarla kontrol etmek.
+Input validasyonunu **deklaratif** ve **kod-temiz** uygulamak: Jakarta Bean Validation'ın derin özellikleri, banking-specific validator'lar (IBAN, T.C. Kimlik No) ve aynı DTO'yu farklı senaryolarda farklı kurallarla kontrol etmek.
 
 ## Süre
 
@@ -28,27 +28,23 @@ Okuma: 1.5 saat • Mini task: 2 saat • Test: 1 saat • Toplam: ~4.5 saat
 
 ### 1. Neden validation katmanlı (input'a güvenmeme)
 
-Banking'de "input'a güvenmek" güvenlik açığıdır. Sebepler:
-- Client-side validation bypass edilebilir
-- API direkt çağrılır (curl, Postman)
-- Internal sistemler bile bug üretebilir
-- Audit trail için sebep loglu validation gerekir
+Banking'de "input'a güvenmek" bir güvenlik açığıdır. Client-side validation bypass edilebilir, API curl ile direkt çağrılabilir, hatta internal sistemler bile bug'lı veri üretebilir. Üstelik audit trail için "neden reddedildi" bilgisinin loglanması gerekir — yani reddetme işi sunucuda, kontrollü bir şekilde olmalı.
 
-Validation 3 katmanda yapılır:
+Peki her kuralı nereye yazacaksın? Validation'ı 3 katmana ayırıyoruz:
 
 | Katman | Sorumluluğu | Örnek |
 |---|---|---|
 | **Syntactic** (input parser) | Tip, format, length | "amount sayı mı?", "currency 3 karakter mi?" |
-| **Semantic** (DTO validation) | Business kuralı dışında değer kuralları | "amount > 0 mı?", "currency ISO listesinde mi?" |
-| **Domain** (aggregate) | İş kuralları, state-bağımlı | "hesabın bakiyesi yeterli mi?", "hesap kapalı mı?" |
+| **Semantic** (DTO validation) | State'ten bağımsız değer kuralları | "amount > 0 mı?", "currency ISO listesinde mi?" |
+| **Domain** (aggregate) | İş kuralları, state-bağımlı | "bakiye yeterli mi?", "hesap kapalı mı?" |
 
-İlk iki katman **Bean Validation** ile, üçüncü katman **domain code** ile. Karıştırma.
+İlk iki katman **Bean Validation** ile, üçüncü katman **domain code** ile yapılır. Bu ayrımı karıştırmak bu bölümün en büyük tuzağı — bölüm sonundaki anti-pattern'lerde tekrar göreceğiz.
 
 ```mermaid
-flowchart TD
-    A["HTTP Request"] --> B["Syntactic katman: tip ve format"]
-    B --> C["Semantic katman: Bean Validation"]
-    C --> D["Domain katman: iş kuralları"]
+flowchart LR
+    A["HTTP Request"] --> B["Syntactic: tip ve format"]
+    B --> C["Semantic: Bean Validation"]
+    C --> D["Domain: iş kuralları"]
     B -- "hata" --> E["400 Bad Request"]
     C -- "hata" --> E
     D -- "hata" --> F["Domain hatası"]
@@ -57,9 +53,9 @@ flowchart TD
 
 ### 2. Jakarta Bean Validation — temel
 
-Standart: JSR 380 (Jakarta Bean Validation 3.0). Implementation: **Hibernate Validator** (Spring Boot default).
+Standart: JSR 380 (Jakarta Bean Validation 3.0). Implementation: **Hibernate Validator** — Spring Boot'un default'u, ekstra kurulum gerekmez.
 
-**Standard constraint'ler:**
+İşin büyük kısmını standart constraint'ler karşılar. Tabloyu ezberleme; hangi ihtiyaca hangi annotation'ın karşılık geldiğini bil:
 
 | Annotation | Anlamı |
 |---|---|
@@ -81,6 +77,8 @@ Standart: JSR 380 (Jakarta Bean Validation 3.0). Implementation: **Hibernate Val
 
 ### 3. Banking örnekleri — built-in constraint'lerle
 
+Kuru tablodan gerçek hayata geçelim. Hesap açma isteği şöyle görünür:
+
 ```java
 public record OpenAccountRequest(
     @NotNull(message = "Owner ID is required")
@@ -96,6 +94,8 @@ public record OpenAccountRequest(
     BigDecimal openingBalance
 ) {}
 ```
+
+Transfer isteği de aynı mantık — para field'ında `@DecimalMin` + `@DecimalMax` + `@Digits` üçlüsüne dikkat:
 
 ```java
 public record TransferRequest(
@@ -117,9 +117,11 @@ public record TransferRequest(
 ) {}
 ```
 
+BigDecimal için `@Min`/`@Max` değil `@DecimalMin`/`@DecimalMax` kullanıyoruz — long bazlı olanlar ondalık kesinliği kaybettirir.
+
 ### 4. `@Valid` etkinleştirme
 
-Spring Controller method parameter'ında:
+Annotation'ları yazdın, ama tek başlarına hiçbir şey yapmazlar. Spring'e "bu parametreyi validate et" demen gerekir:
 
 ```java
 @PostMapping
@@ -129,10 +131,10 @@ public AccountResponse openAccount(
 ```
 
 ```admonish warning title="Dikkat"
-`@Valid` olmadan validation annotation'ları **çalışmaz**. Bu junior tuzağı.
+`@Valid` olmadan validation annotation'ları **çalışmaz**. Bu klasik bir junior tuzağı: DTO'ya annotation'ları yazarsın, testte her şey geçer, çünkü validation hiç tetiklenmemiştir.
 ```
 
-Validation'ın request yaşam döngüsündeki yeri:
+Validation'ın request yaşam döngüsündeki yeri — controller'ına gelmeden önce olur:
 
 ```mermaid
 sequenceDiagram
@@ -154,49 +156,33 @@ sequenceDiagram
 
 ### 5. Validation hata handling
 
-Validation başarısız olunca Spring `MethodArgumentNotValidException` fırlatır. Default response:
+Validation başarısız olunca Spring `MethodArgumentNotValidException` fırlatır. Default response şöyle bir şeydir:
 
 ```json
 {
   "timestamp": "...",
   "status": 400,
   "error": "Bad Request",
-  "trace": "...",  // stacktrace expose oluyor → tehlike
+  "trace": "...",
   "path": "/v1/accounts"
 }
 ```
 
 ```admonish warning title="Dikkat"
-Default response'ta stacktrace expose oluyor — **banking için yeterli değil.** Topic 1.7'de RFC 7807 ProblemDetail ile düzgün handle edeceğiz.
+Default response'ta stacktrace expose olabiliyor ve hangi field'ın neden reddedildiği belli değil — **banking için yeterli değil.** Topic 1.7'de RFC 7807 ProblemDetail ile düzgün handle edeceğiz.
 ```
 
-Şimdilik basit `@ControllerAdvice`:
-
-```java
-@RestControllerAdvice
-class ValidationExceptionHandler {
-    
-    @ExceptionHandler(MethodArgumentNotValidException.class)
-    public ResponseEntity<Map<String, Object>> handle(MethodArgumentNotValidException ex) {
-        Map<String, String> errors = new HashMap<>();
-        ex.getBindingResult().getFieldErrors().forEach(error ->
-            errors.put(error.getField(), error.getDefaultMessage())
-        );
-        return ResponseEntity.badRequest().body(Map.of(
-            "errors", errors
-        ));
-    }
-}
-```
+Şimdilik geçici çözüm: field bazlı hataları toplayan basit bir `@RestControllerAdvice`. Kodunu Task 1.6.6'da yazacaksın — fikir şu: `ex.getBindingResult().getFieldErrors()` üzerinden dön, `field → message` map'i oluştur, 400 ile dön.
 
 ### 6. Custom validation — `@IbanFormat`
 
-Banking'de IBAN (Uluslararası Banka Hesap Numarası) doğrulamak çok yaygın. Custom annotation yaz:
+Standart constraint'ler "3 büyük harf" gibi kuralları karşılar, ama IBAN checksum'ı gibi domain'e özgü format kurallarını karşılamaz. Banking'de IBAN doğrulamak o kadar yaygın ki, ilk custom validator'ın bu olacak.
+
+Custom validator her zaman aynı 3 adımdır:
 
 ```mermaid
 flowchart LR
-    A["1. Annotation tanımı"] --> B["2. Validator sınıfı"]
-    B --> C["3. DTO üzerinde kullanım"]
+    A["Annotation tanımı"] --> B["Validator sınıfı"] --> C["DTO üzerinde kullanım"]
 ```
 
 #### Adım 1: Annotation tanımı
@@ -221,7 +207,11 @@ public @interface IbanFormat {
 }
 ```
 
+`message`, `groups`, `payload` üçlüsü Bean Validation kontratının zorunlu parçası — her custom annotation'da aynen bulunur.
+
 #### Adım 2: Validator implementation
+
+IBAN'ın matematiği: ilk 4 karakteri sona taşı, harfleri sayıya çevir (A=10, B=11, ...), çıkan dev sayının mod 97'si 1 olmalı.
 
 ```java
 package com.mavibank.banking.common.validation;
@@ -264,21 +254,18 @@ public class IbanFormatValidator implements ConstraintValidator<IbanFormat, Stri
 }
 ```
 
-Validator'ın uyguladığı mod-97 akışı:
+Akışı görselleştirelim:
 
 ```mermaid
-flowchart TD
-    A["IBAN girişi"] --> B["Normalize: boşluk sil, büyük harf"]
-    B --> C{"Uzunluk 15-34 arası mı?"}
+flowchart LR
+    A["IBAN girişi"] --> B["Normalize"] --> C{"Uzunluk ve format uygun mu"}
     C -- "hayır" --> R["Geçersiz"]
-    C -- "evet" --> D{"Format uygun mu?"}
-    D -- "hayır" --> R
-    D -- "evet" --> E["İlk 4 karakteri sona taşı"]
-    E --> F["Harfleri sayıya çevir"]
-    F --> G{"mod 97 sonucu 1 mi?"}
+    C -- "evet" --> E["İlk 4 karakteri sona taşı"] --> F["Harfleri sayıya çevir"] --> G{"mod 97 sonucu 1 mi"}
     G -- "evet" --> V["Geçerli"]
     G -- "hayır" --> R
 ```
+
+Buradaki incelik: validator null'a **izin verir**. Null kontrolü `@NotNull`'ın sorumluluğu — her constraint tek bir şeyi kontrol eder, böylece "optional ama girilirse geçerli IBAN" gibi kombinasyonlar kurulabilir.
 
 #### Adım 3: Kullanım
 
@@ -293,7 +280,7 @@ public record InternationalTransferRequest(
 
 ### 7. Custom validation — `@TcKimlikNo` (TR'ye özgü)
 
-T.C. Kimlik Numarası 11 haneli, son 2 hane checksum.
+TR bankacılığında müşteri kimliği demek T.C. Kimlik No demek: 11 hane, ilk hane 0 olamaz, son 2 hane checksum. Aynı 3 adımlı reçeteyle ikinci validator'ını yaz:
 
 ```java
 @Target({ElementType.FIELD, ElementType.PARAMETER, ElementType.RECORD_COMPONENT})
@@ -336,11 +323,13 @@ public class TcKimlikNoValidator implements ConstraintValidator<TcKimlikNo, Stri
 }
 ```
 
-### 8. Cross-field validation — `@AssertTrue` ile
+Java'da `%` operatörü negatif sonuç dönebilir — `digit10 < 0` düzeltmesi o yüzden var. Bu tarz köşe durumları için `@ParameterizedTest` şart (test bölümünde yazacaksın).
 
-İki field'ı **birlikte** doğrulamak gerekir bazen. Örnek: TransferRequest'te `fromAccountId != toAccountId`.
+### 8. Cross-field validation
 
-**Yöntem 1: `@AssertTrue` method on DTO**
+Bazen kural tek field'a değil, iki field'ın **ilişkisine** bağlıdır: transfer'de `fromAccountId != toAccountId` gibi. Field-level annotation bunu göremez; iki yöntemin var.
+
+**Yöntem 1: `@AssertTrue` method on DTO** — küçük işler için hızlı:
 
 ```java
 public record TransferRequest(
@@ -358,10 +347,10 @@ public record TransferRequest(
 ```
 
 ```admonish warning title="Dikkat"
-`@JsonIgnore` koy yoksa Jackson `isDifferentAccounts` getter'ını serialize edip JSON'a yazar.
+`@JsonIgnore` koy — yoksa Jackson `isDifferentAccounts` getter'ını serialize edip response JSON'ına `differentAccounts: true` diye yazar.
 ```
 
-**Yöntem 2: Class-level custom annotation (daha temiz büyük projede)**
+**Yöntem 2: Class-level custom annotation** — büyük projede daha temiz, çünkü kural DTO'nun içine gömülmez, yeniden kullanılabilir:
 
 ```java
 @Target(ElementType.TYPE)
@@ -390,12 +379,7 @@ public record TransferRequest(...) {}
 
 ### 9. Validation group'ları — aynı DTO, farklı senaryolar
 
-Bazen aynı DTO **farklı senaryolarda farklı kurallarla** validate edilmeli:
-
-- "Hesap aç" → ownerId zorunlu, accountId yok
-- "Hesap güncelle" → accountId zorunlu, ownerId yok
-
-Tek DTO + group'lar:
+Aynı DTO bazen farklı endpoint'lerde farklı kurallara tabidir: "hesap aç"ta `id` olmamalı, "hesap güncelle"de zorunlu. Group'lar bunu tek DTO ile çözer:
 
 ```java
 public interface OnCreate {}
@@ -415,7 +399,7 @@ public record AccountRequest(
 ) {}
 ```
 
-Controller:
+Controller'da hangi group'un aktif olduğunu `@Validated` seçer:
 
 ```java
 @PostMapping
@@ -430,15 +414,15 @@ public AccountResponse update(
 ) { ... }
 ```
 
-`@Validated` (Spring) vs `@Valid` (standard) — `@Validated` group destekler.
+Fark önemli: `@Valid` standarttır ama group bilmez; `@Validated` Spring'e özgüdür ve group destekler.
 
 ```admonish tip title="İpucu"
-**Banking pratiği:** Tek DTO + group genelde **karışıklığa** sebep olur. Daha temiz: her senaryo için ayrı DTO. Group'ları biliyor ol ama **kullanırken iki kere düşün.**
+**Banking pratiği:** Tek DTO + group genelde **karışıklığa** sebep olur — hangi field hangi senaryoda zorunlu, kod okuyarak anlaşılmaz. Daha temiz yol: her senaryo için ayrı DTO. Group'ları biliyor ol ama **kullanırken iki kere düşün.**
 ```
 
 ### 10. Constraint composition — birleşik annotation
 
-Bir validation kombinasyonu birden fazla yerde tekrarlanıyorsa, kendi composite annotation'ını yaz:
+`currency` field'ına her seferinde aynı 3 annotation'ı yazmak hem tekrar hem tutarsızlık riski. Kombinasyonu tek annotation'a topla:
 
 ```java
 @NotBlank
@@ -454,7 +438,8 @@ public @interface IsoCurrencyCode {
 }
 ```
 
-Kullanım:
+Composite annotation'da validator class yok (`validatedBy = {}`) — işi üzerindeki constraint'ler yapar. Kullanımı:
+
 ```java
 public record OpenAccountRequest(
     @NotNull UUID ownerId,
@@ -463,12 +448,12 @@ public record OpenAccountRequest(
 ```
 
 ```admonish tip title="İpucu"
-Üç annotation tek annotation'a düştü. Aynı kombinasyonu 10 DTO'da kullanıyorsan değer.
+Üç annotation tek annotation'a düştü. Aynı kombinasyonu 10 DTO'da kullanıyorsan değer; tek yerde kullanıyorsan gereksiz soyutlama.
 ```
 
 ### 11. Nested validation — `@Valid` ile cascade
 
-DTO'da başka DTO varsa, nested validation:
+DTO içinde başka DTO varsa validation otomatik içeri inmez — cascade'i açıkça istemen gerekir:
 
 ```java
 public record AddressDto(
@@ -485,12 +470,12 @@ public record CustomerRequest(
 ```
 
 ```admonish warning title="Dikkat"
-`@Valid` olmadan `address`'in field'ları validate edilmez.
+Field üzerinde `@Valid` olmadan `address`'in içindeki annotation'lar sessizce atlanır — hata da almazsın, validation da olmaz.
 ```
 
 ### 12. Programmatic validation — Validator bean'i
 
-Controller dışında validation gerekirse:
+Input her zaman controller'dan gelmez: Kafka consumer, batch job, internal API. Bu akışlarda `Validator` bean'ini inject edip elle validate etmek banking'de standarttır:
 
 ```java
 @Service
@@ -511,9 +496,9 @@ class TransferService {
 }
 ```
 
-Banking'de **iç akışta** input gelirse (örn. Kafka consumer'dan), elle validate etmek standart.
-
 ### 13. Method-level validation — `@Validated` class-level
+
+Class'a `@Validated` koyarsan Spring, method parametrelerindeki constraint'leri de kontrol eder:
 
 ```java
 @Service
@@ -530,26 +515,26 @@ class AccountService {
 }
 ```
 
-Method parameter validation. `ConstraintViolationException` fırlatır (Spring `@Valid`'in tetiklediği `MethodArgumentNotValidException` ile farklı).
-
-Banking pratiği: **Service layer'da method-level validation tartışmalı.** Çoğu ekip "domain code kendi precondition'ını kontrol eder" der, Bean Validation sadece DTO katmanında.
+İki tuzak: burada fırlatılan exception `ConstraintViolationException`'dır (`@Valid`'in tetiklediği `MethodArgumentNotValidException` değil — handler'ını ona göre yaz). Ve banking pratiğinde service layer'da method-level validation **tartışmalıdır**: çoğu ekip "domain code kendi precondition'ını kendi kontrol eder, Bean Validation DTO katmanında kalır" der.
 
 ### 14. Validation message i18n
 
+TR bankalarında Türkçe + İngilizce mesaj desteği yaygın; hardcoded mesaj yerine message key kullan.
+
 `messages.properties`:
 ```
-account.balance.insufficient=Yetersiz bakiye: hesapta {0} var, istenilen {1}
+account.currency.required=Para birimi zorunlu
 account.currency.invalid=Geçersiz para birimi
 ```
 
-DTO:
+DTO'da key'i süslü parantezle referansla:
 ```java
 @NotBlank(message = "{account.currency.required}")
 @Pattern(regexp = "^[A-Z]{3}$", message = "{account.currency.invalid}")
 String currency
 ```
 
-`MessageSource` ve `LocalValidatorFactoryBean` setup'ı:
+Spring'in `MessageSource`'unu validator'a bağlamak için:
 
 ```java
 @Configuration
@@ -572,9 +557,9 @@ class ValidationConfig {
 }
 ```
 
-TR bankalarında **Türkçe + İngilizce** mesaj desteği yaygın.
-
 ### 15. Validation anti-pattern'ler
+
+Araçları öğrendin; şimdi yanlış kullanımlarını tanı.
 
 **Anti-pattern 1: Business logic'i validation'a koymak**
 
@@ -588,10 +573,10 @@ public boolean isWithinTransferLimit() {
 ```
 
 ```admonish warning title="Dikkat"
-Bean Validation **stateless** olmalı. External call yapma. State'e dayalı kurallar domain logic'inde.
+Bean Validation **stateless** olmalı. External call yok, DB sorgusu yok. State'e dayalı kurallar (bakiye, limit, hesap durumu) domain logic'e aittir — bölüm başındaki 3 katman tablosunu hatırla.
 ```
 
-**Anti-pattern 2: Validation'ı tek satıra yıkmak**
+**Anti-pattern 2: Her şeyi regex'e yıkmak**
 
 ```java
 // ❌ Kötü
@@ -599,23 +584,23 @@ Bean Validation **stateless** olmalı. External call yapma. State'e dayalı kura
 String description;
 ```
 
-`@Size(max = 500)` daha okunabilir.
+`@Size(max = 500)` aynı işi yapar ve niyeti okuyana anlatır. Regex'i sadece gerçekten format kuralı olan yerlerde kullan.
 
-**Anti-pattern 3: `@Email` yetersizliği**
+**Anti-pattern 3: `@Email`'e fazla güvenmek**
 
-`@Email` annotation basit regex, RFC 5322 tam uygulamaz. Banking'de gerçek email validation için `commons-validator` ya da DNS lookup.
+`@Email` basit bir regex'tir, RFC 5322'yi tam uygulamaz. Banking'de gerçek email doğrulaması için `commons-validator` ya da DNS lookup gerekir.
 
-**Anti-pattern 4: Validation'ı atlayarak güvenmek**
+**Anti-pattern 4: Validation'ı atlayıp input'a güvenmek**
 
 ```java
 // ❌ Tehlikeli
 public void process(String userInput) {
-    // güveniyorum hiç temizleme
+    // güveniyorum, hiç temizleme
     sql.execute("SELECT * FROM accounts WHERE name = '" + userInput + "'");
 }
 ```
 
-Banking'de **her input** validate + sanitize edilmeli, prepared statement, escape, vb.
+Banking'de **her input** validate + sanitize edilir: prepared statement, escape, whitelist. Validation güvenlik zincirinin ilk halkasıdır, son halkası değil.
 
 ---
 
@@ -628,7 +613,7 @@ Banking'de **her input** validate + sanitize edilmeli, prepared statement, escap
 - Apache Commons Validator (IBAN, ISIN, ISBN validators)
 - IBAN format spec (ECBS)
 - T.C. Kimlik No algoritması (NVI / İçişleri Bakanlığı)
-- "Hexagonal Architecture" perspectifinden validation ne nerede olur tartışması
+- "Hexagonal Architecture" perspektifinden validation ne nerede olur tartışması
 
 ---
 

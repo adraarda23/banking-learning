@@ -149,4 +149,4 @@ Kafka, "mesaj kuyruğu" değildir. **Distributed commit log**'dur. Bu farkı iç
 
 ## Başla
 
-→ [01-kafka-architecture/](01-kafka-architecture/README.md)
+→ [01-kafka-architecture/](01-kafka-architecture/index.md)

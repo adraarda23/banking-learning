@@ -1023,7 +1023,7 @@ olduğunu söyle.
 - [ ] `@SpringBatchTest` ile integration test yazdım (en az 3 test)
 - [ ] ADR-010 yazıldı
 
-Hepsi yeşil ise → Topic 2'ye geç → [02-chunk-oriented/](../02-chunk-oriented/README.md)
+Hepsi yeşil ise → Topic 2'ye geç → [02-chunk-oriented/](../02-chunk-oriented/index.md)
 
 ---
 

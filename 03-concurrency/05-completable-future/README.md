@@ -981,7 +981,7 @@ Her madde için PASS / FAIL / EKSIK. Kod yazma, sadece eksiklikleri söyle.
 - [ ] `parallelStream` + common pool blocking'i reproduce ettim, kendi executor ile izole ettim
 - [ ] `join()` chain ortasında blocking call yapmıyorum
 
-Hepsi onaylı → Topic 3.6'ya geç → [06-concurrent-collections/](../06-concurrent-collections/README.md)
+Hepsi onaylı → Topic 3.6'ya geç → [06-concurrent-collections/](../06-concurrent-collections/index.md)
 
 ---
 

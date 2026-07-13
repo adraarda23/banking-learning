@@ -846,4 +846,4 @@ Aşağıdaki cümleleri kendi kelimelerinle doldur:
 9. "TransferCompleted topic'i için seçtiğim partition sayısı: ____, sebep: ____."
 10. "TransferCompleted event payload'unda PII tutmama sebebim: ____. Alternatif: ____."
 
-→ Sıradaki topic: [02-producer/](../02-producer/README.md)
+→ Sıradaki topic: [02-producer/](../02-producer/index.md)

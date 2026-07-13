@@ -240,4 +240,4 @@ Bu fazı bitirdiğinde aşağıdaki cümleleri **kendi kelimelerinle** doldurabi
 
 ## Başla
 
-→ [01-ddd-strategic/](./01-ddd-strategic/README.md)
+→ [01-ddd-strategic/](./01-ddd-strategic/index.md)

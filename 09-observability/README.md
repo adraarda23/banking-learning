@@ -216,4 +216,4 @@ PHASE_TEST
 Faz 10 (Domain — Türk bankacılığı: IBAN, EFT, FAST, BDDK)
 ```
 
-→ Topic 9.1'e başla → [01-structured-logging/](./01-structured-logging/README.md)
+→ Topic 9.1'e başla → [01-structured-logging/](./01-structured-logging/index.md)

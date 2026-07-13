@@ -10,7 +10,7 @@
 
 ## Hedef
 
-Bir Java backend uygulamasının kodunu **neye göre organize edersin** sorusunu derinlemesine cevaplamak. Banking domain'inde neden bu kararın "uygulamayı taşıyabilir/test edilebilir" yapmak için kritik olduğunu görmek.
+"Bir Java backend uygulamasının kodunu neye göre organize edersin?" sorusuna derinlemesine cevap vermek — ve banking domain'inde bu kararın uygulamayı neden "taşınabilir ve test edilebilir" yaptığını görmek.
 
 ## Süre
 
@@ -27,32 +27,17 @@ Okuma: 1.5-2 saat • Mini task'ler: 2 saat • Test: 30 dk • Toplam: ~4.5 saa
 
 ### 1. Neden mimari kararları önemli — banking perspektifi
 
-Bankada bir hesap servisi 10 yıl yaşar. Veritabanı değişir (Oracle → PostgreSQL), framework değişir (Spring 5 → 6 → ?), arayüz değişir (SOAP → REST → gRPC). **Domain logic değişmez**: bir hesabın bakiyesi negatife düşemez, her transfer iki kayıt üretir, faiz hesabı çok kesin kurallara tabi.
+Bankada bir hesap servisi 10 yıl yaşar. O sürede veritabanı değişir (Oracle → PostgreSQL), framework değişir (Spring 5 → 6 → ?), arayüz değişir (SOAP → REST → gRPC). Değişmeyen tek şey **domain logic**: bakiye negatife düşemez, her transfer iki kayıt üretir, faiz hesabı kesin kurallara tabidir.
 
-Yanlış mimari = teknoloji değişikliği = uygulamayı sıfırdan yazmak.
-Doğru mimari = teknoloji çevre katmanlarda değişir, çekirdek (domain) sağlam kalır.
+Yanlış mimaride teknoloji değişikliği "uygulamayı sıfırdan yaz" demektir. Doğru mimaride teknoloji çevre katmanlarda değişir, çekirdek sağlam kalır.
 
-Bu yüzden **bağımlılık yönü** mimarinin can damarı: çevre koda mı bağlı, yoksa çevre çekirdek koda mı bağlı?
+Bu yüzden mimarinin can damarı **bağımlılık yönü**: çekirdek kod çevreye mi bağlı, yoksa çevre çekirdeğe mi? Bu bölümdeki her şey bu tek sorunun etrafında dönüyor.
 
 ---
 
 ### 2. Layered Architecture (3-katmanlı / N-tier)
 
-**Tanım:** Kodu yatay katmanlara böler. Klasik versiyon:
-
-```
-┌─────────────────────────┐
-│  Controller (web)       │  ← HTTP istekleri burada karşılanır
-├─────────────────────────┤
-│  Service (business)     │  ← İş kuralları burada
-├─────────────────────────┤
-│  Repository (data)      │  ← DB ile konuşan kod
-├─────────────────────────┤
-│  Database               │
-└─────────────────────────┘
-```
-
-Bağımlılık yönü yukarıdan aşağı: Controller → Service → Repository → DB.
+Spring Boot tutorial'larının %95'i bu yapıdadır, o yüzden buradan başlıyoruz. Fikir basit: kodu yatay katmanlara böl, her katman bir alttakini çağırsın.
 
 ```mermaid
 flowchart TD
@@ -61,7 +46,7 @@ flowchart TD
     R --> DB["Database"]
 ```
 
-**Neden popüler:** Spring Boot tutorial'larının %95'i bu yapıdadır. Hızlı başlanır. Junior'ın aşina olduğu yapı.
+Bağımlılık yönü yukarıdan aşağı: Controller → Service → Repository → DB. Hızlı başlanır, junior'ın aşina olduğu yapıdır.
 
 **Basit örnek:**
 
@@ -94,87 +79,56 @@ class AccountService {
 interface AccountRepository extends JpaRepository<Account, Long> { }
 ```
 
-**Sorunlar (banking için):**
+Peki sorun ne? Dikkat et: Service, JPA repository'e bağımlı. Yani iş kurallarını taşıyan katman, **persistence teknolojisini tanıyor**. Banking'de bu şu tuzaklara dönüşür:
 
 ```admonish warning title="Dikkat — Layered'ın banking için tuzakları"
-1. **Domain modeli framework'e bağımlı.** `Account` entity'si `@Entity`, `@Id`, `@Column` annotation'ları ile JPA'ya yapıştı. JPA bırakırsan domain modelini yeniden yazarsın.
+1. **Domain modeli framework'e yapışır.** `Account` entity'si `@Entity`, `@Id`, `@Column` ile JPA'ya bağlı. JPA bırakırsan domain modelini yeniden yazarsın.
 
-2. **Service'i unit test etmek zor.** `AccountRepository` Spring bean olduğu için mock veya `@DataJpaTest` gerekir. Saf bir Java birim testi yazamazsın.
+2. **Service'i unit test etmek zor.** Repository Spring bean olduğu için mock veya `@DataJpaTest` gerekir; saf Java birim testi yazamazsın.
 
-3. **Çekirdek iş kuralları her yere dağılır.** Bakiye kontrolü Service'te, validation Controller'da, audit trigger Repository'de — kim hangi kuralı uyguluyor karışır.
+3. **İş kuralları her yere dağılır.** Bakiye kontrolü Service'te, validation Controller'da, audit trigger Repository'de — kim hangi kuralı uyguluyor karışır.
 
-4. **Dış sistem entegrasyonu sızar.** Bir external bank API'sini servise enjekte ettiğin anda, servisin domain logic'i ile network detayları birbirine girer.
-
-5. **Bağımlılık yönü domain'e dayatma yapar.** Service, JPA repository'e bağımlıdır → service domain'i değil, persistence'ı tanır.
+4. **Dış sistem entegrasyonu sızar.** External bank API'sini servise enjekte ettiğin anda domain logic ile network detayları birbirine girer.
 ```
 
 ---
 
 ### 3. Hexagonal Architecture (Ports & Adapters)
 
-Alistair Cockburn tarafından önerildi (2005). **Aynı şey** "Ports & Adapters", "Onion Architecture", "Clean Architecture" — küçük farklar var ama özü aynı.
+Şimdi bağımlılık yönünü ters çevirelim. Alistair Cockburn'ün 2005'te önerdiği fikir: **çekirdek domain logic ortada durur**, tüm dış dünya (DB, HTTP, Kafka) çevrede. Çekirdek dış dünyaya bağımlı değildir — dış dünya çekirdeğe bağımlıdır.
 
-**Tanım:** Uygulamanın **çekirdek domain logic'i** ortada durur. Tüm dış dünya (DB, HTTP, Kafka, dosya sistemi) **çevrede** durur. Çekirdek dış dünyaya **bağımlı değildir** — dış dünya çekirdeğe bağımlıdır.
+İki anahtar kavram var:
 
-```
-                  ┌─────────────────┐
-                  │   HTTP / REST   │
-                  │   (adapter)     │
-                  └────────┬────────┘
-                           ↓
-        ┌──────────────────────────────────┐
-        │                                  │
-        │       Application Core           │
-        │   ┌─────────────────────────┐    │
-        │   │      Domain Model       │    │  ← saf Java, framework yok
-        │   │  Account, Transfer,     │    │
-        │   │  JournalEntry...        │    │
-        │   └─────────────────────────┘    │
-        │                                  │
-        │   Use Cases / Application        │  ← orchestration
-        │   Services                       │
-        │                                  │
-        │   Ports (interfaces)             │  ← çekirdek "şuna ihtiyacım var" der
-        │   - AccountRepository (port)     │
-        │   - NotificationSender (port)    │
-        └──────┬────────────────────┬──────┘
-               ↓                    ↓
-        ┌──────────────┐   ┌──────────────┐
-        │ JPA Adapter  │   │ Kafka Adapter│
-        └──────┬───────┘   └──────────────┘
-               ↓
-        ┌──────────────┐
-        │  PostgreSQL  │
-        └──────────────┘
-```
+- **Port:** Çekirdeğin dış dünyayla konuşma **kontratı** — bir interface, ve onu çekirdek tanımlar.
+  - *Driving port:* "Beni dışarıdan çağırın" — use case interface'i
+  - *Driven port:* "Bana bunları sağlayın" — repository, message sender interface'i
+- **Adapter:** Port'u gerçek bir teknolojiyle somutlaştıran kod.
+  - *Driving adapter:* HTTP controller, gRPC handler, Kafka consumer — uygulamayı **çağıran** taraf
+  - *Driven adapter:* JPA implementation, Kafka producer, SMS gateway client — uygulamanın **çağırdığı** taraf
 
-Aynı yapının katman ve bağımlılık ilişkisi:
+Resmin tamamı: driving taraf solda çekirdeği çağırır, driven taraf sağda çekirdeğin tanımladığı port'ları implement eder.
 
 ```mermaid
-flowchart TD
-    subgraph CORE["Application Core"]
-        IN["Use Case - driving port"] --> SVC["Application Service"]
-        SVC --> DOM["Domain Model - saf Java"]
-        SVC --> OUT["AccountRepository - driven port"]
-        SVC --> OUT2["NotificationSender - driven port"]
+flowchart LR
+    subgraph DRIVING["Driving taraf"]
+        HTTP["HTTP Controller"]
     end
-    HTTP["HTTP Controller - driving adapter"] --> IN
-    JPA["JPA Adapter - driven adapter"] -. "implement eder" .-> OUT
-    KAFKA["Kafka Adapter - driven adapter"] -. "implement eder" .-> OUT2
-    JPA --> PG["PostgreSQL"]
+    subgraph CORE["Application Core"]
+        UC["Use Case interface - driving port"] --> SVC["Application Service"]
+        SVC --> DOM["Domain Model - saf Java"]
+        SVC --> REPO["AccountRepository - driven port"]
+        SVC --> NOTIF["NotificationSender - driven port"]
+    end
+    subgraph DRIVEN["Driven taraf"]
+        JPA["JPA Adapter"] --> PG["PostgreSQL"]
+        KAFKA["Kafka Adapter"]
+    end
+    HTTP --> UC
+    JPA -. "implement eder" .-> REPO
+    KAFKA -. "implement eder" .-> NOTIF
 ```
 
-**Anahtar kavramlar:**
-
-**Port:** Çekirdeğin "dış dünyadan beklediği" interface. Çekirdek tanımlar.
-- *Driving port* (sol/üst): "Beni dışarıdan çağırın" — use case interface'i
-- *Driven port* (sağ/alt): "Bana bunları sağlayın" — repository, message sender interface'i
-
-**Adapter:** Port'u gerçek bir teknoloji ile somutlaştıran kod.
-- *Driving adapter*: HTTP controller, gRPC handler, Kafka consumer — uygulamayı çağıran taraf
-- *Driven adapter*: JPA repository implementation, Kafka producer, SMS gateway client — uygulamanın çağırdığı taraf
-
-**Dependency inversion:** Çekirdek bir interface tanımlar, adapter onu implement eder. Çekirdek **adapter'ın varlığını bilmez**.
+Kesikli oklara dikkat: JPA adapter sağda durur ama ok **çekirdeğe doğru** akar. Çekirdek bir interface tanımlar, adapter onu implement eder; çekirdek adapter'ın varlığını bile bilmez. Buna **dependency inversion** denir ve hexagonal'in bütün sırrı budur.
 
 **Banking domain örneği:**
 
@@ -285,7 +239,7 @@ class TransferController {
 }
 ```
 
-Bir transfer isteğinin bu yapıda uçtan uca akışı şöyle:
+Bir transfer isteğinin uçtan uca akışı:
 
 ```mermaid
 sequenceDiagram
@@ -305,20 +259,16 @@ sequenceDiagram
     S-->>C: tamam
 ```
 
-Controller sadece **port interface'ini** bilir, service sadece **port üzerinden** persistence'a ulaşır — hiçbir ok domain'den dışarı çıkmaz.
+Controller sadece port interface'ini bilir, service persistence'a sadece port üzerinden ulaşır — hiçbir ok domain'den dışarı çıkmaz.
 
-**Avantajlar:**
+**Kazandıkların:**
 
-1. **Domain saf Java.** Spring veya JPA olmadan IDE'de çalıştırırsın. Unit test'leri mock'sız yazılır.
-2. **Adapter değiştirilebilir.** JPA → MongoDB geçişi sadece adapter değişir, domain kalır.
-3. **Test piramidi sağlıklı:** domain unit test (hızlı, çok), adapter test (TestContainers ile), integration test (az).
-4. **Açık kontrat:** Port'lar bir interface, "uygulamanın dış dünyadan ihtiyaçları neler" sorusunun tek cevabı.
+1. **Domain saf Java.** Spring ve JPA olmadan çalışır; unit test'ler mock'sız yazılır.
+2. **Adapter değiştirilebilir.** JPA → MongoDB geçişinde sadece adapter değişir.
+3. **Test piramidi sağlıklı:** domain unit test (hızlı, çok), adapter test (TestContainers), integration test (az).
+4. **Açık kontrat:** port'lar, "uygulamanın dış dünyadan ihtiyaçları neler" sorusunun tek cevabı.
 
-**Dezavantajlar:**
-
-1. **Daha fazla kod.** Domain ↔ persistence için mapper yazarsın.
-2. **Junior için karmaşık.** İlk bakışta over-engineering gibi gelir.
-3. **Küçük projede gereksiz.** CRUD bir admin paneli için çok ağır.
+**Bedeli:** mapper kodu yazarsın (daha fazla kod), ilk bakışta over-engineering gibi gelir ve küçük bir CRUD admin paneli için gerçekten de ağırdır.
 
 ```admonish tip title="İpucu — banking için neden değer"
 Domain kuralları (negative balance, double-entry invariant, faiz formülü) **on yıllarca yaşayacak**. Teknoloji 3 yılda bir değişir. Hexagonal seni yaşatır.
@@ -328,27 +278,26 @@ Domain kuralları (negative balance, double-entry invariant, faiz formülü) **o
 
 ### 4. Onion Architecture & Clean Architecture (kısaca)
 
-**Onion Architecture (Jeffrey Palermo):** Hexagonal'in benzeri, sadece görselleştirmesi "soğan halkaları" şeklinde. Merkezde Domain, sonra Application Services, sonra Infrastructure. Aynı dependency inversion prensibi.
+Bu isimleri iş ilanlarında ve mülakatlarda göreceksin, paniğe gerek yok:
 
-**Clean Architecture (Uncle Bob):** Yine aynı fikir. Katmanları "Entities → Use Cases → Interface Adapters → Frameworks & Drivers" diye adlandırır. **"The Dependency Rule"** der: bağımlılıklar sadece dışarıdan içeri akar.
+- **Onion Architecture** (Jeffrey Palermo): aynı fikir, "soğan halkaları" görseliyle — merkezde Domain, sonra Application Services, sonra Infrastructure.
+- **Clean Architecture** (Uncle Bob): katmanları "Entities → Use Cases → Interface Adapters → Frameworks & Drivers" diye adlandırır ve **"The Dependency Rule"** der: bağımlılıklar sadece dışarıdan içeri akar.
 
-Üçü de pratikte aynı yapıyı önerir. İsim farklı, fikir aynı: **domain merkez, framework çevre, bağımlılık içe doğru.**
+Üçü de pratikte aynı yapıyı önerir: **domain merkez, framework çevre, bağımlılık içe doğru.**
 
 ---
 
 ### 5. Domain-Driven Design (DDD) — mimari değil ama bağlantılı
 
-Eric Evans (2003). DDD bir **mimari** değil, **modelleme yaklaşımı**. Hexagonal ile çok iyi eşleşir.
+Hexagonal sana "domain'i ortaya koy" der ama o domain'i **nasıl modelleyeceğini** söylemez. Orada DDD devreye girer (Eric Evans, 2003). DDD bir mimari değil, modelleme yaklaşımıdır — hexagonal ile çok iyi eşleşir.
 
-**DDD'nin Faz 1'de bilmen gereken parçaları:**
+Faz 1'de bilmen gereken parçaları:
 
-- **Ubiquitous language:** Kod ile iş diliyle aynı kelimeleri kullanmak. Bankacı "EFT" diyorsa kod da `Eft` diyor, `Transfer` değil.
-- **Bounded context:** Büyük domain'i parçalara böl. Account context, Card context, Transfer context — her birinin kendi modeli olabilir.
-- **Aggregate:** Bir tutarlılık sınırı. Bir aggregate root (örn. `Account`), kendisine ait child'ları (`JournalEntry`'leri) yönetir. Aggregate root **dışarıdan yegane giriş noktasıdır**.
-- **Entity vs Value Object:**
-  - *Entity:* Kimliği var (`Account`, `Customer`). İki müşterinin aynı adı olsa da farklı entity'dir.
-  - *Value Object:* Kimliği yok, değeri ile tanımlanır. `Money(100.00, TRY)` herhangi bir `Money(100.00, TRY)` ile eşittir. **Immutable** olmalı.
-- **Domain event:** Domain'de bir şey olduğunda yayılan mesaj. `MoneyTransferred`, `AccountOpened` gibi.
+- **Ubiquitous language:** Kodda iş diliyle aynı kelimeleri kullan. Bankacı "EFT" diyorsa kod da `Eft` der, `Transfer` değil.
+- **Bounded context:** Büyük domain'i parçalara böl — Account context, Card context, Transfer context. Her birinin kendi modeli olabilir.
+- **Aggregate:** Bir tutarlılık sınırı. Aggregate root (örn. `Account`) kendi child'larını (`JournalEntry`'leri) yönetir ve **dışarıdan yegane giriş noktasıdır**.
+- **Entity vs Value Object:** *Entity*'nin kimliği vardır (`Account`, `Customer`) — iki müşterinin adı aynı olsa da farklı entity'dir. *Value object* değeriyle tanımlanır — her `Money(100.00, TRY)` birbirine eşittir ve **immutable** olmalıdır.
+- **Domain event:** Domain'de bir şey olduğunda yayılan mesaj: `MoneyTransferred`, `AccountOpened`.
 
 **Banking örneği — value object:**
 
@@ -383,6 +332,8 @@ public record Money(BigDecimal amount, Currency currency) {
     }
 }
 ```
+
+Dikkat: currency mismatch kuralı `Money`'nin **içinde** yaşıyor. Onu kullanan hiçbir servis bu kontrolü unutamaz.
 
 **Banking örneği — aggregate root:**
 
@@ -493,9 +444,9 @@ Bu projede Variant A kullanacağız.
 
 ---
 
-### 7. Modüllerin Maven multi-module ile fiziksel ayrılığı (opsiyonel ama güçlü)
+### 7. Maven multi-module ile fiziksel ayrılık (opsiyonel ama güçlü)
 
-Sadece package değil, **Maven module** olarak da ayırabilirsin:
+Package ayrımı bir söz; multi-module ise **derleyicinin zorladığı** bir sözleşme. Katmanları ayrı Maven module'lerine bölersin:
 
 ```
 core-banking/
@@ -512,7 +463,7 @@ core-banking/
     └── pom.xml                      (tüm adapter'lara depend)
 ```
 
-Modüller arası bağımlılık yönü — dikkat et, tüm oklar domain'e doğru akar:
+Modüller arası bağımlılık yönü — tüm oklar domain'e doğru akar:
 
 ```mermaid
 flowchart TD
@@ -523,17 +474,13 @@ flowchart TD
     APPL --> DOM["banking-domain"]
 ```
 
-**Avantaj:** Compile-time enforcement. Domain modülünde Spring import'una **derleyici izin vermez**, çünkü Spring dependency'si yok.
-
-**Dezavantaj:** Setup biraz daha ağır. Junior için A variant'ı package-level ile başlamak yeterli.
-
-Bu projede başlangıçta **tek module + package separation** kullanacağız. Faz 7'de microservices'e bölerken multi-module'a geçireceğiz.
+Avantajı compile-time enforcement: domain modülünde Spring dependency'si olmadığı için derleyici Spring import'una **izin vermez**. Bedeli biraz daha ağır setup — bu yüzden başlangıçta **tek module + package separation** kullanacağız, Faz 7'de microservices'e bölerken multi-module'a geçeceğiz.
 
 ---
 
 ### 8. Architectural Decision Records (ADR)
 
-Mimari kararlarını **yazılı kayıt** olarak tutmak. `core-banking/docs/adr/` klasörü açar, her karar için bir markdown dosyası.
+Altı ay sonra "biz neden hexagonal seçmiştik?" diye soran olacak — belki de o kişi sen olacaksın. ADR, mimari kararları yazılı kayıt altına alma alışkanlığıdır: `core-banking/docs/adr/` klasörü, her karar için bir markdown dosyası.
 
 Template:
 
@@ -564,9 +511,9 @@ Banking şirketlerinde ADR çok yaygın — production'a giren her major karar b
 
 ### 9. Anti-pattern'ler — ne yapma
 
-**Anti-pattern 1: "Anemic Domain Model"**
+**Anti-pattern 1: Anemic Domain Model**
 
-Domain class'ı sadece getter/setter'dan oluşur, hiçbir davranış yoktur. Tüm logic Service'e dağılır.
+Domain class'ı sadece getter/setter'dan oluşur, hiçbir davranışı yoktur; tüm logic Service'e dağılır.
 
 ```java
 // ❌ Kötü
@@ -586,17 +533,13 @@ class AccountService {
 }
 ```
 
-Sorun: `Account` saçma. Onun **iç tutarlılığı** dışarıdan korunmak zorunda. Başka bir servis aynı kuralı uygulamayı unutursa, bakiye negatife düşer.
+Sorun: `Account`'un iç tutarlılığı dışarıdan korunmak zorunda. Başka bir servis aynı kontrolü unutursa bakiye negatife düşer. Doğrusu: `account.withdraw(amount)` — kural nesnenin içinde yaşar.
 
-Doğrusu: `account.withdraw(amount)` çağrısı, kuralı içinde tutar.
+**Anti-pattern 2: Her şeyi yapan Service**
 
-**Anti-pattern 2: "Service İçinde Repository Çağrısı + Business Logic Karışık"**
+Service hem orchestration yapar, hem DB sorgusu yazar, hem matematik yapar, hem HTTP çağrısı atar. Çözüm: orchestration servise, kural domain'e, DB adapter'a, HTTP başka bir adapter'a.
 
-Service hem orchestration yapar, hem DB sorgusu yazar, hem matematik yapar, hem HTTP çağrısı yapar.
-
-Çözüm: orchestration servise, kural domain'e, DB adapter'a, HTTP başka bir adapter'a.
-
-**Anti-pattern 3: "Entity'i HTTP'ye Sızdırma"**
+**Anti-pattern 3: Entity'i HTTP'ye sızdırma**
 
 ```java
 // ❌ Kötü
@@ -604,11 +547,9 @@ Service hem orchestration yapar, hem DB sorgusu yazar, hem matematik yapar, hem 
 public AccountJpaEntity get(@PathVariable Long id) { ... }
 ```
 
-Sorunlar: lazy loading patlaması, internal field'lar dışarı sızar, JSON formatın DB schema'na bağlanır, breaking change riski yüksek.
+Sonuçları: lazy loading patlaması, internal field'ların dışarı sızması, JSON formatının DB schema'sına bağlanması ve yüksek breaking change riski. Çözüm: ayrı `AccountResponse` DTO'su (sonraki topic'te detaylı).
 
-Çözüm: ayrı `AccountResponse` DTO'su (sonraki topic'te detaylı).
-
-**Anti-pattern 4: "Circular Dependency Between Layers"**
+**Anti-pattern 4: Katmanlar arası circular dependency**
 
 ```admonish warning title="Dikkat"
 Domain, persistence adapter'a import yapar. Bu hexagonal'i çürütür. Domain hiçbir şeye bağımlı olmamalı.
@@ -835,7 +776,7 @@ düzeltme. Sadece neyin eksik/yanlış olduğunu söyle. Ben düzelteceğim.
 - [ ] Hexagonal architecture'ın "dependency direction"ını birine 2 dakikada anlatabilirim
 - [ ] Anti-pattern'leri tanıyabiliyorum (Anemic Domain Model özellikle)
 
-Hepsi onaylı → Topic 1.2'ye geç → [02-project-setup/](../02-project-setup/README.md)
+Hepsi onaylı → Topic 1.2'ye geç → [02-project-setup/](../02-project-setup/index.md)
 
 ---
 

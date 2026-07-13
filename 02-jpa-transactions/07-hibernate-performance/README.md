@@ -1068,7 +1068,7 @@ Her madde için PASS / FAIL / EKSIK ve kısa gerekçe. Kod yazma.
 - [ ] PostgreSQL `log_min_duration_statement` aktif, `pg_stat_statements` çalışıyor
 - [ ] Anti-pattern listesi rahat (IDENTITY+batch, string concat, money cache, vs.)
 
-Hepsi onaylı → Phase 2 mini-project'e geç → [../mini-project/](../mini-project/README.md)
+Hepsi onaylı → Phase 2 mini-project'e geç → [../mini-project/](../mini-project/index.md)
 
 ---
 

@@ -1019,4 +1019,4 @@ Aşağıdaki cümleleri **kendi kelimelerinle** doldur:
 
 ---
 
-Tamamlandı → [02-service-decomposition/](../02-service-decomposition/README.md)
+Tamamlandı → [02-service-decomposition/](../02-service-decomposition/index.md)

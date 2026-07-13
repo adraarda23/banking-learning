@@ -937,7 +937,7 @@ Her madde için PASS / FAIL / EKSIK işaretle. Kod yazma, sadece eksiklikleri s�
 - [ ] Cache coherency MESI protokolünü en azından bir cümleyle anlatabiliyorum
 - [ ] Compiler/CPU reordering'in pratik etkisini örnekle anlatabiliyorum
 
-Hepsi onaylı → Topic 3.2'ye geç → [02-synchronization-primitives/](../02-synchronization-primitives/README.md)
+Hepsi onaylı → Topic 3.2'ye geç → [02-synchronization-primitives/](../02-synchronization-primitives/index.md)
 
 ---
 

@@ -135,5 +135,5 @@ Bunlar mid-level developer'ın bilmesi gereken şeyler. Senin Phase 1'i bitirdi�
 ```admonish success title="Sonraki durak: Faz 2"
 İyi şanslar. Phase 2 daha derin ve teknik — JPA internals, transaction propagation,
 locking, N+1, connection pool tuning. Faz 1 sağlam ise Faz 2 üzerine inşa olur.
-→ [Faz 2 — JPA & Transactions](../02-jpa-transactions/README.md)
+→ [Faz 2 — JPA & Transactions](../02-jpa-transactions/index.md)
 ```

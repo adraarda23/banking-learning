@@ -33,13 +33,13 @@ Yaklaşık 2-2.5 hafta. Topic başına 1-1.5 gün okuma + task, mini-project 3-4
 
 | # | Topic | Süre | Kritik kavram |
 |---|-------|------|---------------|
-| 1 | [01-batch-architecture](./01-batch-architecture/README.md) | 1 gün | Job, Step, JobInstance vs JobExecution, JobRepository |
-| 2 | [02-chunk-oriented](./02-chunk-oriented/README.md) | 1.5 gün | ItemReader/Processor/Writer, chunk size, paging reader |
-| 3 | [03-skip-retry-restart](./03-skip-retry-restart/README.md) | 1.5 gün | SkipPolicy, RetryPolicy, ExecutionContext, restart semantics |
-| 4 | [04-listeners-flow](./04-listeners-flow/README.md) | 1 gün | Listener'lar, conditional flow, decider, split |
-| 5 | [05-partitioning-parallel](./05-partitioning-parallel/README.md) | 1.5 gün | Partitioner, multi-threaded step, throttle limit |
-| 6 | [06-scheduling](./06-scheduling/README.md) | 1 gün | @Scheduled, Quartz, ShedLock |
-| M | [mini-project](./mini-project/README.md) | 3-4 gün | EOD Reconciliation + Interest Accrual + Fraud Report |
+| 1 | [01-batch-architecture](./01-batch-architecture/index.md) | 1 gün | Job, Step, JobInstance vs JobExecution, JobRepository |
+| 2 | [02-chunk-oriented](./02-chunk-oriented/index.md) | 1.5 gün | ItemReader/Processor/Writer, chunk size, paging reader |
+| 3 | [03-skip-retry-restart](./03-skip-retry-restart/index.md) | 1.5 gün | SkipPolicy, RetryPolicy, ExecutionContext, restart semantics |
+| 4 | [04-listeners-flow](./04-listeners-flow/index.md) | 1 gün | Listener'lar, conditional flow, decider, split |
+| 5 | [05-partitioning-parallel](./05-partitioning-parallel/index.md) | 1.5 gün | Partitioner, multi-threaded step, throttle limit |
+| 6 | [06-scheduling](./06-scheduling/index.md) | 1 gün | @Scheduled, Quartz, ShedLock |
+| M | [mini-project](./mini-project/index.md) | 3-4 gün | EOD Reconciliation + Interest Accrual + Fraud Report |
 | T | [PHASE_TEST.md](./PHASE_TEST.md) | 0.5 gün | Self-assessment |
 
 ---

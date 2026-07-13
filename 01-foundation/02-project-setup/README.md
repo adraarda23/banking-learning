@@ -10,7 +10,7 @@
 
 ## Hedef
 
-Boş bir klasörden çalışan bir Spring Boot 3 uygulamasına kadar gelmek. Sadece "çalıştır" değil, **production-grade konfigürasyon** ile: profil ayrımı, type-safe config binding, secrets'ı yml'den uzakta tutma.
+Boş bir klasörden çalışan bir Spring Boot 3 uygulamasına gelmek. Ama sadece "çalıştır" değil — **production-grade konfigürasyon** ile: profil ayrımı, type-safe config binding, secret'ları yml'den uzakta tutma.
 
 ## Süre
 
@@ -19,7 +19,7 @@ Okuma: 1 saat • Mini task: 2 saat • Test: 30 dk • Toplam: ~3.5 saat
 ## Önbilgi
 
 - Topic 1.1 tamamlandı
-- Java 21 kurulu (Maven projende Java 21 hedefleyeceğiz — virtual thread için)
+- Java 21 kurulu (virtual thread için Java 21 hedefleyeceğiz)
 - Maven kurulu (`mvn -version`)
 
 ---
@@ -28,32 +28,26 @@ Okuma: 1 saat • Mini task: 2 saat • Test: 30 dk • Toplam: ~3.5 saat
 
 ### 1. Spring Boot felsefesi
 
-Spring Boot 3 (2022-2024+), Spring Framework 6 üzerine kurulu. Üç temel taahhüt:
+Spring Framework güçlü ama çıplak haliyle kurulumu zahmetli — Spring Boot bu zahmeti senin yerine üstlenir. Bunu üç taahhütle yapar:
 
-1. **Opinionated defaults:** "Çoğu durum için doğru olanı varsayılan yap." Logging, JSON, embedded server hepsi sıfır config çalışır.
-2. **Auto-configuration:** Classpath'te `spring-boot-starter-data-jpa` görüyorsa, otomatik olarak Hibernate kur, DataSource bekle, EntityManager bean'i hazırla.
-3. **Production-ready:** Actuator ile health/metrics, externalized config, profile management — production'a hazır.
+1. **Opinionated defaults:** "Çoğu durum için doğru olanı varsayılan yap." Logging, JSON, embedded server sıfır config çalışır.
+2. **Auto-configuration:** Classpath'te `spring-boot-starter-data-jpa` görürse Hibernate'i kurar, DataSource bekler, EntityManager bean'ini hazırlar.
+3. **Production-ready:** Actuator ile health/metrics, externalized config, profile management hazır gelir.
 
-**Spring Boot ≠ Spring Framework.** Spring Framework (Core, MVC, Data, Security) altyapı. Spring Boot ise bu altyapının üstüne **starter dependency'leri + auto-config + opinionated default** ekler.
+Sık karışan bir ayrım: **Spring Boot ≠ Spring Framework.** Framework (Core, MVC, Data, Security) altyapıdır; Boot bu altyapının üstüne **starter dependency + auto-config + opinionated default** ekler.
 
 ### 2. Spring Initializr vs manuel Maven
 
-İki yol var:
+Projeye başlamanın iki yolu var, ve biri açıkça junior tuzağı.
 
-**A. Spring Initializr (önerilen):** [start.spring.io](https://start.spring.io)
-- Web UI'da bağımlılıkları tıklayarak seçersin
-- Hazır `pom.xml` + boş main class indirir
-- Hızlı, hatasız başlama
+- **Spring Initializr (önerilen):** [start.spring.io](https://start.spring.io)'da bağımlılıkları tıklayarak seçersin, hazır `pom.xml` + boş main class indirirsin. Hızlı ve hatasız.
+- **Manuel:** `pom.xml`'i elinle yazarsın. Tüm versiyon ve plugin'leri bilmen gerekir; sonuç genelde yanlış versiyon, eksik plugin, çalışmayan setup.
 
-**B. Manuel:** Boş klasör, `pom.xml`'i elinle yaz
-- Tüm versiyon ve plugin'leri kendin bilmen lazım
-- Genelde junior tuzağı: yanlış versiyon, eksik plugin, çalışmayan setup
-
-Bu projede **Initializr ile başla.** Aldıktan sonra `pom.xml`'i inceleyerek "Initializr ne kurdu" sorusunu kendin cevapla.
+Bu projede **Initializr ile başla.** Sonra `pom.xml`'i inceleyip "Initializr ne kurdu?" sorusunu kendin cevapla — öğrenme orada.
 
 ### 3. `pom.xml` anatomisi
 
-Spring Boot uygulamasının `pom.xml`'i:
+`pom.xml` projenin kimliği: hangi Java, hangi Spring Boot, hangi kütüphaneler. Bir Spring Boot uygulamasınınki şöyle görünür:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -148,15 +142,15 @@ Spring Boot uygulamasının `pom.xml`'i:
 </project>
 ```
 
-**Anahtar şeyler:**
+Bu dosyada üç şeye dikkat et:
 
-- **`<parent>`:** Spring Boot'un parent POM'una bağlanmak `dependencyManagement` getirir. Her Spring Boot dependency için versiyon yazmana gerek yok — parent yönetir. Bu çok değerli (versiyon uyumsuzluğu tehlikeleri kalkar).
+- **`<parent>`:** Spring Boot'un parent POM'u `dependencyManagement` getirir — Spring Boot dependency'lerine versiyon yazmazsın, parent yönetir. Versiyon uyumsuzluğu derdi biter.
+- **`spring-boot-starter-*`:** Starter = bir grup ilgili dependency. `starter-web` tek satır ama arkada Spring MVC + Tomcat + Jackson dahil ~30 jar gelir.
+- **`spring-boot-maven-plugin`:** `mvn spring-boot:run` ve fat JAR build bunun sayesinde.
 
-- **`spring-boot-starter-*`:** "Starter" = bir grup ilgili dependency. `starter-web` = Spring MVC + Tomcat + Jackson + validation altyapısı. Tek satır dependency, arkada 30 jar gelir.
+### 4. Maven temel komutlar
 
-- **`spring-boot-maven-plugin`:** `mvn spring-boot:run` ve fat JAR build için.
-
-### 4. Maven temel komutlar (banking'de günlük kullanım)
+Banking'de günlük hayatın bir parçası olacak komutlar:
 
 ```bash
 mvn clean              # target/ klasörünü siler
@@ -166,36 +160,23 @@ mvn package            # JAR oluşturur
 mvn install            # local Maven repo'na koyar
 mvn spring-boot:run    # uygulamayı başlatır
 
-mvn dependency:tree    # bağımlılık ağacını gösterir (versiyon çakışmalarını bulmak için)
+mvn dependency:tree    # bağımlılık ağacı (versiyon çakışması bulmak için)
 mvn versions:display-dependency-updates  # güncel olmayan dep'leri listeler
 
-mvn -DskipTests package  # test'siz build
+mvn -DskipTests package      # test'siz build
 mvn test -Dtest=AccountTest  # sadece bir test class
 ```
 
 ```admonish tip title="İpucu"
-TR bankalarında çoğu yerde Maven kullanılır. Gradle bazı modern startup'larda. Maven'a hakim ol.
+TR bankalarında çoğu yerde Maven kullanılır; Gradle bazı modern startup'larda. Maven'a hakim ol.
 ```
 
 ### 5. Single module vs Multi-module
 
-**Single module:** Tek `pom.xml`, tüm kod `src/main/java/` altında. Package'larla organize.
+Proje büyüdükçe "tek pom mu, çok pom mu?" sorusu gelir. İki model:
 
-**Multi-module:** Parent `pom.xml` + alt modüller (her birinin kendi `pom.xml`'i).
-
-```
-core-banking/
-├── pom.xml                                  (parent)
-├── banking-domain/
-│   ├── pom.xml
-│   └── src/main/java/
-├── banking-application/
-│   ├── pom.xml
-│   └── src/main/java/
-└── banking-adapter-web/
-    ├── pom.xml
-    └── src/main/java/
-```
+- **Single module:** Tek `pom.xml`, tüm kod `src/main/java/` altında, package'larla organize.
+- **Multi-module:** Parent `pom.xml` + her biri kendi `pom.xml`'ine sahip alt modüller.
 
 ```mermaid
 flowchart TD
@@ -206,16 +187,11 @@ flowchart TD
     A -- "depends on" --> D
 ```
 
-**Phase 1'de:** Single module + iyi package yapısı. Sebep:
-- Multi-module Maven karmaşıklığı junior için ekstra yük
-- Package-private görünürlüğü `domain` package'ında kullanırsan zaten ayrışma sağlanır
-- Phase 7'de microservice'e ayırırken multi-module'a geçeriz
+Phase 1'de **single module + iyi package yapısı** kullanacağız. Multi-module Maven karmaşıklığı şu an ekstra yük; `domain` package'ında package-private görünürlük zaten ayrışmayı sağlar. Phase 7'de microservice'e ayırırken multi-module'a geçeriz.
 
 ### 6. `application.yml` — externalized configuration
 
-Spring Boot, `src/main/resources/application.properties` veya `application.yml` dosyasından konfigürasyon okur. YAML daha okunabilir, onu kullanırız.
-
-**Temel `application.yml`:**
+Konfigürasyonu koda gömmek yerine dışarıda tutarsın — böylece aynı JAR farklı ortamlarda farklı davranır. Spring Boot bunu `src/main/resources/application.yml` (veya `.properties`) dosyasından okur; YAML daha okunabilir, onu kullanacağız.
 
 ```yaml
 spring:
@@ -265,42 +241,37 @@ logging:
     org.hibernate.SQL: DEBUG    # sadece development'ta
 ```
 
-**Önemli noktalar:**
+Üç satır özellikle önemli:
 
-- **`${DB_PASSWORD:}` syntax'ı:** Environment variable `DB_PASSWORD` set edilmemişse default olarak boş string. Production'da DB password yml'de yazmayacaksın — environment variable veya secret manager'dan gelecek.
-- **`spring.jpa.hibernate.ddl-auto: validate`:** Hibernate schema'ya dokunmasın, sadece doğrulasın. Schema migration Flyway'in işi.
-- **`management.endpoints.web.exposure.include`:** Actuator'da hangi endpoint'leri expose edeceksin. Production'da `health,info,prometheus` kafidir.
+- **`${DB_PASSWORD:}`:** Environment variable set edilmemişse boş string. Production'da password yml'de olmaz — env var veya secret manager'dan gelir.
+- **`ddl-auto: validate`:** Hibernate schema'ya dokunmasın, sadece doğrulasın. Migration Flyway'in işi.
+- **`exposure.include`:** Actuator'da neyi expose edeceğini sen seçersin. Production'da `health,info,prometheus` kâfi.
 
 ### 7. Profile sistemi (dev / test / prod)
 
-Banking projelerinde **en az 3 ortam** var:
+Banking projelerinde en az üç ortam var ve her biri farklı config ister:
 
-- **dev:** developer'ın laptop'u — H2 in-memory veya lokal PostgreSQL, verbose log
-- **test:** CI'da çalışan integration test'ler — TestContainers ile geçici DB
-- **prod:** production — gerçek DB, encrypted password, sıkı log
+- **dev:** developer laptop'u — lokal PostgreSQL, verbose log
+- **test:** CI'daki integration test'ler — TestContainers ile geçici DB
+- **prod:** gerçek DB, encrypted password, sıkı log
 
-Spring Boot bunları **profile** sistemi ile yönetir.
-
-**Dosya hiyerarşisi:**
+Spring Boot bunu **profile** sistemiyle çözer. Dosya hiyerarşisi:
 
 ```
 src/main/resources/
-├── application.yml              ← ortak tüm profile'lerde geçerli
+├── application.yml              ← ortak, tüm profile'lerde geçerli
 ├── application-dev.yml          ← `dev` profile aktifken eklenir
 ├── application-test.yml         ← `test` profile aktifken eklenir
 └── application-prod.yml         ← `prod` profile aktifken eklenir
 ```
 
-**Override mekaniği:** Üstte `application.yml`, üzerine profile-specific dosya. Aynı key varsa profile-specific kazanır.
+Override mekaniği basit: önce `application.yml` yüklenir, üzerine aktif profile'in dosyası biner. Aynı key varsa profile-specific olan kazanır.
 
 ```mermaid
-flowchart TD
-    BASE["application.yml ortak ayarlar"] --> DEV["application-dev.yml"]
-    BASE --> TEST["application-test.yml"]
-    BASE --> PROD["application-prod.yml"]
-    DEV --> RES["Aktif profil dosyasi ayni key'de kazanir"]
-    TEST --> RES
-    PROD --> RES
+flowchart LR
+    BASE["application.yml ortak ayarlar"] --> MERGE["Birlesim"]
+    PROF["application-dev.yml aktif profil"] --> MERGE
+    MERGE --> RES["Ayni key'de profil dosyasi kazanir"]
 ```
 
 **Örnek `application-dev.yml`:**
@@ -336,7 +307,7 @@ logging:
     com.mavibank: INFO
 ```
 
-**Profile aktifleştirme yolları:**
+Profile'i aktifleştirmenin dört yolu var:
 
 ```bash
 # 1. Komut satırı
@@ -354,21 +325,11 @@ spring:
 java -jar -Dspring.profiles.active=prod core-banking.jar
 ```
 
-**Birden fazla profile:**
-```
-SPRING_PROFILES_ACTIVE=prod,monitoring,debug
-```
-Sırasıyla uygulanır, sondaki kazanır.
+Birden fazla profile de verebilirsin: `SPRING_PROFILES_ACTIVE=prod,monitoring,debug`. Sırasıyla uygulanır, sondaki kazanır.
 
 ### 8. Configuration source precedence (kim kazanır)
 
-Spring Boot config kaynaklarının önceliği (sondaki en güçlü):
-
-1. `application.yml`
-2. `application-{profile}.yml`
-3. OS environment variables (`DB_PASSWORD=...`)
-4. JVM system properties (`-Dspring.datasource.url=...`)
-5. Command-line arguments (`--spring.datasource.url=...`)
+Aynı key birden fazla kaynaktan geldiğinde kim kazanır? Spring Boot'un net bir öncelik sırası var — sondaki en güçlü:
 
 ```mermaid
 flowchart LR
@@ -379,16 +340,16 @@ flowchart LR
     E --> WIN["Sondaki kazanir"]
 ```
 
-**Banking pratik kuralı:**
+Banking'de pratik kural şu şekilde oturur:
 
-- Sabit defaults → `application.yml`
+- Sabit default'lar → `application.yml`
 - Profile-specific override → `application-{profile}.yml`
 - Secret (password, API key) → environment variable, **asla yml'de değil**
 - Acil prod override → komut satırı argümanı
 
 ### 9. `@Value` vs `@ConfigurationProperties`
 
-İki yolla konfigürasyonu kod'a bağlarsın.
+Config'i koda bağlamanın iki yolu var; hangisini seçtiğin, kodun büyüdükçe fark yaratır.
 
 **`@Value` — basit ama kötü scale eder:**
 
@@ -403,12 +364,7 @@ public class TransferService {
 }
 ```
 
-Sorunlar:
-- Field başına annotation
-- Validation yok
-- Refactor'da string key kaybolur
-- Type-safe değil (typo'da runtime hatası)
-- Test etmek zor (her field için ayrı `@TestPropertySource`)
+Sorunları: field başına annotation, validation yok, refactor'da string key kırılır, typo ancak runtime'da patlar, test için her field'a ayrı `@TestPropertySource` gerekir.
 
 **`@ConfigurationProperties` — type-safe, banking standardı:**
 
@@ -437,7 +393,7 @@ banking:
       EUR: 10000.00
 ```
 
-**Aktivasyon (Spring Boot 3):**
+Aktive etmek için main class'a `@ConfigurationPropertiesScan` ekle (veya per-class `@EnableConfigurationProperties(TransferProperties.class)`):
 
 ```java
 @SpringBootApplication
@@ -449,12 +405,7 @@ public class CoreBankingApplication {
 }
 ```
 
-Veya per-class:
-```java
-@EnableConfigurationProperties(TransferProperties.class)
-```
-
-**Kullanım:**
+Kullanımı sıradan constructor injection:
 
 ```java
 @Service
@@ -473,11 +424,11 @@ class TransferService {
 }
 ```
 
-**Banking kural:** Tüm business rules için `@ConfigurationProperties` kullan. `@Value` sadece çok basit (ve genelde Spring'in kendi prop'ları için) durumlarda.
+**Banking kuralı:** Tüm business rule config'leri için `@ConfigurationProperties`. `@Value` sadece çok basit, tekil durumlarda.
 
 ### 10. Property naming — kebab-case ↔ camelCase
 
-YAML'da `kebab-case`, Java'da `camelCase`. Spring Boot otomatik mapleyemi yapar (**relaxed binding**):
+YAML'da `kebab-case`, Java'da `camelCase` yazılır; Spring Boot ikisini otomatik eşler (**relaxed binding**):
 
 ```yaml
 banking:
@@ -489,11 +440,11 @@ banking:
 record TransferProperties(BigDecimal maxAmount) {}  // Java: camelCase
 ```
 
-Eşleşir. Banking ekibinde tutarlılık için YAML'da hep kebab-case yaz.
+Ekip tutarlılığı için YAML'da hep kebab-case yaz.
 
 ### 11. Profile activation testi
 
-Test'lerde profile aktifleştirme:
+Test'ler de ortam ister — `@ActiveProfiles` ile test profile'ini aktifleştirirsin:
 
 ```java
 @SpringBootTest
@@ -517,7 +468,7 @@ logging:
 
 ### 12. Secret management — banking gerçeği
 
-Banking'de credential yönetimi:
+Bir bankada sızmış bir DB password'ü regülasyon olayıdır — o yüzden credential yönetimi pazarlık konusu değil.
 
 ```admonish warning title="Dikkat"
 **Asla:**
@@ -526,17 +477,9 @@ Banking'de credential yönetimi:
 - Slack/email üzerinden paylaşılan password
 ```
 
-**Üretim:**
-- HashiCorp Vault
-- AWS Secrets Manager
-- Kubernetes Secrets (dikkat: base64, encrypted değil)
-- Sealed Secrets
+Üretimde secret'lar bir secret manager'dan gelir: HashiCorp Vault, AWS Secrets Manager, Kubernetes Secrets (dikkat: base64'tür, encrypted değil) veya Sealed Secrets. Local dev için ara çözüm: gitignored `.env` dosyası veya `application-local.yml`.
 
-**Local dev için ara çözüm:**
-- `.env` dosyası (`.gitignore`'da)
-- `application-local.yml` (Git'e dahil değil)
-
-Spring Boot 3.2+ `spring.config.import` ile Vault entegrasyonu çok temiz:
+Spring Boot 3.2+ ile Vault entegrasyonu tek satır:
 
 ```yaml
 spring:
@@ -544,9 +487,11 @@ spring:
     import: "vault://secret/banking"
 ```
 
-Bunu Phase 8 (Security) topic'inde detaylı yapacağız. Şimdilik environment variable kullanmak yeterli.
+Bunu Phase 8'de (Security) detaylı yapacağız; şimdilik environment variable yeterli.
 
-### 13. Spring Boot DevTools — development hayat kurtarıcı
+### 13. Spring Boot DevTools
+
+Her kod değişikliğinde uygulamayı elle restart etmek zaman yer — DevTools bunu otomatikleştirir:
 
 ```xml
 <dependency>
@@ -557,22 +502,16 @@ Bunu Phase 8 (Security) topic'inde detaylı yapacağız. Şimdilik environment v
 </dependency>
 ```
 
-Faydaları:
-- Classpath değişikliğinde otomatik restart
-- LiveReload (browser auto-refresh)
-- H2 console gibi development-only auto-config
-- `spring.devtools.restart.enabled=true`
-
-**Production'da otomatik kapanır** — `scope=runtime` + Spring Boot kontrolü.
+Getirdikleri: classpath değişikliğinde otomatik restart, LiveReload (browser auto-refresh), H2 console gibi development-only auto-config. **Production'da otomatik kapanır** — `scope=runtime` + Spring Boot'un kendi kontrolü sayesinde.
 
 ### 14. Component scanning ve auto-configuration mekaniği
 
-`@SpringBootApplication` aslında 3 annotation'ın birleşimi:
+"Bean'lerim neden bulunmuyor?" sorusunun cevabı hep buradadır. `@SpringBootApplication` aslında üç annotation'ın birleşimi:
 
 ```java
 @SpringBootConfiguration  // ≈ @Configuration
 @EnableAutoConfiguration  // classpath bazlı auto-config
-@ComponentScan            // bu class'ın bulunduğu paket + altları taranır
+@ComponentScan            // bu class'ın paketi + alt paketleri taranır
 public @interface SpringBootApplication { }
 ```
 
@@ -585,15 +524,14 @@ flowchart TD
     C3 --> CS["Main class paketi ve alt paketleri taranir"]
 ```
 
-**Component scan kuralı:** `@SpringBootApplication` annotation'lı class'ın **paketi ve alt paketleri** taranır.
+Kural net: sadece main class'ın **paketi ve alt paketleri** taranır. Main class `com.mavibank.banking`'deyse:
 
-Yani main class'ını `com.mavibank.banking` paketine koyarsan:
 - `com.mavibank.banking.account.adapter.in.web.*` ✓ taranır
 - `com.mavibank.banking.transfer.adapter.out.persistence.*` ✓ taranır
 - `com.mavibank.other.*` ✗ taranmaz
 
 ```admonish tip title="İpucu"
-**Sonuç:** Main class'ını **en üst paketin altına** koy.
+**Sonuç:** Main class'ını **en üst paketin altına** koy — component scan gerisini halleder.
 ```
 
 ---
@@ -618,6 +556,7 @@ Tüm task'leri `~/projects/core-banking/` içinde yap. Topic 1.1'deki domain cla
 ### Task 1.2.1 — Spring Initializr ile proje oluştur (15 dk)
 
 [start.spring.io](https://start.spring.io)'a git:
+
 - Project: Maven
 - Language: Java
 - Spring Boot: 3.3.x veya 3.4.x (en güncel stabil)
@@ -630,6 +569,7 @@ Tüm task'leri `~/projects/core-banking/` içinde yap. Topic 1.1'deki domain cla
 - Java: 21
 
 Dependencies:
+
 - Spring Web
 - Spring Data JPA
 - Validation
@@ -639,7 +579,7 @@ Dependencies:
 - Spring Boot DevTools
 - Lombok (opsiyonel — Topic 1.5'te tartışacağız)
 
-Indir, zip'i `~/projects/core-banking/` içine aç. **Önemli:** Topic 1.1'de yazdığın `Account`, `Money`, vb. class'larını Initializr'ın oluşturduğu `src/main/java/com/mavibank/banking/` altına taşı (paket yapın korunsun).
+İndir, zip'i `~/projects/core-banking/` içine aç. **Önemli:** Topic 1.1'de yazdığın `Account`, `Money`, vb. class'larını Initializr'ın oluşturduğu `src/main/java/com/mavibank/banking/` altına taşı (paket yapın korunsun).
 
 `mvn spring-boot:run` ile boş bir Spring Boot ayağa kalkmalı.
 
@@ -648,7 +588,7 @@ Indir, zip'i `~/projects/core-banking/` içine aç. **Önemli:** Topic 1.1'de ya
 `pom.xml`'i aç. Şunları kendine sor ve **defterine cevap yaz**:
 
 1. `<parent>` neden var, neyi sağlıyor?
-2. `spring-boot-starter-web` dependency'sinin transitive olarak getirdiği ana kütüphaneler neler? (`mvn dependency:tree | head -50`)
+2. `spring-boot-starter-web`'in transitive olarak getirdiği ana kütüphaneler neler? (`mvn dependency:tree | head -50`)
 3. `spring-boot-maven-plugin`'in `repackage` goal'u ne yapar?
 4. `spring-boot-starter-test` hangi test kütüphanelerini getirir?
 5. Tomcat versiyonu kaç? Bunu nereden tespit ettin?
@@ -656,6 +596,7 @@ Indir, zip'i `~/projects/core-banking/` içine aç. **Önemli:** Topic 1.1'de ya
 ### Task 1.2.3 — `application.yml` ile profile yapısı kur (30 dk)
 
 `src/main/resources/` altında:
+
 - `application.yml` — ortak ayarlar
 - `application-dev.yml` — local PostgreSQL
 - `application-test.yml` — TestContainers
@@ -670,13 +611,14 @@ spring:
 ```
 
 Test:
+
 ```bash
 mvn spring-boot:run                              # dev profile (default)
 SPRING_PROFILES_ACTIVE=prod mvn spring-boot:run  # prod profile (DB env var yoksa hata)
 ```
 
 ```admonish warning title="Dikkat"
-**Anti-pattern uyarısı:** `application.yml`'a default profile yazmak — production'da unutursun. Bunu Phase 1'de pedagojik amaçla yapıyoruz, gerçek üretimde **profile aktivasyonu deployment'tan gelmeli** (env var, K8s ConfigMap).
+**Anti-pattern uyarısı:** `application.yml`'a default profile yazmak — production'da unutursun. Bunu Phase 1'de pedagojik amaçla yapıyoruz; gerçek üretimde **profile aktivasyonu deployment'tan gelmeli** (env var, K8s ConfigMap).
 ```
 
 ### Task 1.2.4 — `@ConfigurationProperties` class yaz (30 dk)
@@ -742,6 +684,7 @@ logging:
 ```
 
 Logger inject et:
+
 ```java
 @Service
 class AccountService {
@@ -777,6 +720,7 @@ Thumbs.db
 ```
 
 `application-local.yml` (gitignored — secret'larınla aynı yere):
+
 ```yaml
 spring:
   datasource:
@@ -862,6 +806,7 @@ class AccountPropertiesTest {
 `application-test.yml`'da `min-opening-balance: -1.00` koy (yanlış config), uygulamanın **boot olmamasını** bekle. Bunu test class olarak değil, manuel `mvn spring-boot:run` ile dene. Validation hatası ile fail olmalı.
 
 Otomatik test için:
+
 ```java
 @Test
 void shouldFailWhenMinOpeningBalanceIsNegative() {

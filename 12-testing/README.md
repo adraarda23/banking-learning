@@ -22,14 +22,14 @@ Toplam: ~3-4 hafta (günde 2-3 saat çalışma). Her topic ortalama 1.5-2 gün.
 
 ## Topic listesi
 
-1. **[01-junit5-advanced/](01-junit5-advanced/README.md)** — JUnit 5 Jupiter Platform/Engine/API mimarisi, parametrik test'lerin tüm kaynakları, dynamic test'ler, `@Nested`, `@DisplayName`, lifecycle, conditional execution
-2. **[02-mockito-deep/](02-mockito-deep/README.md)** — Mockito proxy-based çalışma şekli, `@Mock` vs `@Spy` vs `@InjectMocks`, BDDMockito, ArgumentCaptor, MockedStatic, MockedConstruction
-3. **[03-testcontainers/](03-testcontainers/README.md)** — TestContainers concept, PostgreSQL/Kafka/Keycloak/Redis container'ları, container reuse, `@ServiceConnection`, wait strategies, network setup
-4. **[04-archunit/](04-archunit/README.md)** — Mimariyi JUnit test'i olarak yazmak, layered/sliced architecture rule'ları, hexagonal enforcement
-5. **[05-contract-testing/](05-contract-testing/README.md)** — Consumer-driven contract testing, Spring Cloud Contract, Pact framework, broker (Pactflow)
-6. **[06-mutation-testing/](06-mutation-testing/README.md)** — PIT framework, mutator types, survival rate, test kalitesini ölçme, CI threshold gate
-7. **[07-performance-testing-ci/](07-performance-testing-ci/README.md)** — Performance test'lerin CI'a entegrasyonu, regresyon tespiti, baseline karşılaştırma, performance gate
-8. **[mini-project/](mini-project/README.md)** — Final tamamlama: tüm test araçlarını `core-banking`'e entegre etmek
+1. **[01-junit5-advanced/](01-junit5-advanced/index.md)** — JUnit 5 Jupiter Platform/Engine/API mimarisi, parametrik test'lerin tüm kaynakları, dynamic test'ler, `@Nested`, `@DisplayName`, lifecycle, conditional execution
+2. **[02-mockito-deep/](02-mockito-deep/index.md)** — Mockito proxy-based çalışma şekli, `@Mock` vs `@Spy` vs `@InjectMocks`, BDDMockito, ArgumentCaptor, MockedStatic, MockedConstruction
+3. **[03-testcontainers/](03-testcontainers/index.md)** — TestContainers concept, PostgreSQL/Kafka/Keycloak/Redis container'ları, container reuse, `@ServiceConnection`, wait strategies, network setup
+4. **[04-archunit/](04-archunit/index.md)** — Mimariyi JUnit test'i olarak yazmak, layered/sliced architecture rule'ları, hexagonal enforcement
+5. **[05-contract-testing/](05-contract-testing/index.md)** — Consumer-driven contract testing, Spring Cloud Contract, Pact framework, broker (Pactflow)
+6. **[06-mutation-testing/](06-mutation-testing/index.md)** — PIT framework, mutator types, survival rate, test kalitesini ölçme, CI threshold gate
+7. **[07-performance-testing-ci/](07-performance-testing-ci/index.md)** — Performance test'lerin CI'a entegrasyonu, regresyon tespiti, baseline karşılaştırma, performance gate
+8. **[mini-project/](mini-project/index.md)** — Final tamamlama: tüm test araçlarını `core-banking`'e entegre etmek
 
 ---
 

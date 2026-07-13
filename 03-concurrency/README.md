@@ -14,20 +14,20 @@ Sonunda elinde: race condition'a karşı dirençli, virtual thread'le ölçeklen
 
 ## Topic sırası
 
-1. **[JMM & Memory Model](./01-jmm-memory-model/README.md)** — happens-before, volatile, cache coherency, instruction reordering
-2. **[Synchronization Primitives](./02-synchronization-primitives/README.md)** — synchronized, volatile, atomic family, CAS, ABA problem
-3. **[Lock Family](./03-locks/README.md)** — ReentrantLock, ReadWrite, StampedLock, Condition, deadlock fix
-4. **[Executor Framework](./04-executor-framework/README.md)** — ThreadPoolExecutor, queue strategies, ForkJoinPool, custom thread factory
-5. **[CompletableFuture & Async](./05-completable-future/README.md)** — async chains, exception handling, timeout, banking FX fetch
-6. **[Concurrent Collections](./06-concurrent-collections/README.md)** — ConcurrentHashMap, BlockingQueue, CountDownLatch, Semaphore
-7. **[Virtual Threads (Loom)](./07-virtual-threads-loom/README.md)** — Project Loom, pinning, ScopedValue
-8. **[Structured Concurrency](./08-structured-concurrency/README.md)** — StructuredTaskScope, parallel KYC
-9. **[JVM Internals](./09-jvm-internals/README.md)** — heap, GC algorithms, JIT, tiered compilation
-10. **[Performance Tools](./10-performance-tools/README.md)** — JFR, async-profiler, MAT, jstack, GC log
-11. **[JMH Benchmarking](./11-jmh-benchmarking/README.md)** — micro-benchmarks, blackhole, fork, banking benchmarks
+1. **[JMM & Memory Model](./01-jmm-memory-model/index.md)** — happens-before, volatile, cache coherency, instruction reordering
+2. **[Synchronization Primitives](./02-synchronization-primitives/index.md)** — synchronized, volatile, atomic family, CAS, ABA problem
+3. **[Lock Family](./03-locks/index.md)** — ReentrantLock, ReadWrite, StampedLock, Condition, deadlock fix
+4. **[Executor Framework](./04-executor-framework/index.md)** — ThreadPoolExecutor, queue strategies, ForkJoinPool, custom thread factory
+5. **[CompletableFuture & Async](./05-completable-future/index.md)** — async chains, exception handling, timeout, banking FX fetch
+6. **[Concurrent Collections](./06-concurrent-collections/index.md)** — ConcurrentHashMap, BlockingQueue, CountDownLatch, Semaphore
+7. **[Virtual Threads (Loom)](./07-virtual-threads-loom/index.md)** — Project Loom, pinning, ScopedValue
+8. **[Structured Concurrency](./08-structured-concurrency/index.md)** — StructuredTaskScope, parallel KYC
+9. **[JVM Internals](./09-jvm-internals/index.md)** — heap, GC algorithms, JIT, tiered compilation
+10. **[Performance Tools](./10-performance-tools/index.md)** — JFR, async-profiler, MAT, jstack, GC log
+11. **[JMH Benchmarking](./11-jmh-benchmarking/index.md)** — micro-benchmarks, blackhole, fork, banking benchmarks
 
 Sonra:
-- **[Mini-project](./mini-project/README.md)** — rate limiter, virtual thread benchmark, deadlock reproduce+fix, memory leak with MAT
+- **[Mini-project](./mini-project/index.md)** — rate limiter, virtual thread benchmark, deadlock reproduce+fix, memory leak with MAT
 - **[PHASE_TEST.md](./PHASE_TEST.md)**
 
 ## Faz 3'ün sonunda olman gereken yer

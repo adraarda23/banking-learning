@@ -28,7 +28,7 @@ Okuma: 1.5 saat • Mini task: 2 saat • Test: 1 saat • Toplam: ~4.5 saat
 
 ### 1. Entity ≠ DTO — neden ayrı tutuyoruz
 
-**Anti-pattern:**
+En kestirme yol, domain entity'ni doğrudan controller'dan dönmek. Kısa vadede işe yarar ama bir bankada bu, güvenlik açığıyla eşdeğerdir. Önce hataya bak:
 
 ```java
 @RestController
@@ -48,22 +48,17 @@ class AccountController {
 ```
 
 ```admonish warning title="Dikkat"
-**Problemler:**
+Bu kodun problemleri:
 
 1. **Internal field'lar dışarı sızar.** `version` (optimistic lock), `created_by`, sensitive bilgiler API'den çıkar.
-
 2. **JSON kontrat schema'ya bağlanır.** DB kolonu rename edersen client'ı kırarsın.
-
-3. **Lazy loading patlamaları.** JPA entity HTTP response'a çevrilirken serializer lazy proxy'leri trigger eder → N+1, LazyInitializationException.
-
-4. **Validation karışır.** Entity'de `@Email` annotation ile validation = domain'i framework'e bağladın.
-
+3. **Lazy loading patlamaları.** Serializer lazy proxy'leri trigger eder → N+1, LazyInitializationException.
+4. **Validation karışır.** Entity'de `@Email` = domain'i framework'e bağladın.
 5. **Mass assignment vulnerability.** Client `status=APPROVED` gönderir, Jackson deserialize eder → yetkisiz field değiştirme.
-
-6. **API evolution zor.** Eski client `{id, name}` görüyordu, yeni client `{id, name, kyc_status}` görüyor. Aynı entity = aynı JSON = backward compat kırılır.
+6. **API evolution zor.** Aynı entity = aynı JSON = backward compat kırılır.
 ```
 
-DTO ayrımıyla veri, katmanlar arasında şu akışla ilerler — entity hiçbir zaman HTTP sınırını geçmez:
+Çözüm basit: HTTP sınırında **ayrı DTO'lar** kullan. Entity hiçbir zaman bu sınırı geçmez; veri katmanlar arasında şöyle akar:
 
 ```mermaid
 flowchart LR
@@ -76,7 +71,7 @@ flowchart LR
     F --> G["Client JSON"]
 ```
 
-**Doğru yaklaşım — ayrı DTO'lar:**
+Doğru yaklaşım kodda böyle görünür:
 
 ```java
 // Request DTO (client → server)
@@ -129,9 +124,11 @@ class AccountController {
 }
 ```
 
+Buradaki `toResponse` gibi manuel mapping kodunu aklında tut — Bölüm 8'de MapStruct ile bundan kurtulacağız.
+
 ### 2. Request vs Response DTO ayrımı
 
-**Tek DTO** kullanmak (request ve response için aynı class) **yaygın yanlış**:
+DTO'ya geçtin, güzel. Ama sık yapılan ikinci hata: request ve response için **tek DTO** kullanmak.
 
 ```java
 public class AccountDto {
@@ -144,16 +141,13 @@ public class AccountDto {
 ```
 
 ```admonish warning title="Dikkat"
-Sorunlar:
+Tek DTO'nun sorunları:
 - Hangi field hangi yönde gidiyor belirsiz
 - Validation karışır (request'te zorunlu olan response'da nullable, vb.)
-- Mass assignment riski
+- Mass assignment riski geri gelir
 ```
 
-**Kural:** Her endpoint için **yön bazlı** DTO yaz:
-- `OpenAccountRequest`, `OpenAccountResponse`
-- `UpdateAccountStatusRequest` (sadece statusu güncelle)
-- `TransferRequest`, `TransferResponse`
+Kural şu: her endpoint için **yön bazlı** DTO yaz — `OpenAccountRequest` / `AccountResponse`, `TransferRequest` / `TransferResponse`, `UpdateAccountStatusRequest` gibi.
 
 ```admonish tip title="İpucu"
 Bu yaklaşım PR'da daha çok dosya yaratır ama **explicit > implicit**.
@@ -161,24 +155,23 @@ Bu yaklaşım PR'da daha çok dosya yaratır ama **explicit > implicit**.
 
 ### 3. RESTful resource design — banking
 
-**Resource odaklı düşün:**
+URL'ler API'nin vitrinidir; kaynak (resource) odaklı düşünürsen tutarlı kalır:
 
 - `/accounts` — hesap collection
 - `/accounts/{id}` — tek hesap
 - `/accounts/{id}/transactions` — hesabın transaction'ları (read)
-- `/transfers` — transfer collection (write)
-- `/transfers/{id}` — transfer detayı
+- `/transfers` ve `/transfers/{id}` — transfer collection ve detayı
 
-**HTTP method semantik:**
+HTTP method'ların semantiği banking'de şöyle oturur:
 
 - `GET /accounts/{id}` — oku (cacheable, safe, idempotent)
 - `POST /accounts` — yeni kaynak yarat (NOT idempotent — aynı body iki kere = iki kayıt)
 - `POST /transfers` — operasyon başlat (idempotent yapmak için `Idempotency-Key` header)
-- `PUT /accounts/{id}` — full replace (idempotent — Banking'de **nadiren doğru**, account'un tüm field'ı replace edilmez)
+- `PUT /accounts/{id}` — full replace (banking'de **nadiren doğru** — account'un tüm field'ı replace edilmez)
 - `PATCH /accounts/{id}` — partial update (status değişikliği)
-- `DELETE /accounts/{id}` — hesap kapat (banking'de **soft delete** — status'u CLOSED yap, fiziksel silme yok)
+- `DELETE /accounts/{id}` — hesap kapat (banking'de **soft delete** — status CLOSED olur, fiziksel silme yok)
 
-**Banking-specific anti-pattern: "Action verb in URL"**
+**Tuzak — "action verb in URL":**
 
 ```
 POST /accounts/123/close          # ❌ kötü
@@ -186,20 +179,20 @@ POST /transfers/456/cancel        # ❌ kötü
 POST /cards/789/block             # ❌ kötü
 ```
 
-REST puristleri "noun-based" der. Ama bankacılıkta bu kuralı **pragmatik olarak ihlal ediyoruz**. Sebep: bu işlemler aslında **command**'lar, basit CRUD değil. Bunları kabul edilebilir alternatif:
+REST puristleri "noun-based" der. Bankacılıkta bu kural **pragmatik olarak ihlal edilir**, çünkü bu işlemler basit CRUD değil, **command**'dır. Kabul edilebilir alternatifler:
 
 ```
 POST /transfers/456/cancellations   # cancellation resource'u yarat
 PATCH /accounts/123 {"status": "CLOSED"}  # patch yaklaşımı
 ```
 
-Banking'de **karar ekibe ait**, ama tutarlı ol.
+Karar ekibe ait — ama hangisini seçersen seç, **tutarlı ol**.
 
 ### 4. Idempotency — banking için kritik
 
-Bir transfer iki kez işlenirse → çift ödeme → felaket.
+Neden önemli, tek cümle: bir transfer iki kez işlenirse çift ödeme olur, çift ödeme felakettir. Network timeout'ta client retry yapar ve aynı istek iki kez gelir — buna hazır olmalısın.
 
-`POST /transfers` endpoint'inde **`Idempotency-Key` header** zorunlu olsun:
+Çözüm: `POST /transfers` endpoint'inde **`Idempotency-Key` header** zorunlu olsun.
 
 ```http
 POST /transfers HTTP/1.1
@@ -214,10 +207,7 @@ Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000
 }
 ```
 
-Server:
-1. Idempotency-Key DB'de var mı bak.
-2. Varsa: kayıtlı response'u döndür (yeniden işleme yok).
-3. Yoksa: işle, key + response'u kaydet, response'u dön.
+Server tarafında mantık üç adım: key kayıtlı mı bak; kayıtlıysa saklanan response'u dön (yeniden işleme yok); değilse işle, key + response'u kaydet, dön.
 
 ```mermaid
 sequenceDiagram
@@ -249,12 +239,14 @@ CREATE TABLE idempotency_keys (
 ```
 
 ```admonish tip title="İpucu"
-`request_hash`: aynı key + farklı body = client hata yaptı → 422 fırlat.
+`request_hash` bir tuzağı yakalar: aynı key + farklı body = client hata yaptı → 422 fırlat.
 ```
 
 Bunu Phase 2'de tam implement edeceğiz. Phase 1'de **kavramı oturt**, basit versiyonu yaz.
 
 ### 5. Status code'lar — banking için kullanım
+
+Client'ın hata handling'i status code'lara dayanır; yanlış code = client'ta yanlış davranış. Banking'de en çok kullanacakların:
 
 | Code | Anlamı | Banking örneği |
 |---|---|---|
@@ -272,15 +264,13 @@ Bunu Phase 2'de tam implement edeceğiz. Phase 1'de **kavramı oturt**, basit ve
 | 500 Internal Server Error | Bilinmeyen hata | NPE, DB down |
 | 503 Service Unavailable | Geçici sorun | Downstream service down |
 
-**Banking'de 422 vs 409:**
-- 422: Input semantik olarak yanlış (negatif transfer amount)
-- 409: State conflict (concurrent modification)
+En çok karıştırılan üçlü 400 / 422 / 409:
 
-**Banking'de 400 vs 422:**
-- 400: HTTP/JSON seviyesinde malformed
-- 422: Domain validation hatası
+- **400**: HTTP/JSON seviyesinde malformed (parse bile edilemedi)
+- **422**: input semantik olarak yanlış — domain validation hatası (negatif transfer amount)
+- **409**: state conflict (concurrent modification)
 
-Karar akışı şöyle düşünülebilir:
+Karar akışı şöyle:
 
 ```mermaid
 flowchart TD
@@ -295,11 +285,9 @@ flowchart TD
 
 ### 6. Response shape — tutarlılık
 
-Her endpoint farklı response shape üretirse, client'ın frontend'inde her endpoint için ayrı handling = bakım kâbusu.
+Her endpoint farklı response shape üretirse client her endpoint için ayrı handling yazar — bakım kâbusu. Üç standart shape yeter:
 
-**Tutarlı response patterns:**
-
-#### a) Single resource:
+**Single resource:**
 ```json
 {
   "id": "...",
@@ -310,7 +298,7 @@ Her endpoint farklı response shape üretirse, client'ın frontend'inde her endp
 }
 ```
 
-#### b) Collection (pagination ile):
+**Collection (pagination ile):**
 ```json
 {
   "items": [
@@ -324,8 +312,7 @@ Her endpoint farklı response shape üretirse, client'ın frontend'inde her endp
 }
 ```
 
-#### c) Error:
-RFC 7807 ProblemDetail (Topic 1.7'de detaylı):
+**Error** — RFC 7807 ProblemDetail (Topic 1.7'de detaylı):
 ```json
 {
   "type": "https://api.mavibank.com/problems/insufficient-funds",
@@ -338,9 +325,9 @@ RFC 7807 ProblemDetail (Topic 1.7'de detaylı):
 
 ### 7. Pagination — banking'de standart
 
-`GET /accounts/{id}/transactions?page=0&size=20&sort=occurredAt,desc`
+Bir hesabın milyonlarca transaction'ı olabilir; hepsini tek response'ta dönemezsin. Standart page/size yaklaşımı:
 
-Spring Boot için yardımcı (Phase 2'de daha derin):
+`GET /accounts/{id}/transactions?page=0&size=20&sort=occurredAt,desc`
 
 ```java
 @GetMapping("/{id}/transactions")
@@ -359,35 +346,20 @@ public PageResponse<TransactionResponse> getTransactions(
 }
 ```
 
-**Banking'de cursor-based pagination** bazen daha iyi:
+Alternatif olarak **cursor-based pagination** var:
 ```
 GET /transactions?cursor=eyJpZCI6Ii4uLiJ9&limit=20
 ```
 
 ```admonish tip title="İpucu"
-Çok büyük datasette `OFFSET` performans kıran (10M satır transaction). Cursor stabil ve hızlı. Phase 2'de detaylandıracağız.
+Çok büyük datasette (10M satır transaction) `OFFSET` performans kırar. Cursor stabil ve hızlı. Phase 2'de detaylandıracağız.
 ```
 
 ### 8. MapStruct — compile-time mapper'lar
 
-Entity ↔ DTO mapping kodu sıkıcı ve hata-prone. Manuel yazarsan:
+Bölüm 1'deki manuel `toResponse` metodunu hatırla: sıkıcı, tekrarlı ve hata-prone. Entity'e yeni field ekleyip mapper'ı güncellemeyi unutursan response'da o field eksik kalır — sessiz bir bug.
 
-```java
-private AccountResponse toResponse(Account account) {
-    return new AccountResponse(
-        account.getId().value(),
-        account.getOwnerId().value(),
-        account.getCurrency().getCurrencyCode(),
-        account.getBalance().amount(),
-        account.getStatus().name(),
-        account.getOpenedAt()
-    );
-}
-```
-
-Yeni field eklediğinde mapper'ı unutursan response'da o field eksik → bug.
-
-**MapStruct** annotation-processor ile compile-time mapper üretir:
+**MapStruct** bu kodu annotation-processor ile compile-time'da senin yerine üretir:
 
 ```java
 @Mapper(componentModel = "spring")
@@ -412,14 +384,7 @@ public interface AccountMapper {
 }
 ```
 
-**Avantajlar:**
-- Compile-time hata: eksik mapping varsa derleyici uyarır
-- Performans: reflection yok, generated code direct
-- Type-safe
-
-**Dezavantajlar:**
-- Setup biraz daha karmaşık (annotation processor)
-- Custom mapping için boilerplate
+Kazandıkların: eksik mapping'de **compile-time hata**, reflection'sız hızlı generated code, type-safety. Bedeli: annotation processor setup'ı ve custom mapping'lerde biraz boilerplate.
 
 **Maven setup:**
 ```xml
@@ -450,7 +415,7 @@ public interface AccountMapper {
 </build>
 ```
 
-**Lombok ile birlikte kullanırken:** annotation processor sırası önemli. `lombok-mapstruct-binding` ekle:
+Lombok ile birlikte kullanacaksan annotation processor sırası önemli — `lombok-mapstruct-binding` ekle:
 
 ```xml
 <path>
@@ -460,7 +425,8 @@ public interface AccountMapper {
 </path>
 ```
 
-**Banking pratiği:** Mapper'lar **adapter katmanında** durur, domain'de değil.
+Peki mapper'lar nerede yaşar? **Adapter katmanında**, domain'de değil:
+
 ```
 banking/account/adapter/in/web/AccountWebMapper.java
 banking/account/adapter/out/persistence/AccountPersistenceMapper.java
@@ -475,14 +441,13 @@ flowchart LR
 ```
 
 ```admonish warning title="Dikkat"
-İki farklı mapper — biri HTTP DTO ↔ domain, diğeri JPA entity ↔ domain. **Karıştırma.**
+İki farklı mapper var — biri HTTP DTO ↔ domain, diğeri JPA entity ↔ domain. **Karıştırma.**
 ```
 
 ### 9. Lombok — kullan veya kullanma kararı
 
-[Project Lombok](https://projectlombok.org/) annotation-processor — `@Data`, `@Getter`, `@Builder`, `@AllArgsConstructor` ile boilerplate kısaltır.
+[Project Lombok](https://projectlombok.org/), `@Data`, `@Getter`, `@Builder` gibi annotation'larla boilerplate'i kısaltan bir annotation processor:
 
-**Yaygın kullanım:**
 ```java
 @Data                       // getter+setter+toString+equals+hashCode
 @AllArgsConstructor
@@ -495,19 +460,13 @@ public class AccountEntity {
 }
 ```
 
-**Pro:**
-- Daha az kod
-- Hata oranı düşük
-- Refactoring kolay
+Artıları net: daha az kod, düşük hata oranı, kolay refactoring. Eksileri de ciddi:
 
-**Contra:**
-- IDE entegrasyonu gerekli (plugin)
-- Annotation processor'a bağımlılık
-- Generated kod görünmez → debug zor
-- `@Data` mutable yapı yaratır → domain modelinde tehlikeli (setter eklenmesin!)
-- `@Builder` constructor immutability'i bypass eder
+- IDE plugin'i gerekir; generated kod görünmez → debug zor
+- `@Data` mutable yapı yaratır → **domain modelinde tehlikeli** (setter eklenmesin!)
+- `@Builder` constructor'daki invariant kontrollerini bypass eder
 
-**Banking'de pragmatik karar:**
+Banking'de pragmatik karar tablosu:
 
 | Yer | Lombok? |
 |---|---|
@@ -516,14 +475,11 @@ public class AccountEntity {
 | DTO | `record` tercih, gerekirse Lombok `@Value` (immutable) |
 | Test helper | Evet — `@Builder` özellikle iyi |
 
-**Banking'de domain'de Lombok TARTIŞMALI.** Bazı ekipler hiç istemiyor (görünmezlik). Bu projede:
-- Domain: `record` veya manuel (Lombok yok)
-- Entity ve DTO: `record` (Java 16+ ile artık standart)
-- Lombok'u sadece JPA entity'de `@Getter`/`@Setter` için kullan, `@Data` kullanma
+Domain'de Lombok **tartışmalı** — bazı ekipler görünmezlik yüzünden hiç istemiyor. Bu projedeki kararımız: domain'de `record` veya manuel (Lombok yok); DTO'lar `record`; Lombok sadece JPA entity'de `@Getter`/`@Setter` için, `@Data` asla.
 
-### 10. `record` vs class vs Lombok — modern Java karar
+### 10. `record` vs class vs Lombok — modern Java kararı
 
-Java 16+ ile `record` immutable data class:
+Java 16+ ile `record`, immutable data class'ı dile gömdü — çoğu DTO için Lombok'a gerek kalmadı:
 
 ```java
 public record AccountResponse(
@@ -536,37 +492,21 @@ public record AccountResponse(
 ) {}
 ```
 
-Otomatik:
-- final fields, no setter
-- constructor with all fields
-- accessor methods (`id()`, mapping ile getter ismi farklı)
-- `equals`, `hashCode`, `toString`
+Otomatik gelenler: final field'lar (setter yok), all-args constructor, accessor'lar (`id()` — getter ismi farklı), `equals`/`hashCode`/`toString`. DTO'lar immutable ve veri-odaklı olduğu için **banking'e ideal**.
 
-**Banking için ideal**: DTO'lar genelde immutable ve veri-odaklı.
+Sınırları da bil: inheritance yok (record final), mutability yok, built-in builder yok. Modern Java standardı buna göre şekillenir:
 
-**Sınırları:**
-- Inheritance yok (record final)
-- Custom mutability yok
-- Builder pattern doğrudan yok (kendin yazarsın veya kütüphane)
-
-**Modern Java standardı:**
-- DTO → `record`
-- Domain value object → `record`
+- DTO ve domain value object → `record`
 - Domain entity (mutable) → manuel class
-- JPA entity → manuel class (record JPA ile sorunlu, hala değişiyor)
+- JPA entity → manuel class (record JPA ile sorunlu — proxy gerektirir, record final)
 
 ### 11. JSON serialization tuning — Jackson
 
-#### Date/time
+DTO'yu yazdın; ama JSON'a nasıl çevrildiği de kontrat parçası. Dört ayar noktası var.
 
-Default Jackson `Instant` ISO-8601:
-```json
-"openedAt": "2025-05-12T10:30:00Z"
-```
+**Date/time:** Jackson default'u `Instant` için ISO-8601 — `"openedAt": "2025-05-12T10:30:00Z"`. Bu iyi; custom format gerekirse `@JsonFormat`.
 
-İyi. Custom format gerekirse `@JsonFormat` ile.
-
-#### BigDecimal
+**BigDecimal:** scientific notation tuzağına dikkat:
 
 ```yaml
 spring:
@@ -575,7 +515,7 @@ spring:
       WRITE_BIGDECIMAL_AS_PLAIN: true   # 1.5E2 yerine 150
 ```
 
-JavaScript client'lar için `BigDecimal`'i **string olarak yazmak** daha güvenli:
+JavaScript client'lar float precision kaybettiği için `BigDecimal`'i **string olarak yazmak** daha güvenli:
 
 ```java
 @JsonProperty("amount")
@@ -583,9 +523,9 @@ JavaScript client'lar için `BigDecimal`'i **string olarak yazmak** daha güvenl
 private BigDecimal amount;
 ```
 
-Bunu DTO-level'da yapmak yerine custom `ObjectMapper` configuration ile yap.
+Bunu her DTO'da tekrarlamak yerine custom `ObjectMapper` configuration ile merkezi yap.
 
-#### Null handling
+**Null handling:**
 
 ```yaml
 spring:
@@ -593,31 +533,27 @@ spring:
     default-property-inclusion: NON_NULL    # null field'lar JSON'a dahil olmaz
 ```
 
-Banking'de tercih genelde **explicit null** (`"closedAt": null` daha okunabilir). Karar ekibe ait. Tutarlı ol.
+Banking'de tercih genelde **explicit null** (`"closedAt": null` daha okunabilir). Karar ekibe ait — tutarlı ol.
 
-#### Property naming
-
-Java `camelCase`, JSON convention farklı olabilir:
+**Property naming:** Java `camelCase`, JSON convention farklı olabilir:
 
 ```yaml
 spring:
   jackson:
-    property-naming-strategy: SNAKE_CASE
+    property-naming-strategy: SNAKE_CASE    # JSON'da owner_id, Java'da ownerId
 ```
 
-→ JSON'da `owner_id`, Java'da `ownerId`.
+TR bankalarında çoğunlukla **camelCase JSON** kullanılır; bu projede de camelCase ile devam ediyoruz.
 
-TR bankalarında **çoğunlukla camelCase JSON** kullanılır. Karar ekibe ait. Bu projede `camelCase` ile devam edelim.
+### 12. API versioning
 
-### 12. Versioning API
+API yayınlandığı an client'lar ona bağımlı olur; breaking change yapmanın tek güvenli yolu versioning. Banking'de **şart**. Üç yöntem:
 
-Banking'de API versioning **şart**. Yöntemler:
-
-1. **URL versioning:** `/v1/accounts`, `/v2/accounts`
+1. **URL versioning:** `/v1/accounts`, `/v2/accounts` — en explicit, banking'de yaygın
 2. **Header versioning:** `Accept: application/vnd.mavibank.v2+json`
 3. **Query parameter:** `?version=2` (kötü, kaçın)
 
-URL versioning en explicit ve banking'de yaygın. Bu projede `/v1/` prefix kullanacağız:
+Bu projede `/v1/` prefix kullanacağız:
 
 ```java
 @RestController
@@ -625,13 +561,11 @@ URL versioning en explicit ve banking'de yaygın. Bu projede `/v1/` prefix kulla
 class AccountController { ... }
 ```
 
-Yeni bir versiyon eklenince:
-- `/v1/accounts` çalışmaya devam eder (backward compat)
-- `/v2/accounts` yeni özelliklerle
+Yeni versiyon geldiğinde `/v1/accounts` çalışmaya devam eder (backward compat), `/v2/accounts` yeni özellikleri taşır.
 
 ### 13. HATEOAS — ne, neden, ne zaman?
 
-REST'in 4. seviyesi (Richardson Maturity Model) HATEOAS — response'ta ilgili kaynakların link'leri.
+REST'in en üst seviyesi (Richardson Maturity Model) HATEOAS: response'ta ilgili kaynakların link'leri gelir.
 
 ```json
 {
@@ -645,13 +579,11 @@ REST'in 4. seviyesi (Richardson Maturity Model) HATEOAS — response'ta ilgili k
 }
 ```
 
-Spring HATEOAS kütüphanesi destekler.
-
-**Banking'de yaygın değil.** Çoğu zaman client uygulama URL pattern'lerini biliyor, HATEOAS overhead'i değmez. Bu projede **kullanmayacağız** ama bilmen iyi.
+Spring HATEOAS kütüphanesi bunu destekler. Ama **banking'de yaygın değil**: client zaten URL pattern'lerini biliyor, overhead'i değmez. Bu projede kullanmayacağız — ama mülakatlarda ve mimari tartışmalarda karşına çıkar, tanı.
 
 ### 14. OpenAPI / Swagger — API documentation
 
-`springdoc-openapi` ile otomatik dokümantasyon:
+API'ni kimse dokümansız kullanamaz; elle doküman yazmak da hızla eskir. `springdoc-openapi` dokümantasyonu koddan otomatik üretir:
 
 ```xml
 <dependency>
@@ -661,9 +593,7 @@ Spring HATEOAS kütüphanesi destekler.
 </dependency>
 ```
 
-`http://localhost:8080/swagger-ui.html` adresinde otomatik UI.
-
-DTO'larına `@Schema` annotation'ı ekle:
+`http://localhost:8080/swagger-ui.html` adresinde otomatik UI açılır. Kaliteyi artırmak için DTO'lara `@Schema` ekle:
 
 ```java
 public record OpenAccountRequest(
@@ -675,7 +605,7 @@ public record OpenAccountRequest(
 ) {}
 ```
 
-Endpoint'lere `@Operation`:
+Endpoint'lere de `@Operation`:
 
 ```java
 @Operation(summary = "Open a new account", 
@@ -684,7 +614,7 @@ Endpoint'lere `@Operation`:
 public ResponseEntity<AccountResponse> open(...) { ... }
 ```
 
-**Banking'de OpenAPI dokümantasyonu standart**. Internal team, client team, external partner hepsi kullanır.
+Banking'de OpenAPI dokümantasyonu **standart** — internal team, client team, external partner hepsi kullanır.
 
 ---
 

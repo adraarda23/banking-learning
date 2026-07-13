@@ -1024,7 +1024,7 @@ Her madde için PASS / FAIL / EKSIK işaretle. Kod yazma.
 - [ ] Bitmap index'in OLTP'de neden zararlı olduğunu söyleyebilirim
 - [ ] Banking için core index seti (`accounts`, `transactions`, `journal_lines`) tasarlayabilirim
 
-→ Sonraki: [02-execution-plan-tuning/](../02-execution-plan-tuning/README.md)
+→ Sonraki: [02-execution-plan-tuning/](../02-execution-plan-tuning/index.md)
 
 ---
 

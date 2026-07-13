@@ -1127,7 +1127,7 @@ Her madde için PASS / FAIL / EKSIK ve kanıt. Kod yazma.
 - [ ] Tüm `@ManyToOne` explicit LAZY (code review yaptım)
 - [ ] Anti-pattern listesi rahat — özellikle "pagination + collection JOIN FETCH", "EAGER cascade"
 
-Hepsi onaylı → Topic 2.6'ya geç → [06-connection-pool/](../06-connection-pool/README.md)
+Hepsi onaylı → Topic 2.6'ya geç → [06-connection-pool/](../06-connection-pool/index.md)
 
 ---
 

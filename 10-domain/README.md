@@ -96,4 +96,4 @@ Bu faz bittiğinde sen sadece "Java backend bilen junior" değil, "Java backend 
 
 Faz 11 DevOps (CI/CD, containerization, deploy) ve Faz 12 Testing'in derinleşmiş hâli olacak. Domain bilgisi onları renklendirecek — "Bu pipeline'da Flyway migration sırasında bir AML rule update nasıl rollout edilir?" gibi soruları rahat cevaplayacaksın.
 
-→ İlk topic: [01-double-entry-accounting/](./01-double-entry-accounting/README.md)
+→ İlk topic: [01-double-entry-accounting/](./01-double-entry-accounting/index.md)

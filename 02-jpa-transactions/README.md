@@ -12,16 +12,16 @@ Sonunda elinde: `core-banking` projesinde **race condition'a karşı dirençli**
 
 ## Topic sırası
 
-1. **[JPA Fundamentals & Entity Lifecycle](./01-jpa-fundamentals/README.md)** — persistence context, entity states, dirty checking, flush modes
-2. **[Spring Data JPA & Repositories](./02-spring-data-jpa/README.md)** — JpaRepository, derived queries, projections, pagination
-3. **[Transaction Management](./03-transactions/README.md)** — `@Transactional` propagation (7 türü), isolation level, banking senaryoları
-4. **[Locking](./04-locking/README.md)** — optimistic (`@Version`), pessimistic (`SELECT FOR UPDATE`), deadlock fix, retry pattern
-5. **[N+1 Problem & Fetch Strategies](./05-n-plus-one/README.md)** — tespit, `@EntityGraph`, JOIN FETCH, DTO projection
-6. **[HikariCP Connection Pool](./06-connection-pool/README.md)** — pool sizing formula, banking pattern, leak detection, PgBouncer
-7. **[Hibernate Performance](./07-hibernate-performance/README.md)** — batch insert, statement cache, second-level cache, identity vs sequence
+1. **[JPA Fundamentals & Entity Lifecycle](./01-jpa-fundamentals/index.md)** — persistence context, entity states, dirty checking, flush modes
+2. **[Spring Data JPA & Repositories](./02-spring-data-jpa/index.md)** — JpaRepository, derived queries, projections, pagination
+3. **[Transaction Management](./03-transactions/index.md)** — `@Transactional` propagation (7 türü), isolation level, banking senaryoları
+4. **[Locking](./04-locking/index.md)** — optimistic (`@Version`), pessimistic (`SELECT FOR UPDATE`), deadlock fix, retry pattern
+5. **[N+1 Problem & Fetch Strategies](./05-n-plus-one/index.md)** — tespit, `@EntityGraph`, JOIN FETCH, DTO projection
+6. **[HikariCP Connection Pool](./06-connection-pool/index.md)** — pool sizing formula, banking pattern, leak detection, PgBouncer
+7. **[Hibernate Performance](./07-hibernate-performance/index.md)** — batch insert, statement cache, second-level cache, identity vs sequence
 
 Sonra:
-- **[Mini-project](./mini-project/README.md)** — `core-banking`'i locking + N+1 fix + pool tuning ile genişlet, **deadlock'u canlı reprodüksiyon + fix**
+- **[Mini-project](./mini-project/index.md)** — `core-banking`'i locking + N+1 fix + pool tuning ile genişlet, **deadlock'u canlı reprodüksiyon + fix**
 - **[PHASE_TEST.md](./PHASE_TEST.md)** — Phase 3'e geçmeden kendini sına
 
 ## Faz 2'nin sonunda olman gereken yer

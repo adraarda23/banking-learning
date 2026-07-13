@@ -26,56 +26,41 @@ Okuma: 1.5 saat • Mini task: 2.5 saat • Test: 1 saat • Toplam: ~5 saat
 
 ## Kavramlar
 
-### 1. Neden migration tool gerekli — banking gerçeği
+### 1. Neden migration tool gerekli?
 
-Bir banking schema'sı 10 yılda yüzlerce değişir:
-- Yeni kolon (`risk_score`)
-- Index ekleme (performans için)
-- Yeni tablo (yeni feature)
-- Tip değişikliği (`VARCHAR(50)` → `VARCHAR(100)`)
-- Constraint ekleme/kaldırma
+Bir banking schema'sı 10 yılda yüzlerce kez değişir: yeni kolon, yeni tablo, index, tip değişikliği, constraint. Soru şu: bu değişiklikleri kim, hangi sırayla, hangi ortamda uyguladı?
 
-**Yapma yolu (kötü):**
-- DBA elle production'da SQL çalıştırır
-- Dev environment ile prod arasında schema farkı oluşur
-- "Hangi script'i çalıştırdık, hangisini çalıştırmadık?" karmaşası
-- Rollback nedir, nasıl olur?
-- Yeni developer'a "lokali kur" demek = 4 saat çile
+Kötü senaryoyu bilirsin: DBA elle production'da SQL çalıştırır, dev ile prod arasında schema farkı oluşur, "hangi script'i çalıştırdık?" karmaşası başlar. Yeni gelen developer'a "lokali kur" demek 4 saatlik çile demektir.
 
-**Yapma yolu (iyi):**
-- Schema değişiklikleri **versiyonlu SQL dosyaları** olarak repo'da
-- Uygulama başladığında veya pipeline'da otomatik çalıştırılır
-- Hangi versiyona kadar uygulandığı **DB'de bir tabloda** yazılı
+İyi yol ise değişiklikleri kod gibi yönetmek:
+
+- Schema değişiklikleri **versiyonlu SQL dosyaları** olarak repo'da durur
+- Uygulama başlarken veya pipeline'da otomatik uygulanır
+- Hangi versiyona kadar gelindiği **DB'deki bir tabloda** yazılıdır
 - Yeni developer: `mvn spring-boot:run` → DB otomatik kurulur
 
-Bu disiplin **migration tool**'ları sağlar. En yaygın ikisi:
-
-- **Flyway** — basit, dosya-bazlı, SQL odaklı (TR bankalarında yaygın)
-- **Liquibase** — XML/YAML/JSON desteği, daha karmaşık ama daha esnek
-
-Bu projede **Flyway** kullanıyoruz. Liquibase'i de tanıyacaksın (sondaki karşılaştırma bölümü).
+Bu disiplini **migration tool**'lar sağlar. En yaygın ikisi: **Flyway** (basit, dosya-bazlı, SQL odaklı — TR bankalarında yaygın) ve **Liquibase** (XML/YAML desteği, daha esnek ama karmaşık). Bu projede Flyway kullanıyoruz; Liquibase'i sondaki karşılaştırmada tanıyacaksın.
 
 ### 2. Flyway temelleri
 
 #### Çalışma prensibi
 
+Flyway'in mantığı basit: dosyalara bak, DB'deki kayıtla karşılaştır, eksikleri sırayla uygula.
+
 1. `src/main/resources/db/migration/` klasörü taranır
-2. Dosya adı `V{version}__{description}.sql` formatında
-3. DB'de `flyway_schema_history` tablosu otomatik yaratılır
-4. Henüz uygulanmamış migration'lar **sırayla** çalıştırılır
-5. Her başarılı uygulamada history tablosuna satır eklenir
-6. Aynı dosya **bir kez** uygulanır — script'i değiştirmek = checksum hatası
+2. DB'de `flyway_schema_history` tablosu otomatik yaratılır
+3. Henüz uygulanmamış migration'lar **sırayla** çalıştırılır, her biri history'e yazılır
+4. Aynı dosya **bir kez** uygulanır — sonradan değiştirmek = checksum hatası
 
 ```mermaid
-flowchart TD
-    A["Uygulama başlar"] --> B["db/migration klasörü taranır"]
-    B --> C["flyway_schema_history okunur"]
-    C --> D{"Uygulanmamış migration var mı?"}
-    D -->|"Evet"| E["Sıradaki migration'ı çalıştır"]
-    E --> F["History tablosuna satır ekle"]
-    F --> D
-    D -->|"Hayır"| G["Checksum'ları doğrula"]
-    G --> H["Uygulama devam eder"]
+flowchart LR
+    A["Uygulama başlar"] --> B["Migration klasörü taranır"]
+    B --> C["History tablosu okunur"]
+    C --> D{"Yeni migration var mı?"}
+    D -->|"Evet"| E["Sırayla uygula, history'e yaz"]
+    E --> D
+    D -->|"Hayır"| F["Checksum doğrula"]
+    F --> G["Uygulama devam eder"]
 ```
 
 #### Dosya adlandırma
@@ -88,38 +73,29 @@ V4.1__add_index_on_account_owner.sql
 V20251215.1__add_iban_column.sql
 ```
 
-Format kuralları:
-- `V` prefix (versioned migration)
-- Version number — dot ile ayrılabilir (`1`, `1.1`, `1.1.1`)
-- **İki underscore** (`__`)
-- Description — `_` veya space kabul
-- `.sql` extension
+Format şöyle çözülür: `V` prefix + version number (dot ile ayrılabilir: `1`, `1.1`) + **iki underscore** (`__`) + description + `.sql`. En sık yapılan hata tek underscore koymak — Flyway dosyayı görmezden gelir.
 
-**Version sıralama:**
-- `V1`, `V2`, `V2.1`, `V2.10`, `V3` — string değil **numeric** sıralanır
-- `V1.10` > `V1.2` (10 > 2)
+Sıralama string değil **numeric** yapılır: `V1.10 > V1.2` çünkü 10 > 2.
 
 ```admonish tip title="İpucu"
-**Banking pratiği:** Timestamp-based versioning (`V20251215_120000__add_iban.sql`) — ekip içinde aynı versiyon çakışmasını engeller. Veya sequential (`V1`, `V2`, ...) — küçük ekipte iyi.
+**Banking pratiği:** Timestamp-based versioning (`V20251215_120000__add_iban.sql`) ekip içinde aynı versiyon çakışmasını engeller. Küçük ekipte sequential (`V1`, `V2`, ...) yeterli.
 ```
 
 #### Migration türleri
 
-**Versioned (`V`):** En yaygın. Bir kez uygulanır. Checksum kontrolü var.
+| Tür | Prefix | Davranış | Ne için |
+|---|---|---|---|
+| Versioned | `V` | Bir kez uygulanır, checksum kontrolü var | Tablo, kolon, index — asıl iş |
+| Repeatable | `R` | İçerik değişince yeniden uygulanır | View, stored procedure, function |
+| Undo | `U` | Flyway Pro/Teams (paralı), open source'ta YOK | Banking'de zaten kullanmayız |
 
-**Repeatable (`R`):** Her değişiklikte tekrar çalıştırılır. Stored procedure, view, function gibi tanımlar için ideal.
+Repeatable örneği: `R__create_balance_summary_view.sql` — bu dosyayı düzenleyebilirsin, checksum değişince Flyway yeniden uygular.
 
-```
-R__create_balance_summary_view.sql
-```
-
-Bu dosyayı düzenleyebilirsin — checksum değişince Flyway yeniden uygular.
-
-**Undo (`U`):** Flyway Pro/Teams (paralı) özelliği. Open source'ta YOK. Banking'de rollback'i farklı yöntemle yaparız (forward migration ile düzeltme — sonra anlatacağım).
+Undo yoksa rollback nasıl olur? Forward migration ile düzeltme — Kural 6'da anlatacağım.
 
 ### 3. İlk migration — `accounts` tablosu
 
-`src/main/resources/db/migration/V1__create_accounts_table.sql`:
+Teoriyi gördün, şimdi gerçek bir banking tablosu yazalım. `src/main/resources/db/migration/V1__create_accounts_table.sql`:
 
 ```sql
 CREATE TABLE accounts (
@@ -140,63 +116,60 @@ CREATE INDEX idx_accounts_owner_id ON accounts(owner_id);
 CREATE INDEX idx_accounts_status ON accounts(status) WHERE status != 'CLOSED';
 ```
 
-**Anahtar noktalar:**
+Her satırın bir sebebi var:
 
-- **`UUID` primary key** — distributed sistem için iyi (Phase 7'de microservice'e bölünce). Sequential ID (`BIGSERIAL`) de yaygın, banka tercihine bağlı.
-- **`NUMERIC(19, 4)`** — `BigDecimal` karşılığı. 4 decimal yer ileride mikro-faiz için. 19 toplam basamak → ~10^15 TRY (yeterli).
+- **`UUID` primary key** — distributed sistem için iyi (Phase 7'de microservice'e bölünce). Sequential `BIGSERIAL` de yaygın, banka tercihine bağlı.
+- **`NUMERIC(19, 4)`** — `BigDecimal` karşılığı. 4 decimal ileride mikro-faiz için, 19 basamak ~10^15 TRY'ye yeter.
 - **`CHAR(3)`** — currency ISO kodu sabit 3 karakter.
 - **`status` CHECK constraint** — domain enum'una karşılık DB-level guarantee.
 - **`version` BIGINT** — optimistic locking için (Phase 2'de detay).
-- **`TIMESTAMP WITH TIME ZONE`** — banka multi-region olabilir, timezone-aware lazım. Bare `TIMESTAMP` yerine **her zaman** `TIMESTAMPTZ`.
-- **Partial index** (`WHERE status != 'CLOSED'`) — kapalı hesaplara index ayırmak gereksiz, daha küçük index daha hızlı.
+- **`TIMESTAMP WITH TIME ZONE`** — banka multi-region olabilir. Bare `TIMESTAMP` yerine **her zaman** `TIMESTAMPTZ`.
+- **Partial index** (`WHERE status != 'CLOSED'`) — kapalı hesaplara index ayırmak gereksiz; küçük index hızlı index demektir.
 
-### 4. Banking schema migration kuralları (zor öğrenilenler)
+### 4. Banking migration kuralları (zor öğrenilenler)
 
-#### Kural 1: Migration'ı **edit etme** (production'a gittikten sonra)
+Bu 7 kuralın her biri production'da yaşanmış bir acıdan doğdu. Tek tek gidelim.
+
+#### Kural 1: Uygulanmış migration'ı edit etme
 
 ```admonish warning title="Dikkat"
 Bir migration uygulandıktan sonra dosyayı değiştirme. Flyway checksum tutar — dosya içeriği değişirse validate aşamasında hata alırsın.
 ```
 
-Flyway checksum tutar:
+`V2__add_status_column.sql` uygulandı, checksum kaydedildi. Sonradan içeriği değiştirirsen:
 
-```
-V2__add_status_column.sql  (checksum: abc123)
-```
-
-Sonradan içeriği değiştirirsen:
 ```
 ERROR: Validate failed: Migration checksum mismatch for migration version 2
 ```
 
 **Doğru yol:** Yeni migration ekle (`V3__alter_status_column.sql`).
 
-#### Kural 2: Migration'lar **idempotent değildir** ama defensive yaz
+#### Kural 2: Defensive yaz
 
-`CREATE TABLE accounts` ikinci kez çalıştırılırsa hata. Flyway her migration'ı bir kez çalıştırır, ama yine de **defensive yaz**:
+Flyway her migration'ı bir kez çalıştırır, yani `CREATE TABLE accounts` normalde ikinci kez çalışmaz. Yine de defensive yazmak iyi alışkanlıktır:
 
 ```sql
 CREATE TABLE IF NOT EXISTS accounts (...);
 ```
 
 ```admonish tip title="İpucu"
-Defensive yazım (`IF NOT EXISTS` gibi) acil onarımda elle çalıştırırken hayatını kurtarır.
+Defensive yazım (`IF NOT EXISTS` gibi) acil onarımda script'i elle çalıştırman gerektiğinde hayatını kurtarır.
 ```
 
-#### Kural 3: Migration **atomic olmayabilir**
+#### Kural 3: Migration atomic olmayabilir
 
-DDL statement'leri çoğu DB'de transaction içinde çalışmaz veya kısmen çalışır. Multi-statement migration **yarıda kalabilir**. Flyway'in onu nasıl handle ettiğini bilmek lazım:
+DDL statement'leri her DB'de transaction içinde çalışmaz. Yani multi-statement bir migration **yarıda kalabilir**:
 
-- **Auto-commit DB (Oracle 11g, MySQL 5.x):** Her DDL statement implicit commit. Yarıda kalma → manuel temizlik.
-- **PostgreSQL:** DDL transaction içinde, rollback mümkün. Flyway tüm migration'ı tek transaction'da çalıştırır (default).
+- **PostgreSQL:** DDL transaction içinde çalışır, rollback mümkün. Flyway tüm migration'ı tek transaction'da çalıştırır (default).
+- **Auto-commit DB'ler (Oracle 11g, MySQL 5.x):** Her DDL implicit commit. Yarıda kalma → manuel temizlik.
 
-Banking'de Oracle yaygın → migration'larını **küçük parçalara böl**, her biri 1-2 statement.
+Banking'de Oracle yaygın olduğundan alışkanlık edin: migration'ları **küçük parçalara böl**, her biri 1-2 statement.
 
-#### Kural 4: Production'da migration **yarış kuralı** var
+#### Kural 4: Migration yarışı
 
-`Application 1` ve `Application 2` aynı anda başlarsa, ikisi de migration uygulamaya çalışır. Flyway DB-level lock kullanır → ikinci bekler, sonra hiçbir şey uygulamadığını görür. Genelde sorunsuz.
+İki app instance aynı anda başlarsa ikisi de migration uygulamaya çalışır. Flyway DB-level lock kullanır: ikinci bekler, sonra yapılacak iş kalmadığını görür. Genelde sorunsuz.
 
-Ama **çok büyük migration** (örn. 1M satırlık tabloya kolon ekleme + populate) sırasında diğer app'ler timeout alabilir. Banking'de bu yüzden **migration ayrı job'da** çalıştırılır, app'ler "schema hazır" varsayar:
+Ama **çok büyük migration** (örn. 1M satırlık tabloya kolon ekleme + populate) sırasında diğer app'ler timeout alabilir. Banking'de bu yüzden migration **ayrı bir job'da** çalıştırılır, app'ler "schema hazır" varsayar:
 
 ```yaml
 spring:
@@ -204,25 +177,24 @@ spring:
     enabled: false   # app'te kapat
 ```
 
-CI/CD pipeline'da explicit Flyway job çalıştır.
+CI/CD pipeline'da explicit Flyway job çalıştırılır.
 
-#### Kural 5: Backward-compatible migration
+#### Kural 5: Backward-compatible migration (expand-contract)
 
-Banking'de **zero-downtime deployment** standardır. Migration backward-compatible olmalı:
+Banking'de **zero-downtime deployment** standarttır: deploy sırasında eski ve yeni kod versiyonu aynı anda çalışır. Migration ikisiyle de uyumlu olmalı.
 
 **Yanlış:**
 ```sql
 ALTER TABLE accounts RENAME COLUMN balance_amount TO balance;
 ```
 
-Sonuç: Eski versiyon "balance_amount" arıyor, yeni "balance" — eski hâlâ çalışıyorsa patlar.
+Eski versiyon hâlâ `balance_amount` arıyor — anında patlar.
 
-**Doğru — 3 adımlı expand-contract:**
-1. **Expand:** `ALTER TABLE accounts ADD COLUMN balance NUMERIC(19,4); UPDATE accounts SET balance = balance_amount;` (uygulamanın iki kolon da yazmasını sağla)
-2. **Migrate code:** Yeni versiyon `balance` kolonunu okuyacak şekilde deploy
+**Doğru — 3 adımlı expand-contract, 3 ayrı release:**
+
+1. **Expand:** `ALTER TABLE accounts ADD COLUMN balance NUMERIC(19,4); UPDATE accounts SET balance = balance_amount;` — uygulama iki kolona da yazar
+2. **Migrate:** Yeni versiyon `balance` kolonunu okuyacak şekilde deploy edilir
 3. **Contract:** Eski versiyon retire olunca `ALTER TABLE accounts DROP COLUMN balance_amount;`
-
-3 ayrı release.
 
 ```mermaid
 flowchart LR
@@ -230,37 +202,28 @@ flowchart LR
     B --> C["Release 3: Contract<br/>eski kolonu sil"]
 ```
 
-#### Kural 6: Rollback strategy
+#### Kural 6: Rollback = forward-fix
 
-Banking'de migration rollback = **forward migration ile düzeltme**, geri alma değil.
+Banking'de migration rollback demek **geri almak değil, ileri düzelten yeni migration yazmak** demektir:
 
 ```
 V5__add_fee_column.sql              ← üretime gitti
 V6__revert_fee_column.sql           ← V5'i geri al (DROP COLUMN fee)
 ```
 
-Sebep:
-- Migration history tutarlı kalır
-- Audit trail temiz
-- "Önceki versiyona dön" gerçek dünyada problemli
+Sebep: migration history tutarlı kalır, audit trail temiz olur ve "önceki versiyona dön" gerçek dünyada zaten problemlidir.
 
 #### Kural 7: Schema migration ≠ data migration
 
 ```admonish warning title="Dikkat"
-Büyük data migration (örn. 10M satırı yeniden hesapla) Flyway'de **çalıştırma**. Sebep:
-- Uzun sürer (saatlerce) → app boot block olur
-- Atomic değil
-- Hata durumunda parçalı
+Büyük data migration (örn. 10M satırı yeniden hesapla) Flyway'de **çalıştırma**: saatlerce sürer ve app boot'u bloklar, atomic değildir, hata durumunda parçalı kalır.
 ```
 
-Onun yerine:
-- Schema değişikliğini Flyway'le yap (`ADD COLUMN`)
-- Data populate'i ayrı **batch job** (Phase 5'te Spring Batch ile)
-- Job idempotent, restartable
+Doğru iş bölümü: schema değişikliğini Flyway'le yap (`ADD COLUMN`), data populate'i ayrı bir **batch job**'a ver (Phase 5'te Spring Batch ile). Job idempotent ve restartable olmalı.
 
 ### 5. PostgreSQL Docker ile local setup
 
-`~/projects/core-banking/docker-compose.yml`:
+Migration'ları denemek için gerçek bir PostgreSQL lazım. `~/projects/core-banking/docker-compose.yml`:
 
 ```yaml
 services:
@@ -302,9 +265,9 @@ spring:
     password: dev_password
 ```
 
-### 6. Flyway'in `flyway_schema_history` tablosu
+### 6. `flyway_schema_history` tablosu
 
-İlk migration sonrası DB'de:
+Flyway'in hafızası bu tablo. İlk migration sonrası bakarsan:
 
 ```sql
 SELECT * FROM flyway_schema_history;
@@ -315,18 +278,12 @@ SELECT * FROM flyway_schema_history;
 | 1 | 1 | create accounts table | SQL | V1__create_accounts_table.sql | -1234567890 | banking_dev | 2025-... | 45 | true |
 
 ```admonish warning title="Dikkat"
-Bu tabloyu **elle değiştirme** (production'da locked permissions ile koruman lazım). Sadece okumak için.
+Bu tabloyu **elle değiştirme** — sadece okumak için. Production'da locked permissions ile korunması gerekir.
 ```
 
-### 7. Flyway Spring Boot otomatik entegrasyon
+### 7. Spring Boot entegrasyonu
 
-`pom.xml`'da `flyway-core` ve `postgresql` driver → Spring Boot otomatik:
-
-1. App başlangıcında DataSource hazırlar
-2. Flyway'i çalıştırır (datasource ile)
-3. `db/migration` klasörünü tarar
-4. Yeni migration'ları uygular
-5. Sonra Hibernate'i başlatır (`ddl-auto: validate` ile schema'yı doğrular)
+`pom.xml`'da `flyway-core` ve `postgresql` driver varsa Spring Boot gerisini kendisi bağlar: DataSource hazır olunca Flyway'i çalıştırır, migration'lar biter, **sonra** Hibernate başlar ve `ddl-auto: validate` ile schema'yı doğrular.
 
 ```mermaid
 sequenceDiagram
@@ -362,13 +319,13 @@ spring:
 
 ### 8. Migration testing
 
-Migration script'leri **test edilir**. Test stratejileri:
+Migration da koddur, kod test edilir. Üç strateji var:
 
-1. **TestContainers ile gerçek PostgreSQL** — her test'te taze container, migration'lar otomatik uygulanır → assertion'lar yaz
-2. **Test profili ile shared TestContainer** — daha hızlı, ama isolation azalır
-3. **H2 in-memory** — hızlı ama PostgreSQL dialect'i tam taklit etmez (banking için **uygun değil**)
+1. **TestContainers ile gerçek PostgreSQL** — her test'te taze container, migration'lar otomatik uygulanır, assertion yazarsın
+2. **Shared TestContainer** — daha hızlı ama isolation azalır
+3. **H2 in-memory** — hızlı ama PostgreSQL dialect'ini tam taklit etmez → banking için **uygun değil**
 
-Banking projesinde **TestContainers + PostgreSQL** standard.
+Banking projesinde standart: **TestContainers + PostgreSQL**.
 
 ```java
 @Testcontainers
@@ -393,18 +350,6 @@ class MigrationIntegrationTest {
     }
     
     @Test
-    void accountsShouldHaveBalanceColumn() {
-        String dataType = jdbcTemplate.queryForObject(
-            """
-            SELECT data_type FROM information_schema.columns 
-            WHERE table_name = 'accounts' AND column_name = 'balance_amount'
-            """,
-            String.class
-        );
-        assertThat(dataType).isEqualTo("numeric");
-    }
-    
-    @Test
     void accountStatusCheckShouldRejectInvalidValue() {
         assertThatThrownBy(() ->
             jdbcTemplate.update(
@@ -416,20 +361,16 @@ class MigrationIntegrationTest {
 }
 ```
 
-`@ServiceConnection` Spring Boot 3.1+ — TestContainer'ın connection bilgilerini otomatik Spring DataSource'una bağlar. Manuel `@DynamicPropertySource` gerekmez.
+Dikkat et: schema'yı `information_schema` üzerinden sorguluyoruz — tablo var mı, kolon tipi ne, constraint çalışıyor mu. `@ServiceConnection` (Spring Boot 3.1+) container'ın connection bilgilerini otomatik DataSource'a bağlar; manuel `@DynamicPropertySource` gerekmez.
 
-### 9. Banking-specific schema design — Topic 1.4'te yazacaklarımız
+### 9. Banking schema — bu bölümde yazacakların
 
-`accounts` (Task 1.4.1'de detayı):
-- id, owner_id, currency, balance_amount, status, opened_at, closed_at, version
+Üç tablo yazacaksın. `accounts`'u gördün; diğer ikisi double-entry bookkeeping'in temeli:
 
-`journal_entries` — bir mali olayı temsil eder (transfer, faiz, ücret):
-- id, transaction_id (idempotency key), description, occurred_at
+- **`journal_entries`** — bir mali olayı temsil eder (transfer, faiz, ücret): id, transaction_id (idempotency key), description, occurred_at
+- **`journal_lines`** — entry'nin alt kalemleri (debit/credit): id, journal_entry_id, account_id, direction, amount, currency
 
-`journal_lines` — journal_entry'nin alt kalemleri (debit/credit):
-- id, journal_entry_id, account_id, direction (DEBIT/CREDIT), amount, currency
-
-Double-entry kuralı: Bir `journal_entry`'nin tüm `journal_lines`'larının toplam DEBIT = toplam CREDIT olmalı.
+Double-entry kuralı: bir `journal_entry`'nin tüm `journal_lines`'larında toplam DEBIT = toplam CREDIT.
 
 ```sql
 CREATE TABLE journal_entries (
@@ -453,11 +394,11 @@ CREATE INDEX idx_journal_lines_account ON journal_lines(account_id);
 CREATE INDEX idx_journal_lines_entry ON journal_lines(journal_entry_id);
 ```
 
-**Banking detayı:** `journal_lines.amount` her zaman pozitif. Yönü `direction` belirler. Bu konvansiyon — accountant'lar böyle düşünür.
+**Banking detayı:** `journal_lines.amount` her zaman pozitif; yönü `direction` belirler. Bu bir konvansiyon — accountant'lar böyle düşünür.
 
 ### 10. Repeatable migration örneği
 
-`R__refresh_balance_summary_view.sql`:
+View gibi tanımlar zamanla evrilir; her değişiklik için yeni `V` dosyası açmak yerine `R__` kullanırsın. `R__refresh_balance_summary_view.sql`:
 
 ```sql
 DROP VIEW IF EXISTS account_balance_summary;
@@ -478,11 +419,11 @@ LEFT JOIN journal_lines jl ON jl.account_id = a.id
 GROUP BY a.id, a.currency, a.balance_amount;
 ```
 
-Bu view'i değiştirmek istediğinde aynı dosyayı edit edip Flyway'i çalıştırırsın → otomatik yeniden yaratılır.
+View'i değiştirmek istediğinde aynı dosyayı edit edip Flyway'i çalıştırırsın — otomatik yeniden yaratılır.
 
-### 11. Liquibase — kısaca karşılaştırma (bilgi olsun)
+### 11. Liquibase — kısa karşılaştırma
 
-Liquibase'in farkları:
+Flyway'in ana rakibini de tanı. Liquibase değişiklikleri SQL yerine soyut bir formatta tutar:
 
 ```xml
 <changeSet id="1" author="ahmet">
@@ -495,43 +436,42 @@ Liquibase'in farkları:
 </changeSet>
 ```
 
-**Liquibase artı'ları:**
-- DB-agnostic (XML/YAML değişiklikleri → birden fazla DB'de çalışır)
-- Built-in rollback (`<rollback>` tag)
-- Change preview, dry-run
-- Daha esnek
-
-**Liquibase eksi'leri:**
-- Daha karmaşık
-- SQL'i bilen developer'ın doğal yolu değil
-- YAML/XML disipliniyle hata yapması kolay
+| | Flyway | Liquibase |
+|---|---|---|
+| Format | Düz SQL | XML/YAML/JSON + SQL |
+| DB-agnostic | Hayır | Evet — aynı changeset birden fazla DB'de |
+| Built-in rollback | Yok (open source) | Var (`rollback` tag) |
+| Öğrenme eğrisi | Düşük — SQL bilen herkes | Yüksek — format disiplini ister |
+| Ekstra | — | Change preview, dry-run |
 
 ```mermaid
 flowchart TD
     A["Migration tool seçimi"] --> B{"SQL odaklı ve basit mi olsun?"}
     B -->|"Evet"| C["Flyway"]
-    B -->|"Hayır"| D{"Çoklu DB desteği veya built-in rollback lazım mı?"}
+    B -->|"Hayır"| D{"Çoklu DB veya built-in rollback lazım mı?"}
     D -->|"Evet"| E["Liquibase"]
     D -->|"Hayır"| C
 ```
 
-**TR banking gerçeği:** Flyway daha yaygın. Bazı eski enterprise sistemler Liquibase. İkisini de bil, projende Flyway kullan.
+**TR banking gerçeği:** Flyway daha yaygın; bazı eski enterprise sistemler Liquibase. İkisini de bil, projende Flyway kullan.
 
 ### 12. SQL versioning kuralları (banking)
 
 **Naming convention:**
-- Tablo: `snake_case` plural (`accounts`, `journal_entries`)
-- Kolon: `snake_case` (`owner_id`, `balance_amount`)
-- Foreign key kolon: `<referenced_table_singular>_id` (`account_id`)
-- Index: `idx_<table>_<col>` (`idx_accounts_owner_id`)
-- Constraint: `chk_<table>_<rule>` (`chk_account_status`)
-- Trigger: `trg_<table>_<event>` (`trg_accounts_update_audit`)
+
+| Nesne | Kural | Örnek |
+|---|---|---|
+| Tablo | `snake_case` plural | `accounts`, `journal_entries` |
+| Kolon | `snake_case` | `owner_id`, `balance_amount` |
+| Foreign key kolon | `<referenced_table_singular>_id` | `account_id` |
+| Index | `idx_<table>_<col>` | `idx_accounts_owner_id` |
+| Constraint | `chk_<table>_<rule>` | `chk_account_status` |
+| Trigger | `trg_<table>_<event>` | `trg_accounts_update_audit` |
 
 **Migration content kuralları:**
-- Bir migration **bir konuya** odaklansın
-- Migration'lar **küçük** olsun (rollback'i kolaylaştırır)
+- Bir migration **bir konuya** odaklansın ve **küçük** olsun (forward-fix'i kolaylaştırır)
 - Migration'da **production data'yı UPDATE etme** (idempotent olmayabilir, audit kaybı)
-- Comment yaz: dosya başında ne yaptığını anlat
+- Dosya başına comment yaz: ne yaptığını anlat
 
 ---
 
@@ -581,7 +521,7 @@ Spec:
 
 Index: `owner_id` üzerinde (partial: status != 'CLOSED').
 
-App'i çalıştır (`mvn spring-boot:run`), migration'ın otomatik uygulandığını görsele bir şekilde doğrula:
+App'i çalıştır (`mvn spring-boot:run`), migration'ın otomatik uygulandığını doğrula:
 
 ```bash
 docker exec -it banking-postgres psql -U banking_dev -d banking_dev

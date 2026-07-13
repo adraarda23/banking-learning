@@ -1245,7 +1245,7 @@ Her madde için PASS / FAIL / EKSIK ve kısa gerekçe. Kod yazma.
 - [ ] Retry metrics Micrometer'a yazılıyor (`/actuator/metrics/transfer.retry` gözüktü)
 - [ ] Anti-pattern listesi rahat — özellikle "lock ordering unutmak", "business exception retry"
 
-Hepsi onaylı → Topic 2.5'e geç → [05-n-plus-one/](../05-n-plus-one/README.md)
+Hepsi onaylı → Topic 2.5'e geç → [05-n-plus-one/](../05-n-plus-one/index.md)
 
 ---
 

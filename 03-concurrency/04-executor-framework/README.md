@@ -1056,7 +1056,7 @@ Her madde için PASS / FAIL / EKSIK. Kod yazma, sadece eksiklikleri söyle.
 - [ ] `Future.get()` timeout her zaman pass ediyorum
 - [ ] Interrupt swallow yasak — flag re-set ediyorum
 
-Hepsi onaylı → Topic 3.5'e geç → [05-completable-future/](../05-completable-future/README.md)
+Hepsi onaylı → Topic 3.5'e geç → [05-completable-future/](../05-completable-future/index.md)
 
 ---
 

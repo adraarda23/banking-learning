@@ -10,17 +10,16 @@
 
 ## Hedef
 
-Faz 1'in tüm topic'lerini birleştirerek **çalışan, test edilmiş, GitHub'a koyulabilir** bir banking servisi inşa etmek. Bu projenin sonunda elinde:
+Faz 1'de her topic için ayrı ayrı kod yazdın. Bu projede yeni bir şey öğrenmiyoruz — öğrendiklerini **tatbik edip** çalışan, test edilmiş, GitHub'a koyulabilir bir banking servisine dönüştürüyoruz. Projenin sonunda elinde şunlar olacak:
 
 - Spring Boot 3 + Java 21 backend
 - PostgreSQL + Flyway migration
 - Hexagonal architecture (`account`, `transfer` bounded context)
 - Double-entry ledger (journal_entries, journal_lines)
-- REST API (`/v1/accounts`, `/v1/transfers`) ProblemDetail error response
+- REST API (`/v1/accounts`, `/v1/transfers`) + ProblemDetail error response
 - Bean Validation (built-in + custom IBAN/TC)
 - Test coverage ≥ %75
-- OpenAPI docs
-- Docker compose ile lokal stack
+- OpenAPI docs + Docker compose ile lokal stack
 
 Hedef mimarinin genel görünümü:
 
@@ -35,21 +34,17 @@ flowchart LR
     Jpa --> DB[("PostgreSQL")]
 ```
 
-Bu, Phase 2-12'nin **temeli**. Her sonraki faz buradan başlayacak.
+Bu proje Phase 2-12'nin **temeli** — her sonraki faz buradan devam edecek. O yüzden burada attığın temizlik ve düzen, aylarca seninle gelecek.
 
-## Süre
-
-```admonish tip title="İpucu"
-3-5 gün (Phase 1'in son haftası civarı). Acele etme. Her adımı **test et**.
+```admonish tip title="Süre"
+3-5 gün ayır (Phase 1'in son haftası civarı). Acele etme; her adımın sonunda kontrol noktasını geçmeden ilerleme.
 ```
-
-## Önbilgi
-
-Faz 1'in 7 topic'ini bitirdin, defter notlarını yazdın, her topic için ayrı ayrı yaptığın kod parçaları var. Burada **birleştiriyoruz** — yeni öğretmeye girmiyoruz, **tatbik** ediyoruz.
 
 ---
 
 ## Acceptance criteria (bitirme şartları)
+
+Proje bittiğinde aşağıdaki listelerin **tamamı** işaretlenebilir olmalı. Başlamadan bir kez oku, bitince tek tek geç.
 
 ### Functional
 
@@ -93,6 +88,8 @@ Faz 1'in 7 topic'ini bitirdin, defter notlarını yazdın, her topic için ayrı
 ---
 
 ## Klasör yapısı (hedef)
+
+Kodu yerleştirirken bu iskeleti referans al. `common/` paylaşılan parçaları, `account/` ve `transfer/` birer bounded context'i taşıyor; her context içinde `domain → application → adapter` katmanları aynı düzende tekrar ediyor.
 
 ```
 core-banking/
@@ -140,26 +137,19 @@ core-banking/
 │   │   │   │   │   ├── AccountStatus.java
 │   │   │   │   │   └── exception/
 │   │   │   │   │       ├── AccountNotFoundException.java
-│   │   │   │   │       ├── AccountClosedException.java
-│   │   │   │   │       ├── AccountFrozenException.java
-│   │   │   │   │       └── InsufficientFundsException.java
+│   │   │   │   │       └── ... (AccountClosed, AccountFrozen, InsufficientFunds)
 │   │   │   │   ├── application/
 │   │   │   │   │   ├── port/
 │   │   │   │   │   │   ├── in/
 │   │   │   │   │   │   │   ├── OpenAccountUseCase.java
 │   │   │   │   │   │   │   ├── GetAccountUseCase.java
 │   │   │   │   │   │   │   ├── DepositUseCase.java
-│   │   │   │   │   │   │   ├── WithdrawUseCase.java
-│   │   │   │   │   │   │   ├── CloseAccountUseCase.java
-│   │   │   │   │   │   │   └── ListAccountTransactionsUseCase.java
+│   │   │   │   │   │   │   └── ... (Withdraw, CloseAccount, ListAccountTransactions)
 │   │   │   │   │   │   └── out/
 │   │   │   │   │   │       └── AccountRepository.java
 │   │   │   │   │   └── service/
 │   │   │   │   │       ├── OpenAccountService.java
-│   │   │   │   │       ├── GetAccountService.java
-│   │   │   │   │       ├── DepositService.java
-│   │   │   │   │       ├── WithdrawService.java
-│   │   │   │   │       └── ...
+│   │   │   │   │       └── ... (her use case için bir service)
 │   │   │   │   ├── config/
 │   │   │   │   │   └── AccountProperties.java
 │   │   │   │   └── adapter/
@@ -168,9 +158,7 @@ core-banking/
 │   │   │   │       │   ├── dto/
 │   │   │   │       │   │   ├── OpenAccountRequest.java
 │   │   │   │       │   │   ├── AccountResponse.java
-│   │   │   │       │   │   ├── DepositRequest.java
-│   │   │   │       │   │   ├── WithdrawRequest.java
-│   │   │   │       │   │   └── UpdateAccountStatusRequest.java
+│   │   │   │       │   │   └── ... (Deposit, Withdraw, UpdateAccountStatus request'leri)
 │   │   │   │       │   └── mapper/
 │   │   │   │       │       └── AccountWebMapper.java
 │   │   │   │       └── out/persistence/
@@ -208,12 +196,8 @@ core-banking/
 │   │   │   │           ├── IdempotencyKeyJpaEntity.java
 │   │   │   │           └── ...
 │   │   └── resources/
-│   │       ├── application.yml
-│   │       ├── application-dev.yml
-│   │       ├── application-test.yml
-│   │       ├── application-prod.yml
-│   │       ├── messages.properties
-│   │       ├── messages_tr.properties
+│   │       ├── application.yml (+ dev, test, prod profil dosyaları)
+│   │       ├── messages.properties, messages_tr.properties
 │   │       └── db/migration/
 │   │           ├── V1__create_accounts_table.sql
 │   │           ├── V2__create_journal_tables.sql
@@ -224,45 +208,50 @@ core-banking/
 │       │   └── ... (paralel paket yapısı, her class için test)
 │       └── resources/
 │           └── application-test.yml
-└── target/
 ```
 
 ---
 
 ## Adım adım build plan
 
-Adımların akışı şöyle:
+Sekiz adım var: ilk dört adımda kodu inşa ediyorsun, son dört adımda doğrulayıp paketliyorsun.
 
 ```mermaid
-flowchart TD
-    A1["1. Temizlik ve birlestirme"] --> A2["2. JPA persistence adapter"]
-    A2 --> A3["3. Use case servisleri"]
-    A3 --> A4["4. Controllers"]
-    A4 --> A5["5. Idempotency persistence"]
-    A5 --> A6["6. Test coverage"]
-    A6 --> A7["7. README, ADR, error catalog"]
-    A7 --> A8["8. Manuel smoke test"]
+flowchart LR
+    subgraph Insa["İnşa"]
+        direction LR
+        A1["Adım 1<br/>Birleştirme"] --> A2["Adım 2<br/>JPA adapter"] --> A3["Adım 3<br/>Use case servisleri"] --> A4["Adım 4<br/>Controllers"]
+    end
+    subgraph Dogrulama["Doğrulama"]
+        direction LR
+        A5["Adım 5<br/>Idempotency"] --> A6["Adım 6<br/>Testler"] --> A7["Adım 7<br/>Dokümantasyon"] --> A8["Adım 8<br/>Smoke test"]
+    end
+    A4 --> A5
 ```
 
 ### Adım 1 — Temizlik ve birleştirme (1-2 saat)
 
-Topic'lerde yazdığın kod parçalarını birleştir. Şu kontrol listesini geç:
+**Ne yapacaksın:** Topic'lerde yazdığın kod parçalarını tek projede, doğru paketlerde topla. **Neden:** Sonraki adımlar bu iskelet üstüne kurulacak; dağınık başlarsan her adımda geri döneceksin.
+
+Kontrol noktası — devam etmeden şu listeyi geç:
 
 - [ ] Tüm dosyalar doğru pakette mi?
 - [ ] Topic 1.1'deki domain class'ları, Topic 1.3'teki Money revize edilmiş hâlleriyle birleşmiş mi?
-- [ ] `Account` aggregate'i domain method'larına sahip (deposit, withdraw, close)?
+- [ ] `Account` aggregate'i domain method'larına sahip mi (deposit, withdraw, close)?
 - [ ] `JournalEntry` ve `JournalLine` domain class'ları yazıldı mı?
-- [ ] Migration dosyaları doğru sırada (V1, V2, V3)?
-- [ ] DTO'lar `record` ve validation annotation'lı?
+- [ ] Migration dosyaları doğru sırada mı (V1, V2, V3)?
+- [ ] DTO'lar `record` ve validation annotation'lı mı?
 - [ ] `GlobalExceptionHandler` tüm domain exception'larını cover ediyor mu?
 
 ### Adım 2 — JPA persistence adapter (3-4 saat)
 
+**Ne yapacaksın:** Domain'i PostgreSQL'e bağlayan adapter katmanını yazacaksın: JPA entity, mapper ve port implementation'ı. **Neden:** Hexagonal'da domain veritabanını bilmez; araya bu adapter girer ve dönüşümü üstlenir.
+
 ```admonish warning title="Dikkat"
-Bu Phase 1'in en zor kısmı, JPA henüz derinlemesine bilmiyorsun ama temel olarak:
+Bu, Phase 1'in en zor kısmı — JPA'yı henüz derinlemesine bilmiyorsun. Aşağıdaki dört parçayı sırayla, örnekleri takip ederek yaz; derinlik Phase 2'de gelecek.
 ```
 
-**`AccountJpaEntity`:**
+**Parça 1 — `AccountJpaEntity`** (tablo karşılığı, domain'den ayrı bir class):
 
 ```java
 @Entity
@@ -300,7 +289,7 @@ class AccountJpaEntity {
 }
 ```
 
-**`AccountPersistenceMapper`** (MapStruct):
+**Parça 2 — `AccountPersistenceMapper`** (MapStruct ile domain ↔ entity dönüşümü):
 
 ```java
 @Mapper(componentModel = "spring")
@@ -333,7 +322,7 @@ public interface AccountPersistenceMapper {
 }
 ```
 
-`Account` domain class'ına `static reconstruct(...)` factory ekle (sadece persistence'ın domain'i yeniden oluşturması için, public constructor değil):
+Bunun çalışması için `Account` domain class'ına `static reconstruct(...)` factory ekle. Bu public constructor değil — sadece persistence'ın domain'i yeniden oluşturması için var:
 
 ```java
 public static Account reconstruct(AccountId id, OwnerId ownerId, Currency currency,
@@ -349,7 +338,7 @@ public static Account reconstruct(AccountId id, OwnerId ownerId, Currency curren
 }
 ```
 
-**`JpaAccountRepository`** (port'un adapter implementation'ı):
+**Parça 3 — `JpaAccountRepository`** (port'un adapter implementation'ı):
 
 ```java
 @Component
@@ -384,7 +373,7 @@ class JpaAccountRepository implements AccountRepository {
 }
 ```
 
-**`AccountJpaRepository`** (Spring Data interface):
+**Parça 4 — `AccountJpaRepository`** (Spring Data interface):
 
 ```java
 interface AccountJpaRepository extends JpaRepository<AccountJpaEntity, UUID> {
@@ -392,11 +381,13 @@ interface AccountJpaRepository extends JpaRepository<AccountJpaEntity, UUID> {
 }
 ```
 
-**Transfer için aynısını yap** — `JournalEntryJpaEntity`, `JournalLineJpaEntity`, mapper, repository implementation.
+Kontrol noktası: aynı dört parçayı **transfer için de** yaz — `JournalEntryJpaEntity`, `JournalLineJpaEntity`, mapper ve repository implementation. App ayağa kalkıyor ve Flyway migration'ları hatasız uygulanıyorsa bu adım tamam.
 
 ### Adım 3 — Use case / application service'ler (2-3 saat)
 
-`OpenAccountService`:
+**Ne yapacaksın:** `port/in` interface'lerini implement eden service'leri yazacaksın. **Neden:** İş akışının orkestrasyonu (repository çağır, domain method'u çalıştır, kaydet) burada yaşar; domain kuralları ise domain'de kalır.
+
+Basit olandan başla — `OpenAccountService`:
 
 ```java
 @Service
@@ -429,7 +420,7 @@ class OpenAccountService implements OpenAccountUseCase {
 }
 ```
 
-`ExecuteTransferService` (en complex): Transfer akışının tamamı şöyle işliyor:
+En complex olanı `ExecuteTransferService`. Koda geçmeden akışı sindir:
 
 ```mermaid
 sequenceDiagram
@@ -508,12 +499,14 @@ class ExecuteTransferService implements ExecuteTransferUseCase {
 ```
 
 ```admonish warning title="Dikkat"
-**Önemli:** `@Transactional` ile tüm operasyon atomic. Eğer bir adımda exception fırlarsa **tümü rollback**.
+`@Transactional` sayesinde tüm operasyon atomic: bir adımda exception fırlarsa **tümü rollback** olur. Para bir hesaptan çıkıp diğerine girmeden asla kaybolmamalı — bu, banking'in en temel invariant'ı.
 ```
+
+Kontrol noktası: tüm use case service'leri yazıldı, proje derleniyor.
 
 ### Adım 4 — Controllers (1-2 saat)
 
-Topic 1.5'te taslakları yazıldı. Şimdi gerçek use case'lerle entegre et:
+**Ne yapacaksın:** Topic 1.5'te taslak olarak yazdığın controller'ları gerçek use case'lere bağlayacaksın. **Neden:** Controller sadece çevirmendir — HTTP'yi domain diline çevirir, iş kuralı barındırmaz.
 
 ```java
 @RestController
@@ -562,15 +555,7 @@ class AccountController {
         return mapper.toResponse(account);
     }
     
-    @PostMapping("/{id}/withdraw")
-    AccountResponse withdraw(@PathVariable UUID id,
-                             @Valid @RequestBody WithdrawRequest request) {
-        Account account = withdrawUseCase.execute(
-            new AccountId(id),
-            Money.of(request.amount(), Currency.getInstance(request.currency()))
-        );
-        return mapper.toResponse(account);
-    }
+    // withdraw endpoint'i deposit ile aynı kalıp — withdrawUseCase ile yaz
     
     @PatchMapping("/{id}/status")
     AccountResponse updateStatus(@PathVariable UUID id,
@@ -609,7 +594,11 @@ class TransferController {
 }
 ```
 
+Kontrol noktası: app'i ayağa kaldır, Swagger UI'da tüm endpoint'ler görünüyor ve basit bir `POST /v1/accounts` isteği 201 dönüyor.
+
 ### Adım 5 — Idempotency persistence (1 saat)
+
+**Ne yapacaksın:** Idempotency key'leri veritabanında saklayacaksın. **Neden:** Client aynı transferi iki kez gönderirse (retry, timeout) para iki kez gitmemeli — key'i kalıcı tutmadan bunu garanti edemezsin.
 
 `V3__create_idempotency_keys_table.sql`:
 
@@ -635,7 +624,7 @@ public interface IdempotencyStore {
 ```
 
 ```admonish tip title="İpucu"
-JPA adapter implement et. **Basit versiyonu**: sadece key + transferId tut, gerçek response cache'lemeyi Phase 2'de yapacağız.
+JPA adapter'ı implement et ama **basit versiyonla** yetin: sadece key + transferId tut. Gerçek response cache'lemeyi Phase 2'de yapacağız.
 ```
 
 Bu tabloyla birlikte veri modelinin tamamı şöyle görünüyor:
@@ -670,16 +659,20 @@ erDiagram
     }
 ```
 
+Kontrol noktası: aynı key ile iki kez transfer isteği attığında ikinci istek yeni journal_entry yaratmıyor.
+
 ### Adım 6 — Test coverage (3-4 saat)
 
-**Unit testler (her topic'ten):**
+**Ne yapacaksın:** Dört seviyede test yazacaksın: unit, service (mock'lu), controller, integration. **Neden:** Her seviye farklı bir hatayı yakalar — unit test domain kuralını, integration test gerçek PostgreSQL üstünde uçtan uca akışı doğrular.
+
+**Seviye 1 — Unit testler** (her topic'ten):
 - `MoneyTest`, `AccountTest`, `ExchangeRateTest`
 - `IbanFormatValidatorTest`, `TcKimlikNoValidatorTest`
 - `OpenAccountRequestValidationTest`
 - `CurrencyNormalizerTest`
 - Domain exception'ların test'leri
 
-**Application service testler (mock'lu unit test):**
+**Seviye 2 — Application service testler** (Mockito ile):
 - `OpenAccountServiceTest` — `AccountRepository` mock'lu
 - `ExecuteTransferServiceTest` — mock'lu, double-entry'nin doğru çalıştığını test et
 
@@ -738,11 +731,11 @@ class ExecuteTransferServiceTest {
 }
 ```
 
-**Controller test'leri (`@WebMvcTest`):**
+**Seviye 3 — Controller testler** (`@WebMvcTest`):
 - `AccountControllerTest` — open, get, deposit, withdraw, close, list
 - `TransferControllerTest` — transfer, idempotency, validation hatları
 
-**Integration test'leri (`@SpringBootTest` + TestContainers):**
+**Seviye 4 — Integration testler** (`@SpringBootTest` + TestContainers):
 - `AccountIntegrationTest` — full HTTP roundtrip, gerçek PostgreSQL
 - `TransferIntegrationTest` — double-entry invariant assertion
 - `MigrationIntegrationTest` — schema doğrulaması
@@ -794,11 +787,15 @@ class TransferIntegrationTest {
 }
 ```
 
+Kontrol noktası: `mvn verify` yeşil ve `target/site/jacoco/index.html` raporunda coverage ≥ %75.
+
 ### Adım 7 — README, ADR, error catalog (1 saat)
 
-`README.md`:
+**Ne yapacaksın:** Projenin dokümantasyonunu yazacaksın. **Neden:** GitHub'da projeni açan biri (recruiter dahil) önce README'yi görür — kod kadar dokümantasyon da vitrindir.
 
-```markdown
+`README.md` için şablon:
+
+````markdown
 # core-banking
 
 TR bank backend learning project. Spring Boot 3 + Java 21 + PostgreSQL.
@@ -836,11 +833,15 @@ OpenAPI: `/v3/api-docs`, Swagger UI: `/swagger-ui.html`.
 ## Lisans
 
 Eğitim projesidir.
-```
+````
 
-ADR'ları yaz: hexagonal, Flyway, ProblemDetail, BigDecimal, validation.
+Kontrol noktası: README hazır, `docs/adr/` altında en az 3 ADR var (aday konular: hexagonal, Flyway, ProblemDetail, BigDecimal, validation) ve `error-catalog.md` her error code'u listeliyor.
 
 ### Adım 8 — Manuel smoke test (30 dk)
+
+**Ne yapacaksın:** Uygulamayı gerçek bir kullanıcı gibi curl ile uçtan uca deneyeceksin. **Neden:** Testler yeşil olsa da "gerçekten çalışıyor mu?" sorusunun cevabı ancak canlı istekle verilir.
+
+Aşağıdaki 9 senaryoyu sırayla çalıştır:
 
 ```bash
 # 1. Hesap aç (owner 1)
@@ -897,12 +898,14 @@ curl http://localhost:8080/v1/accounts/00000000-0000-0000-0000-000000000000
 ```
 
 ```admonish tip title="İpucu"
-Tüm bu senaryolar başarılı çalışıyorsa **proje hazır**.
+9 senaryonun tamamı beklenen sonucu veriyorsa **proje hazır**. Bir tanesi bile sapıyorsa acceptance criteria listesine dön ve eksiği bul.
 ```
 
 ---
 
 ## Claude-verify prompt (full project)
+
+Projeyi bitirdim dediğin an, aşağıdaki prompt'la Claude'a kapsamlı bir audit yaptır. Kendi kör noktalarını böyle yakalarsın.
 
 ```
 Aşağıdaki Spring Boot banking projemi (`core-banking`) tüm Phase 1 öğretileri 
@@ -990,7 +993,7 @@ kod referansı). Yanlış olanların düzeltme yolunu işaret et ama kod yazma.
 
 ## Bitirme
 
-Bu mini-project'i bitirdiğinde GitHub'a push at:
+Audit'ten geçtin mi? O zaman GitHub'a push at:
 
 ```bash
 cd ~/projects/core-banking
@@ -1014,7 +1017,7 @@ Ready for Phase 2."
 git push origin main
 ```
 
-LinkedIn'de "side project" olarak ekle. CV'de **yazılı kanıt** — junior pozisyonunda nadiren görülen kalitede.
+LinkedIn'de "side project" olarak ekle. Bu, CV'nde **yazılı kanıt** — junior pozisyonunda nadiren görülen kalitede bir iş.
 
 → Sonraki: [PHASE_TEST.md](../PHASE_TEST.md)
 

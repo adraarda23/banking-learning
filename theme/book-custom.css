@@ -53,12 +53,18 @@
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
 }
 
-/* Mermaid diyagramları ortala, nefes payı ver */
+/* Mermaid diyagramları ortala, nefes payı ver, ekranı ele geçirmesin */
 .content pre.mermaid {
     background: transparent;
     box-shadow: none;
     text-align: center;
     margin: 1.6em 0;
+}
+
+.content pre.mermaid svg {
+    max-height: 540px;
+    height: auto;
+    max-width: 100%;
 }
 
 /* Faz kapak sayfası ögeleri (raw HTML ile kullanılır) */
