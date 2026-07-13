@@ -14,7 +14,7 @@ Bir banking projesinde **schema değişiklikleri**ni kod gibi yönetmek. Flyway'
 
 ## Süre
 
-Okuma: 1.5 saat • Mini task: 2.5 saat • Test: 1 saat • Toplam: ~5 saat
+Okuma: 1.5 saat • Kendini Sına: 30 dk • Pratik (istersen): 2.5-3.5 saat • Toplam: ~2 saat (pratikle ~5 saat)
 
 ## Önbilgi
 
@@ -327,6 +327,55 @@ Migration da koddur, kod test edilir. Üç strateji var:
 
 Banking projesinde standart: **TestContainers + PostgreSQL**.
 
+Test sınıfının iskeleti üç parçadan oluşur: container tanımı, Spring bağlantısı ve testlerin kullanacağı `JdbcTemplate`:
+
+```java
+@Testcontainers
+@SpringBootTest
+@ActiveProfiles("test")
+class MigrationIntegrationTest {
+    
+    @Container
+    @ServiceConnection
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
+    
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+}
+```
+
+`@ServiceConnection` (Spring Boot 3.1+) container'ın connection bilgilerini otomatik DataSource'a bağlar; manuel `@DynamicPropertySource` gerekmez.
+
+İlk test schema'nın gerçekten kurulduğunu doğrular. Dikkat et: schema'yı `information_schema` üzerinden sorguluyoruz — tablo var mı, kolon tipi ne, constraint çalışıyor mu:
+
+```java
+@Test
+void accountsTableShouldExist() {
+    Integer count = jdbcTemplate.queryForObject(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'accounts'",
+        Integer.class
+    );
+    assertThat(count).isEqualTo(1);
+}
+```
+
+İkinci test CHECK constraint'in çalıştığını kanıtlar — geçersiz `status` değeriyle INSERT, DB seviyesinde reddedilmeli:
+
+```java
+@Test
+void accountStatusCheckShouldRejectInvalidValue() {
+    assertThatThrownBy(() ->
+        jdbcTemplate.update(
+            "INSERT INTO accounts (id, owner_id, currency, status) VALUES (?, ?, ?, ?)",
+            UUID.randomUUID(), UUID.randomUUID(), "TRY", "INVALID"
+        )
+    ).isInstanceOfAny(DataIntegrityViolationException.class);
+}
+```
+
+<details>
+<summary>Tam kod: MigrationIntegrationTest.java (~32 satır)</summary>
+
 ```java
 @Testcontainers
 @SpringBootTest
@@ -361,11 +410,11 @@ class MigrationIntegrationTest {
 }
 ```
 
-Dikkat et: schema'yı `information_schema` üzerinden sorguluyoruz — tablo var mı, kolon tipi ne, constraint çalışıyor mu. `@ServiceConnection` (Spring Boot 3.1+) container'ın connection bilgilerini otomatik DataSource'a bağlar; manuel `@DynamicPropertySource` gerekmez.
+</details>
 
-### 9. Banking schema — bu bölümde yazacakların
+### 9. Banking schema — üç çekirdek tablo
 
-Üç tablo yazacaksın. `accounts`'u gördün; diğer ikisi **double-entry bookkeeping**'in temeli:
+Bu bölümün schema'sı üç tablodan oluşur. `accounts`'u gördün; diğer ikisi **double-entry bookkeeping**'in temeli:
 
 - **`journal_entries`** — bir mali olayı temsil eder (transfer, faiz, ücret): id, transaction_id (**idempotency key**), description, occurred_at
 - **`journal_lines`** — entry'nin alt kalemleri (debit/credit): id, journal_entry_id, account_id, direction, amount, currency
@@ -487,123 +536,129 @@ flowchart TD
 
 ---
 
-## Mini task'ler
+## Kendini Sına
 
-### Task 1.4.1 — PostgreSQL Docker setup (15 dk)
+Cevabı açmadan önce kendi cevabını yüksek sesle ver — mülakatta da aynısını yapacaksın.
 
-`core-banking/docker-compose.yml` yaz (yukarıda örnek). Çalıştır:
-```bash
-docker compose up -d
-docker compose ps        # postgres healthy mi?
-docker compose logs postgres | head
+**S1. Production'a uygulanmış bir migration dosyasını sonradan edit edersen ne olur? Doğru düzeltme yolu nedir?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Flyway her uygulanan migration'ın checksum'ını `flyway_schema_history` tablosuna kaydeder. Dosya içeriği değişirse bir sonraki başlatmada validate aşaması `Migration checksum mismatch for migration version X` hatası verir ve uygulama ayağa kalkmaz. Uygulanmış dosyaya asla dokunulmaz; düzeltme her zaman yeni bir migration olarak eklenir:
+
+```
+V2__add_status_column.sql      <- uygulandı, artık dokunulmaz
+V3__alter_status_column.sql    <- düzeltme buraya
 ```
 
-PostgreSQL container'ına gir, DB'i incele:
-```bash
-docker exec -it banking-postgres psql -U banking_dev -d banking_dev
-\dt           # tabloları listele (boş)
-\q
-```
+</details>
 
-### Task 1.4.2 — V1: accounts table migration (30 dk)
+**S2. `V2_add_iban_column.sql` dosyası repo'da duruyor ama Flyway hiç uygulamıyor, hata da vermiyor. En olası sebep nedir?**
 
-`src/main/resources/db/migration/V1__create_accounts_table.sql` yaz.
+<details>
+<summary>Cevabı göster</summary>
 
-Spec:
-- UUID primary key
-- `owner_id` UUID NOT NULL
-- `currency` CHAR(3) NOT NULL
-- `balance_amount` NUMERIC(19, 4) NOT NULL DEFAULT 0.0000
-- `status` VARCHAR(20) NOT NULL DEFAULT 'ACTIVE' with CHECK ('ACTIVE', 'FROZEN', 'CLOSED')
-- `opened_at` TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-- `closed_at` TIMESTAMPTZ (nullable)
-- `version` BIGINT NOT NULL DEFAULT 0
+Version ile description arasında **tek underscore** var; Flyway formatı `V{version}__{description}.sql` şeklinde **iki underscore** ister. Kurala uymayan dosyayı Flyway sessizce görmezden gelir — hata bile üretmez, bu yüzden fark etmesi zordur. Doğrusu: `V2__add_iban_column.sql`. Bu, pratikte en sık yapılan Flyway hatasıdır.
 
-Index: `owner_id` üzerinde (partial: status != 'CLOSED').
+</details>
 
-App'i çalıştır (`mvn spring-boot:run`), migration'ın otomatik uygulandığını doğrula:
+**S3. Versioned (V) ve Repeatable (R) migration farkı nedir? Bir view tanımı için hangisini seçersin, neden?**
 
-```bash
-docker exec -it banking-postgres psql -U banking_dev -d banking_dev
-\dt                       # accounts ve flyway_schema_history görünmeli
-\d accounts               # schema'yı incele
-SELECT * FROM flyway_schema_history;
-```
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 1.4.3 — V2: journal tables migration (30 dk)
+`V` migration bir kez uygulanır ve checksum'ı sabitlenir; tablo, kolon, index gibi kalıcı schema değişiklikleri içindir. `R` migration ise içeriği (checksum'ı) her değiştiğinde yeniden uygulanır ve tüm V'lerden sonra çalışır. View, stored procedure, function gibi tanımı zamanla evrilen nesneler için `R` seçilir: aynı dosyayı edit edersin, Flyway otomatik yeniden yaratır. Aksi halde her view değişikliği için yeni bir `V` dosyası açman gerekirdi.
 
-`V2__create_journal_tables.sql`:
-- `journal_entries` tablosu (id, transaction_id UNIQUE, description, occurred_at, created_by)
-- `journal_lines` tablosu (id, journal_entry_id FK, account_id FK, direction CHECK, amount > 0, currency)
-- Index'ler
+</details>
 
-App'i restart et, V2'nin uygulandığını doğrula.
+**S4. Banking'de migration rollback neden geri alma (undo) yerine forward-fix ile yapılır?**
 
-### Task 1.4.4 — V3: extra ALTER migration (15 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-V1'de unutulan bir şeyi V3 ile ekle. Örnek: account adına `customer_reference` kolonu (banka müşterisinin dış sistemden referans no).
+Üç sebep var. Birincisi, Flyway open source'ta `U` (undo) migration desteği zaten yok — Pro/Teams özelliği. İkincisi, forward-fix ile migration history lineer ve tutarlı kalır: `V5` hatalıysa onu geri alan `V6__revert_...` yazılır, audit trail'de her iki adım da görünür. Üçüncüsü, "önceki versiyona dön" gerçek dünyada problemlidir: bu arada yazılmış data'yı geri alamazsın. Regüle bir ortamda "ne yaptık, ne zaman yaptık" sorusunun cevabı her zaman DB'de durmalıdır.
 
-`V3__add_customer_reference_to_accounts.sql`:
-```sql
-ALTER TABLE accounts ADD COLUMN customer_reference VARCHAR(50);
-CREATE INDEX idx_accounts_customer_reference ON accounts(customer_reference) 
-    WHERE customer_reference IS NOT NULL;
-```
+</details>
 
-App'i restart et.
+**S5. Zero-downtime deployment'ta bir kolonu tek migration ile rename edersen ne olur? Expand-contract pattern'in üç adımını anlat.**
 
-### Task 1.4.5 — Migration'ı edit et ve sonuçları gör (10 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-V1 dosyasını **kasten** edit et. Örneğin bir comment ekle:
-```sql
--- yeni comment satırı
-CREATE TABLE accounts (...);
-```
+Deploy sırasında eski ve yeni kod versiyonu aynı anda çalışır; `RENAME COLUMN` yaparsan eski versiyon hâlâ eski kolon adını aradığı için anında patlar. Çözüm, üç ayrı release'e yayılan expand-contract:
 
-App'i restart et. Aldığın hatayı **defterine yaz** (`FlywayValidateException` veya `checksum mismatch`).
+1. **Expand:** yeni kolonu ekle, veriyi kopyala; uygulama iki kolona da yazar
+2. **Migrate:** yeni kodu deploy et, artık yeni kolonu okur
+3. **Contract:** eski versiyon tamamen retire olunca eski kolonu sil
 
-Sonra dosyayı eski haline getir, restart et — düzelmeli.
+Her adım hem eski hem yeni kodla uyumludur; downtime sıfırdır.
 
-```admonish tip title="İpucu"
-**Bu deneyimi geçirmek lazım.** Production'da bu hatayı bir kere yedikten sonra migration'a saygın artar.
-```
+</details>
 
-### Task 1.4.6 — Repeatable migration: balance summary view (30 dk)
+**S6. `spring.jpa.hibernate.ddl-auto` banking'de neden `validate` olmalı? `update` hangi riskleri taşır?**
 
-`R__create_balance_summary_view.sql` yaz (yukarıda örnek var). Bir test query'si yaz:
+<details>
+<summary>Cevabı göster</summary>
 
-```sql
-SELECT * FROM account_balance_summary;
-```
+Schema'nın tek sahibi Flyway olmalıdır: değişiklikler versiyonlu, review edilmiş, audit edilebilir SQL dosyalarından gelir. `validate` Hibernate'e sadece "entity'ler ile DB schema uyumlu mu?" kontrolü yaptırır — schema'ya dokunmaz, uyumsuzlukta fail eder. `update` ise Hibernate'in entity'lerden ürettiği DDL'i doğrudan çalıştırır: kontrolsüz, review'suz, history'siz değişiklik demektir ve prod schema'yı Flyway history'sinden koparır. `create` ve `create-drop` zaten tabloları düşürür — banking'de üçü de yasak.
 
-Boş tablo → boş sonuç. Manuel bir kaç account insert et:
+</details>
 
-```sql
-INSERT INTO accounts (id, owner_id, currency, balance_amount, status)
-VALUES (gen_random_uuid(), gen_random_uuid(), 'TRY', 1000.00, 'ACTIVE');
-```
+**S7. Migration testlerini neden H2 in-memory ile değil, TestContainers + gerçek PostgreSQL ile yazıyoruz?**
 
-Query'i tekrar çalıştır, view'ün sonucunu gör.
+<details>
+<summary>Cevabı göster</summary>
 
-Sonra view'i değiştir (örn. bir kolon ekle), restart et, otomatik yeniden yaratıldığını doğrula.
+H2 hızlıdır ama PostgreSQL dialect'ini tam taklit etmez: partial index (`WHERE status != 'CLOSED'`), `NUMERIC` precision davranışı, `TIMESTAMPTZ`, regex CHECK constraint'leri H2'de farklı çalışır veya hiç çalışmaz. Test H2'de geçer, production PostgreSQL'de patlar — testin amacı boşa gider. TestContainers her test çalışmasında gerçek bir `postgres:16` container'ı ayağa kaldırır; migration'lar birebir prod'daki engine üzerinde doğrulanır. Banking'de standart budur.
 
-### Task 1.4.7 — Forward-only rollback örneği (15 dk)
+</details>
 
-`V3__add_customer_reference_to_accounts.sql`'ı silmek istediğini varsay (yanlış karar verdik). V4 yaz:
+**S8. 10M satırlık bir backfill'i (data migration) neden Flyway migration'ının içine koymayız? Doğru yaklaşım nedir?**
 
-`V4__drop_customer_reference_from_accounts.sql`:
-```sql
-DROP INDEX IF EXISTS idx_accounts_customer_reference;
-ALTER TABLE accounts DROP COLUMN customer_reference;
-```
+<details>
+<summary>Cevabı göster</summary>
 
-Bu yaklaşım banking pratiği — geri alma yerine ileri düzeltme.
+Flyway migration'ları app boot sırasında (veya pipeline job'unda) senkron çalışır: saatler süren bir UPDATE boot'u bloklar ve migration lock'u yüzünden diğer instance'lar timeout alır. Ayrıca büyük UPDATE atomic olmayabilir; hata durumunda parçalı, tekrar çalıştırılamaz bir state kalır. Doğru iş bölümü: schema değişikliğini Flyway'le yap (`ADD COLUMN`), data populate'i idempotent ve restartable bir **batch job**'a ver (Spring Batch gibi). Schema migration ile data migration ayrı sorumluluklardır.
+
+</details>
 
 ---
 
-## Test yazma rehberi
+## Tamamlama kriterleri
 
-### Test 1.4.1 — TestContainers entegrasyonu
+- [ ] "Kendini Sına" sorularının tümünü cevaba bakmadan cevaplayabiliyorum
+- [ ] "Migration rollback nasıl yapılır?" sorusuna "forward-fix" cevabı verebilirim
+- [ ] Expand-contract pattern'in 3 adımını sayabiliyorum
+- [ ] H2 yerine TestContainers PostgreSQL kullanma sebebini biliyorum
+- [ ] `flyway_schema_history` tablosunun rolünü ve neden elle değiştirilmeyeceğini açıklayabilirim
+- [ ] (Pratik yaptıysan) Docker ile PostgreSQL local çalışıyor; V1-V4 ve R migration'ları yazılı, uygulanmış
+- [ ] (Pratik yaptıysan) Migration'ı edit edip checksum hatasını bilinçli olarak deneyimledim
+- [ ] (Pratik yaptıysan) TestContainers ile migration integration test yazılı, `mvn test` geçiyor
+
+---
+
+## Defter notları
+
+1. "Flyway'in çalışma prensibi: ____."
+2. "Migration dosyası adlandırma kuralı: ____."
+3. "Versioned (V) ve Repeatable (R) migration farkı: ____."
+4. "Migration uygulandıktan sonra edit edersem ne olur: ____."
+5. "Banking'de schema rollback nasıl yapılır (forward-fix nedir): ____."
+6. "Expand-contract pattern (zero-downtime migration) 3 adımı: ____."
+7. "`spring.jpa.hibernate.ddl-auto: validate` neden gerekli, neden create değil: ____."
+8. "TestContainers H2'den daha iyi çünkü ____."
+9. "TIMESTAMP WITH TIME ZONE ve bare TIMESTAMP farkı: ____."
+10. "`flyway_schema_history` tablosunu manuel düzenlemek nasıl olur, neden tehlikelidir: ____."
+
+## Pratik yapmak istersen
+
+Kavramları elle denemek istersen: bölüm 5'teki `docker-compose.yml` ile PostgreSQL'i kaldır; V1 (`accounts`) ve V2 (journal tabloları) migration'larını yaz; bir V3 ALTER migration'ı, onu geri alan V4 forward-fix'i ve `R__` view migration'ını ekle. Ardından aşağıdaki rehberle testlerini kur; işin bitince Claude-verify prompt'u ile setup'ını denetlet.
+
+<details>
+<summary>Test yazma rehberi (TestContainers + test config)</summary>
+
+**Test 1.4.1 — TestContainers entegrasyonu**
 
 `pom.xml`'da var (Topic 1.2'de eklendi):
 ```xml
@@ -714,7 +769,7 @@ class MigrationIntegrationTest {
 }
 ```
 
-### Test 1.4.2 — `application-test.yml` config
+**Test 1.4.2 — `application-test.yml` config**
 
 ```yaml
 spring:
@@ -730,9 +785,10 @@ logging:
     org.testcontainers: INFO
 ```
 
----
+</details>
 
-## Claude-verify prompt
+<details>
+<summary>Claude-verify prompt (setup'ını Claude'a denetlet)</summary>
 
 ```
 Aşağıdaki Flyway migration setup'umu banking-grade kriterlere göre değerlendir. 
@@ -782,37 +838,9 @@ Her madde için PASS / FAIL / EKSIK işaretle. Kod yazma. Sadece neyi düzeltmem
 gerektiğini söyle.
 ```
 
----
-
-## Tamamlama kriterleri
-
-- [ ] Docker ile PostgreSQL local çalışıyor
-- [ ] V1: `accounts` table migration yazılı, uygulanmış
-- [ ] V2: `journal_entries` ve `journal_lines` tables migration yazılı
-- [ ] V3: bir ALTER migration eklenmiş
-- [ ] R: balance summary view repeatable migration
-- [ ] V4: forward-fix migration (V3'ü geri alan) yazılmış, kavram anlaşılmış
-- [ ] Migration'ı edit edip checksum hatası alındı (bilinçli deneyim)
-- [ ] TestContainers ile migration integration test yazılı
-- [ ] Tüm test'ler `mvn test` ile geçiyor
-- [ ] `flyway_schema_history` tablosunu inceleyip anlamış
-- [ ] "Migration rollback nasıl yapılır?" sorusuna "forward-fix" cevabı verebilirim
-- [ ] H2 yerine TestContainers PostgreSQL kullanma sebebini biliyorum
+</details>
 
 ---
-
-## Defter notları
-
-1. "Flyway'in çalışma prensibi: ____."
-2. "Migration dosyası adlandırma kuralı: ____."
-3. "Versioned (V) ve Repeatable (R) migration farkı: ____."
-4. "Migration uygulandıktan sonra edit edersem ne olur: ____."
-5. "Banking'de schema rollback nasıl yapılır (forward-fix nedir): ____."
-6. "Expand-contract pattern (zero-downtime migration) 3 adımı: ____."
-7. "`spring.jpa.hibernate.ddl-auto: validate` neden gerekli, neden create değil: ____."
-8. "TestContainers H2'den daha iyi çünkü ____."
-9. "TIMESTAMP WITH TIME ZONE ve bare TIMESTAMP farkı: ____."
-10. "`flyway_schema_history` tablosunu manuel düzenlemek nasıl olur, neden tehlikelidir: ____."
 
 ```admonish success title="Bölüm Özeti"
 - Flyway, migration'ları `V{version}__{description}.sql` dosyaları olarak sırayla uygular; uygulanma durumu `flyway_schema_history` tablosunda tutulur

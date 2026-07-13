@@ -14,7 +14,7 @@ Bir REST API'i tasarlarken **entity sızıntısı**ndan kaçınmak; request/resp
 
 ## Süre
 
-Okuma: 1.5 saat • Mini task: 2 saat • Test: 1 saat • Toplam: ~4.5 saat
+Okuma: 1.5 saat • Kendini Sına: 30 dk • Toplam: ~2 saat (isteğe bağlı pratik hariç)
 
 ## Önbilgi
 
@@ -71,7 +71,64 @@ flowchart LR
     F --> G["Client JSON"]
 ```
 
-Doğru yaklaşım kodda böyle görünür:
+Doğru yaklaşımı parça parça inceleyelim. Önce yön bazlı iki DTO: request yalnızca client'ın göndermesi gereken alanları taşır, response yalnızca dışarı açmayı **seçtiğimiz** alanları:
+
+```java
+// Request DTO (client → server)
+public record OpenAccountRequest(
+    @NotNull UUID ownerId,
+    @NotBlank @Size(min=3, max=3) String currency
+) {}
+
+// Response DTO (server → client)
+public record AccountResponse(
+    UUID id,
+    UUID ownerId,
+    String currency,
+    BigDecimal balance,
+    String status,
+    Instant openedAt
+) {}
+```
+
+Controller artık entity değil DTO alıp DTO dönüyor; `@Valid` sayesinde validation HTTP sınırında çalışıyor, domain'e taşmıyor:
+
+```java
+@PostMapping
+public ResponseEntity<AccountResponse> open(
+    @Valid @RequestBody OpenAccountRequest request
+) {
+    Account account = accountService.open(
+        new OwnerId(request.ownerId()),
+        Currency.getInstance(request.currency())
+    );
+    return ResponseEntity.status(201).body(toResponse(account));
+}
+
+@GetMapping("/{id}")
+public AccountResponse get(@PathVariable UUID id) {
+    Account account = accountService.findById(new AccountId(id));
+    return toResponse(account);
+}
+```
+
+Entity → DTO dönüşümü ise şimdilik manuel bir yardımcı metotta — her field tek tek elle kopyalanıyor:
+
+```java
+private AccountResponse toResponse(Account account) {
+    return new AccountResponse(
+        account.getId().value(),
+        account.getOwnerId().value(),
+        account.getCurrency().getCurrencyCode(),
+        account.getBalance().amount(),
+        account.getStatus().name(),
+        account.getOpenedAt()
+    );
+}
+```
+
+<details>
+<summary>Tam kod: OpenAccountRequest + AccountResponse + AccountController (~48 satır)</summary>
 
 ```java
 // Request DTO (client → server)
@@ -123,6 +180,8 @@ class AccountController {
     }
 }
 ```
+
+</details>
 
 Buradaki `toResponse` gibi manuel mapping kodunu aklında tut — Bölüm 8'de MapStruct ile bundan kurtulacağız.
 
@@ -634,170 +693,137 @@ Banking'de OpenAPI dokümantasyonu **standart** — internal team, client team, 
 
 ---
 
-## Mini task'ler
+## Kendini Sına
 
-### Task 1.5.1 — Request/Response DTO'larını yaz (30 dk)
+Cevabı açmadan önce kendi cevabını sesli ya da defterine ver; sonra karşılaştır.
 
-`banking/account/adapter/in/web/dto/`:
+**S1. Domain entity'yi (`Account`) doğrudan controller response'unda dönmenin riskleri neler?**
 
-- `OpenAccountRequest.java` (record): `ownerId UUID`, `currency String`
-- `AccountResponse.java` (record): `id`, `ownerId`, `currency`, `balance`, `status`, `openedAt`
-- `DepositRequest.java`, `WithdrawRequest.java`: `amount BigDecimal`
-- `TransferRequest.java`: `fromAccountId`, `toAccountId`, `amount`, `currency`
-- `TransferResponse.java`: `transferId`, `fromAccountId`, `toAccountId`, `amount`, `currency`, `executedAt`
+<details>
+<summary>Cevabı göster</summary>
 
-Tümü `record`. Hiçbir setter yok. Hiçbir mutable state yok.
+En az altı somut problem var. Internal field'lar (`version`, `created_by`, sensitive bilgiler) API'den dışarı sızar. JSON kontrat DB şemasına bağlanır — kolon rename client'ı kırar. Serializer lazy proxy'leri tetikler: N+1 sorgular ve `LazyInitializationException`. Validation annotation'ları entity'ye girer, domain framework'e bağlanır. En tehlikelisi mass assignment: client `status=APPROVED` gönderir, Jackson deserialize eder, yetkisiz field değişir. Ayrıca aynı entity = aynı JSON olduğu için API evolution ve backward compatibility zorlaşır.
 
-### Task 1.5.2 — MapStruct setup ve mapper yaz (45 dk)
+</details>
 
-`pom.xml`'a MapStruct ekle (yukarıda örnek).
+**S2. Request ve Response için tek bir `AccountDto` kullansak ne kaybederiz?**
 
-`banking/account/adapter/in/web/mapper/AccountWebMapper.java`:
+<details>
+<summary>Cevabı göster</summary>
 
-```java
-@Mapper(componentModel = "spring")
-public interface AccountWebMapper {
-    
-    @Mapping(source = "id.value", target = "id")
-    @Mapping(source = "ownerId.value", target = "ownerId")
-    @Mapping(source = "currency", target = "currency", qualifiedByName = "currencyToCode")
-    @Mapping(source = "balance.amount", target = "balance")
-    AccountResponse toResponse(Account account);
-    
-    @Named("currencyToCode")
-    default String currencyToCode(Currency currency) {
-        return currency.getCurrencyCode();
-    }
-}
-```
+Hangi field'ın hangi yönde aktığı belirsizleşir: `id` ve `balance` response'a aittir, request'te olmamalı; `status` request'te asla olmamalı. Validation kuralları çakışır — request'te zorunlu olan alan response'da nullable olabilir. Mass assignment riski geri gelir, çünkü client response-only field'ları da gönderebilir. Çözüm yön bazlı DTO'lar: `OpenAccountRequest` / `AccountResponse` gibi. Daha çok dosya demek ama **explicit > implicit**.
 
-`mvn clean compile` ile generated source'u `target/generated-sources/annotations/`'da bulup **incele**. Bir mapper'ın aslında basit bir class olduğunu gör.
+</details>
 
-### Task 1.5.3 — `AccountController` yaz (45 dk)
+**S3. `Idempotency-Key` olmadan `POST /transfers`'a retry gelirse ne olur? Key varsa server ne yapar?**
 
-`banking/account/adapter/in/web/AccountController.java`:
+<details>
+<summary>Cevabı göster</summary>
 
-```java
-@RestController
-@RequestMapping("/v1/accounts")
-class AccountController {
-    
-    private final OpenAccountUseCase openAccountUseCase;
-    private final GetAccountUseCase getAccountUseCase;
-    private final AccountWebMapper mapper;
-    
-    AccountController(OpenAccountUseCase openAccountUseCase, 
-                      GetAccountUseCase getAccountUseCase,
-                      AccountWebMapper mapper) {
-        this.openAccountUseCase = openAccountUseCase;
-        this.getAccountUseCase = getAccountUseCase;
-        this.mapper = mapper;
-    }
-    
-    @PostMapping
-    @ResponseStatus(HttpStatus.CREATED)
-    public AccountResponse openAccount(@Valid @RequestBody OpenAccountRequest request) {
-        Account account = openAccountUseCase.execute(
-            new OwnerId(request.ownerId()),
-            Currency.getInstance(request.currency())
-        );
-        return mapper.toResponse(account);
-    }
-    
-    @GetMapping("/{id}")
-    public AccountResponse getAccount(@PathVariable UUID id) {
-        Account account = getAccountUseCase.execute(new AccountId(id));
-        return mapper.toResponse(account);
-    }
-}
-```
+Network timeout'ta client retry yapar; key yoksa aynı transfer iki kez işlenir ve **çift ödeme** olur — banking'de felaket. Key varsa server üç adım izler: key kayıtlı mı diye bakar; kayıtlıysa saklanan response'u aynen döner (yeniden işleme yok); yeniyse işler, key + response'u `idempotency_keys` tablosuna kaydeder ve döner. `request_hash` ek bir tuzağı yakalar: aynı key + farklı body = client hatası, 422 dönülür.
 
-`OpenAccountUseCase`, `GetAccountUseCase` interface'lerini `application/port/in/` altına yaz. Onların implementation'ı `application/service/` altında.
+</details>
 
-### Task 1.5.4 — `TransferController` yaz (30 dk)
+**S4. 400, 422 ve 409'u birer banking örneğiyle ayırt et.**
 
-`banking/transfer/adapter/in/web/TransferController.java`:
+<details>
+<summary>Cevabı göster</summary>
+
+**400 Bad Request**: HTTP/JSON seviyesinde malformed input — istek parse bile edilemedi (bozuk JSON). **422 Unprocessable Entity**: input semantik olarak yanlış, domain validation hatası — negatif transfer amount, insufficient funds, currency mismatch. **409 Conflict**: state conflict — iki transfer aynı anda çalıştı, optimistic lock fail etti. Karar akışı: parse edildi mi? → hayırsa 400; domain kuralları geçti mi? → hayırsa 422; state çakışması var mı? → evetse 409.
+
+</details>
+
+**S5. MapStruct manuel `toResponse` metoduna göre ne kazandırır ve mapper'lar mimaride nerede yaşar?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+MapStruct annotation processor ile mapping kodunu **compile-time'da** üretir: eksik mapping compile hatası verir (manuel mapping'de sessiz bug olurdu), reflection yok yani hızlı, ve type-safe. Bedeli annotation processor setup'ı ve custom mapping'lerde (`@Named` metotlar) biraz boilerplate. Mapper'lar **adapter katmanında** yaşar, domain'de değil — ve iki ayrı mapper vardır: `AccountWebMapper` (HTTP DTO ↔ domain) ile `AccountPersistenceMapper` (JPA entity ↔ domain). Bunlar karıştırılmaz.
+
+</details>
+
+**S6. Bu projede Lombok'u domain class'larında neden kullanmıyoruz; JPA entity neden `record` olamıyor?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+`@Data` mutable yapı yaratır (setter'lar gelir) — domain modelinde immutability kırılır; `@Builder` constructor'daki invariant kontrollerini bypass eder; generated kod görünmez olduğu için debug zorlaşır. Bu yüzden domain'de `record` veya manuel class kullanıyoruz. JPA entity ise `record` olamaz çünkü JPA proxy gerektirir ve record final'dır; setter'sız yapı da JPA ile uyumsuz. Kararımız: DTO'lar `record`, domain'de Lombok yok, JPA entity'de sadece `@Getter`/`@Setter` — `@Data` asla.
+
+</details>
+
+**S7. Para tutarlarını (`BigDecimal`) JSON'a string olarak yazmak neden daha güvenli?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+JavaScript client'lar sayıları IEEE-754 float olarak tutar ve precision kaybeder — `1000.05` gibi bir tutar bozulabilir; banking'de bu kabul edilemez. String olarak yazınca client parse'ı kendi decimal kütüphanesiyle yapar. Jackson tarafında iki önlem var: `WRITE_BIGDECIMAL_AS_PLAIN: true` scientific notation'ı (`1.5E2`) engeller; `ToStringSerializer` tutarı string yazar:
 
 ```java
-@RestController
-@RequestMapping("/v1/transfers")
-class TransferController {
-    
-    @PostMapping
-    @ResponseStatus(HttpStatus.CREATED)
-    public TransferResponse transfer(
-        @Valid @RequestBody TransferRequest request,
-        @RequestHeader("Idempotency-Key") UUID idempotencyKey
-    ) {
-        // Phase 2'de idempotency tam implement edilecek
-        // Şimdilik header'ı al ama hâlâ kullanma
-        ...
-    }
-}
+@JsonSerialize(using = ToStringSerializer.class)
+private BigDecimal amount;
 ```
 
-### Task 1.5.5 — OpenAPI dokümantasyonu (30 dk)
+Bunu her DTO'da tekrarlamak yerine merkezi `ObjectMapper` configuration'ında yap.
 
-`pom.xml`'a `springdoc-openapi-starter-webmvc-ui` ekle.
+</details>
 
-DTO'larına `@Schema` annotation'ları ekle (yukarıda örnek).
+**S8. `POST /accounts/123/close` gibi action-verb URL'lere REST puristleri karşı; banking'de bu gerilim nasıl çözülür?**
 
-Endpoint'lere `@Operation` ekle.
+<details>
+<summary>Cevabı göster</summary>
 
-`http://localhost:8080/swagger-ui.html`'a git, otomatik dokümantasyonu incele. **Defterine** ekran görüntüsü gibi açıklamasını yaz.
+REST puristleri URL'lerin noun-based olmasını ister; ama close/cancel/block gibi işlemler basit CRUD değil, **command**'dır. Kabul edilebilir alternatifler: command'ı resource'a çevirmek (`POST /transfers/456/cancellations` — cancellation kaynağı yarat) ya da state değişikliğini `PATCH /accounts/123 {"status": "CLOSED"}` ile ifade etmek. Banking'de kural pragmatik olarak ihlal de edilebilir; asıl önemli olan ekipçe bir yaklaşım seçip **tutarlı kalmak**.
 
-### Task 1.5.6 — Lombok'a karar ver (deney) (15 dk)
+</details>
 
-Bir `AccountJpaEntity` class'ı yaz (henüz JPA bilgin yok, sadece sınıf):
+---
 
-```java
-import lombok.Data;
-import lombok.NoArgsConstructor;
-import lombok.AllArgsConstructor;
-import lombok.Builder;
+## Tamamlama kriterleri
 
-@Data
-@NoArgsConstructor
-@AllArgsConstructor
-@Builder
-public class AccountJpaEntity {
-    private UUID id;
-    private UUID ownerId;
-    private String currency;
-    private BigDecimal balanceAmount;
-    private String status;
-    private Instant openedAt;
-}
-```
+- [ ] "Kendini Sına" sorularının tümünü cevaba bakmadan yanıtlayabiliyorum
+- [ ] Entity'i HTTP'ye sızdırmanın sorunlarını (internal field, mass assignment, lazy loading, kontrat-şema bağlanması) sayabiliyorum
+- [ ] Request/Response DTO ayrımını ve `record` tercihini gerekçesiyle açıklayabiliyorum
+- [ ] `Idempotency-Key` akışını (üç adım + `request_hash` kontrolü) anlatabiliyorum
+- [ ] 400 / 422 / 409 ayrımını birer banking örneğiyle açıklayabiliyorum
+- [ ] MapStruct'ın ne ürettiğini ve web/persistence mapper'larının adapter katmanındaki yerini biliyorum
+- [ ] Lombok kararını (domain'de yok; JPA entity'de `@Getter`/`@Setter`, `@Data` asla) savunabiliyorum
+- [ ] URL versioning, pagination ve tutarlı response shape yaklaşımlarını açıklayabiliyorum
+- [ ] (İsteğe bağlı) "Pratik yapmak istersen" bölümündeki testleri yazdım ve Claude-verify prompt'unu çalıştırdım
 
-Aynı class'ı **Lombok olmadan** yaz:
+---
 
-```java
-public class AccountJpaEntity {
-    private UUID id;
-    private UUID ownerId;
-    // ... getters, setters, no-args, all-args, equals, hashCode, toString
-}
-```
+## Defter notları
 
-İkisini karşılaştır. Hangisinin testin/refactor'ın daha kolay olduğunu **defterine** yaz.
+1. "Entity'i HTTP'ye sızdırmanın 5 sorunu: ____."
+2. "Request ve Response DTO neden ayrı: ____."
+3. "Banking'de POST /transfers idempotent yapmak için: ____."
+4. "MapStruct'ın manual mapping'e göre avantajları: ____."
+5. "MapStruct + Lombok birlikte çalıştırmak için gereken konfigürasyon: ____."
+6. "Lombok'u domain class'ında neden istemiyoruz: ____."
+7. "`record` JPA entity için neden uygun değil: ____."
+8. "URL versioning vs header versioning farkı: ____."
+9. "RFC 7807 nedir, ne işe yarar (kısaca): ____."
+10. "Banking API'sinde 422 ve 400 farkı: ____."
 
-`record` ile alternatif:
-```java
-public record AccountJpaEntity(
-    UUID id, UUID ownerId, String currency, ...
-) {}
-```
-
-```admonish warning title="Dikkat"
-JPA entity'sinin `record` olamayacağını bil — JPA proxy gerektirir, record final. Bu yüzden JPA entity'leri için Lombok mantıklı olabilir.
+```admonish success title="Bölüm Özeti"
+- Domain entity asla HTTP'ye sızmaz — her endpoint için yön bazlı Request/Response DTO yaz
+- DTO'lar için modern standart `record`: immutable, setter yok, boilerplate yok
+- Banking'de `POST /transfers` gibi kritik uçlarda `Idempotency-Key` header şart — çift ödeme felakettir
+- Status code ayrımı net olsun: 400 malformed input, 422 domain validation hatası, 409 state conflict
+- MapStruct compile-time mapper üretir; web ve persistence mapper'ları adapter katmanında ayrı tut
+- Lombok'u domain'de kullanma; JPA entity'de `@Getter`/`@Setter` OK, `@Data` riskli
 ```
 
 ---
 
-## Test yazma rehberi
+## Pratik yapmak istersen
 
-### Test 1.5.1 — Controller test (`@WebMvcTest`)
+Bu bölümdeki kavramları kod üzerinde denemek istersen aşağıdaki iki kaynak hazır: test yazma rehberi ve kodunu Claude'a doğrulatmak için hazır bir prompt.
+
+<details>
+<summary>Test yazma rehberi (controller, mapper ve JSON serialization testleri)</summary>
+
+### Test 1 — Controller test (`@WebMvcTest`)
 
 `AccountControllerTest.java`:
 
@@ -886,7 +912,7 @@ class AccountControllerTest {
 }
 ```
 
-### Test 1.5.2 — Mapper test
+### Test 2 — Mapper test
 
 ```java
 class AccountWebMapperTest {
@@ -914,7 +940,7 @@ class AccountWebMapperTest {
 }
 ```
 
-### Test 1.5.3 — JSON serialization smoke
+### Test 3 — JSON serialization smoke
 
 ```java
 @Test
@@ -932,9 +958,10 @@ void shouldSerializeBigDecimalAsString() throws Exception {
 }
 ```
 
----
+</details>
 
-## Claude-verify prompt
+<details>
+<summary>Claude-verify prompt (kodunu banking-grade kriterlere göre doğrulat)</summary>
 
 ```
 Aşağıdaki Spring Boot REST API kodumu banking-grade kriterlere göre değerlendir. 
@@ -997,42 +1024,4 @@ Sadece eksik veya yanlışları işaretle:
 Her madde için PASS / FAIL / EKSIK işaretle ve neden olduğunu açıkla. Kod yazma.
 ```
 
----
-
-## Tamamlama kriterleri
-
-- [ ] `OpenAccountRequest`, `AccountResponse`, `TransferRequest`, `TransferResponse` record olarak yazıldı
-- [ ] DTO'larda hiç JPA annotation'ı YOK
-- [ ] `AccountController` ve `TransferController` `/v1/` prefix'i ile
-- [ ] MapStruct kurulu, `AccountWebMapper` çalışıyor
-- [ ] Generated source'u inceledim, ne yapıldığını anladım
-- [ ] OpenAPI / Swagger UI çalışıyor, dokümantasyon görünür
-- [ ] Lombok kullanım kararı (defterimde net olarak yazılı)
-- [ ] `@WebMvcTest` ile controller test edildi (`MockMvc`)
-- [ ] Mapper unit test'i yazıldı
-- [ ] `Idempotency-Key` header'ı transfer endpoint'inde **bekleniyor** (implement Phase 2)
-- [ ] Status code'ları doğru kullanıyorum (201 create, 400 bad request, vb.)
-
----
-
-## Defter notları
-
-1. "Entity'i HTTP'ye sızdırmanın 5 sorunu: ____."
-2. "Request ve Response DTO neden ayrı: ____."
-3. "Banking'de POST /transfers idempotent yapmak için: ____."
-4. "MapStruct'ın manual mapping'e göre avantajları: ____."
-5. "MapStruct + Lombok birlikte çalıştırmak için gereken konfigürasyon: ____."
-6. "Lombok'u domain class'ında neden istemiyoruz: ____."
-7. "`record` JPA entity için neden uygun değil: ____."
-8. "URL versioning vs header versioning farkı: ____."
-9. "RFC 7807 nedir, ne işe yarar (kısaca): ____."
-10. "Banking API'sinde 422 ve 400 farkı: ____."
-
-```admonish success title="Bölüm Özeti"
-- Domain entity asla HTTP'ye sızmaz — her endpoint için yön bazlı Request/Response DTO yaz
-- DTO'lar için modern standart `record`: immutable, setter yok, boilerplate yok
-- Banking'de `POST /transfers` gibi kritik uçlarda `Idempotency-Key` header şart — çift ödeme felakettir
-- Status code ayrımı net olsun: 400 malformed input, 422 domain validation hatası, 409 state conflict
-- MapStruct compile-time mapper üretir; web ve persistence mapper'ları adapter katmanında ayrı tut
-- Lombok'u domain'de kullanma; JPA entity'de `@Getter`/`@Setter` OK, `@Data` riskli
-```
+</details>

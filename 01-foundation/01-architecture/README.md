@@ -14,7 +14,7 @@
 
 ## Süre
 
-Okuma: 1.5-2 saat • Mini task'ler: 2 saat • Test: 30 dk • Toplam: ~4.5 saat
+Okuma: 1.5-2 saat • Kendini sına: 30 dk • Pratik (opsiyonel): 2-2.5 saat
 
 ## Önbilgi
 
@@ -62,7 +62,11 @@ class AccountController {
         return ResponseEntity.ok(service.create(req));
     }
 }
+```
 
+Controller'ın tek işi HTTP isteğini karşılayıp servise devretmek — buraya kadar sorun yok. Asıl kritik nokta bir alt katmanda:
+
+```java
 // Service — business logic
 @Service
 class AccountService {
@@ -74,7 +78,11 @@ class AccountService {
         return new AccountResponse(account.getId(), account.getBalance());
     }
 }
+```
 
+Service iş kurallarını taşıyor ama enjekte ettiği `AccountRepository` doğrudan bir JPA interface'i:
+
+```java
 // Repository — DB'i bilir
 interface AccountRepository extends JpaRepository<Account, Long> { }
 ```
@@ -132,6 +140,8 @@ Kesikli oklara dikkat: JPA adapter sağda durur ama ok **çekirdeğe doğru** ak
 
 **Banking domain örneği:**
 
+Merkezden başlayalım. Domain sınıfı saf Java — iş kuralı (insufficient funds) metodun içinde yaşıyor:
+
 ```java
 // === DOMAIN === (framework yok, Spring yok, JPA yok)
 // banking/domain/account/Account.java
@@ -152,7 +162,11 @@ public class Account {
     }
     // ... getters, no setters
 }
+```
 
+Çekirdek, dış dünyadan ne istediğini iki port ile ilan eder: driven port `AccountRepository` ("bana persistence sağlayın") ve driving port `TransferMoneyUseCase` ("beni bu kontrat üzerinden çağırın"):
+
+```java
 // === PORT === (interface, domain'in dışarıdan istediği)
 // banking/application/port/out/AccountRepository.java
 public interface AccountRepository {
@@ -165,7 +179,11 @@ public interface AccountRepository {
 public interface TransferMoneyUseCase {
     void transfer(AccountId from, AccountId to, Money amount);
 }
+```
 
+Application service use case'i implement eder ve persistence'a **sadece port üzerinden** ulaşır — constructor'a gelen `AccountRepository`'nin arkasında JPA mı MongoDB mi olduğunu bilmez:
+
+```java
 // === APPLICATION SERVICE === (orchestration)
 // banking/application/service/TransferMoneyService.java
 public class TransferMoneyService implements TransferMoneyUseCase {
@@ -185,7 +203,11 @@ public class TransferMoneyService implements TransferMoneyUseCase {
         accountRepository.save(toAccount);
     }
 }
+```
 
+Driven adapter, çekirdeğin tanımladığı port'u JPA ile somutlaştırır; mapper, JPA entity'si ile domain nesnesi arasında çeviri yapar:
+
+```java
 // === ADAPTER (driven) === (JPA implementation)
 // banking/adapter/out/persistence/JpaAccountRepository.java
 @Component
@@ -204,7 +226,11 @@ class JpaAccountRepository implements AccountRepository {
         jpaRepo.save(entity);
     }
 }
+```
 
+`@Entity` annotation'ı domain'e değil, sadece persistence katmanında yaşayan ayrı bir sınıfa yapışır:
+
+```java
 // JPA entity'si domain'in dışında, sadece persistence katmanında
 @Entity
 @Table(name = "accounts")
@@ -215,7 +241,11 @@ class AccountJpaEntity {
     String balanceCurrency;
     // ...
 }
+```
 
+Son parça driving adapter: HTTP controller use case **port'unu** çağırır — somut service sınıfını değil, interface'i tanır:
+
+```java
 // === ADAPTER (driving) === (HTTP controller)
 // banking/adapter/in/web/TransferController.java
 @RestController
@@ -301,6 +331,51 @@ Faz 1'de bilmen gereken parçaları:
 
 **Banking örneği — value object:**
 
+`Money`'nin bütün doğruluğu construction anında garanti altına alınır — compact constructor null ve scale kontrolü yapar, geçersiz bir `Money` nesnesi hiç var olamaz:
+
+```java
+public record Money(BigDecimal amount, Currency currency) {
+    public Money {
+        if (amount == null || currency == null) throw new IllegalArgumentException();
+        if (amount.scale() > currency.getDefaultFractionDigits()) {
+            throw new IllegalArgumentException("Too many decimal places for " + currency);
+        }
+    }
+```
+
+Aritmetik metotlar mevcut nesneyi değiştirmez, **yeni bir `Money` döndürür** — immutability tam olarak budur:
+
+```java
+    public Money add(Money other) {
+        requireSameCurrency(other);
+        return new Money(amount.add(other.amount), currency);
+    }
+    
+    public Money subtract(Money other) {
+        requireSameCurrency(other);
+        return new Money(amount.subtract(other.amount), currency);
+    }
+```
+
+Karşılaştırma dahil her operasyon önce `requireSameCurrency` ile para birimi eşitliğini zorlar — kural tek yerde tanımlı, her yerden zorunlu:
+
+```java
+    public boolean isLessThan(Money other) {
+        requireSameCurrency(other);
+        return amount.compareTo(other.amount) < 0;
+    }
+    
+    private void requireSameCurrency(Money other) {
+        if (!currency.equals(other.currency)) {
+            throw new CurrencyMismatchException(currency, other.currency);
+        }
+    }
+}
+```
+
+<details>
+<summary>Tam kod: Money (~30 satır)</summary>
+
 ```java
 public record Money(BigDecimal amount, Currency currency) {
     public Money {
@@ -333,9 +408,60 @@ public record Money(BigDecimal amount, Currency currency) {
 }
 ```
 
+</details>
+
 Dikkat: currency mismatch kuralı `Money`'nin **içinde** yaşıyor. <mark>Onu kullanan hiçbir servis bu kontrolü unutamaz.</mark>
 
 **Banking örneği — aggregate root:**
+
+`Account` durumunu private tutar ve her durum değişikliğinde bir domain event biriktirir. `deposit` önce invariant'ı (currency eşitliği) kontrol eder:
+
+```java
+public class Account {
+    private final AccountId id;
+    private final OwnerId ownerId;
+    private final Currency currency;
+    private Money balance;
+    private final List<DomainEvent> events = new ArrayList<>();
+    
+    public void deposit(Money amount, TransferId transferId) {
+        if (!amount.currency().equals(this.currency)) {
+            throw new CurrencyMismatchException(this.currency, amount.currency());
+        }
+        balance = balance.add(amount);
+        events.add(new MoneyDeposited(id, amount, transferId, Instant.now()));
+    }
+```
+
+`withdraw` ek olarak insufficient-funds kuralını uygular — "bakiye negatife düşemez" invariant'ı setter'la dışarıdan değil, davranışın kendisiyle korunur:
+
+```java
+    public void withdraw(Money amount, TransferId transferId) {
+        if (!amount.currency().equals(this.currency)) {
+            throw new CurrencyMismatchException(this.currency, amount.currency());
+        }
+        if (balance.isLessThan(amount)) {
+            throw new InsufficientFundsException(id);
+        }
+        balance = balance.subtract(amount);
+        events.add(new MoneyWithdrawn(id, amount, transferId, Instant.now()));
+    }
+```
+
+Biriken event'leri application service tek seferde çeker: liste kopyalanır ve temizlenir, böylece aynı event iki kez yayınlanmaz:
+
+```java
+    public List<DomainEvent> pullEvents() {
+        var pulled = List.copyOf(events);
+        events.clear();
+        return pulled;
+    }
+    // ...
+}
+```
+
+<details>
+<summary>Tam kod: Account (~34 satır)</summary>
 
 ```java
 public class Account {
@@ -372,6 +498,8 @@ public class Account {
     // ...
 }
 ```
+
+</details>
 
 ```admonish warning title="Dikkat"
 `Account` saf Java. `@Entity` yok. JPA ayrı bir `AccountJpaEntity` ile temsil edilir, mapper ile dönüşür.
@@ -569,80 +697,137 @@ Domain, persistence adapter'a import yapar. Bu hexagonal'i çürütür. Domain h
 
 ---
 
-## Mini task'ler
+## Kendini Sına
 
-Bunları sırayla `~/projects/core-banking/` içinde yap. Henüz Spring Boot kurmaya gerek yok, sadece domain sınıfları yazıyoruz.
+Aşağıdaki sorular mülakat tarzındadır. Önce kendi cevabını sesli veya yazılı ver, sonra cevabı açıp karşılaştır.
 
-### Task 1.1.1 — `Money` value object'i yaz (30 dk)
+**S1. Layered mimaride `AccountService`'in doğrudan `JpaRepository`'e bağımlı olması banking'de hangi somut sorunlara yol açar?**
 
-`banking/domain/common/Money.java` oluştur. Şu kuralları sağlasın:
+<details>
+<summary>Cevabı göster</summary>
 
-- `amount` (BigDecimal) ve `currency` (java.util.Currency) tutar
-- Immutable (record kullanabilirsin)
-- `add(Money other)` ve `subtract(Money other)` metodları
-- Farklı para birimleriyle aritmetik → `CurrencyMismatchException` fırlat
-- Negatif amount construction'da kabul edilebilir (refund senaryosu için) ama dikkatli ol
-- `isLessThan`, `isGreaterThanOrEqual`, `isZero`, `isNegative` metodları
-- `Money.zero(Currency)` static factory
-- `Money.of(BigDecimal, Currency)` static factory
-- Scale, currency'nin default fraction digits'i ile sınırlı (TRY: 2, JPY: 0, BHD: 3)
+İş kurallarını taşıyan katman persistence teknolojisini tanımış olur ve bunun dört somut bedeli vardır: (1) domain modeli `@Entity`, `@Id` gibi annotation'larla JPA'ya yapışır — teknoloji değişiminde domain'i yeniden yazarsın; (2) Service'i unit test etmek için mock veya `@DataJpaTest` gerekir, saf Java birim testi yazamazsın; (3) iş kuralları katmanlara dağılır (validation Controller'da, bakiye kontrolü Service'te, audit Repository'de); (4) dış sistem entegrasyonu domain logic'in içine sızar. Bankada bir hesap servisi 10 yıl yaşar ve o sürede DB/framework değişir — bu bağımlılık "uygulamayı sıfırdan yaz" riskine dönüşür.
 
-### Task 1.1.2 — `AccountId`, `OwnerId`, `TransferId` value object'leri (15 dk)
+</details>
 
-Hepsi `record` olarak yaz. Null kabul etmesin. UUID veya Long bazlı — seçimin senin.
+**S2. "Hexagonal mimaride bağımlılık yönü ters çevrilir" ne demek? JPA adapter örneğiyle açıkla.**
 
-### Task 1.1.3 — `Account` aggregate root'u (45 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-`banking/domain/account/Account.java` oluştur:
+Çekirdek, ihtiyacını bir interface (port) olarak kendisi tanımlar: `AccountRepository`. `JpaAccountRepository` adapter'ı bu interface'i **implement eder** — yani derleme bağımlılığı adapter'dan çekirdeğe doğru akar. Adapter çekirdeği import eder ama çekirdek adapter'ın varlığını bile bilmez. Buna **dependency inversion** denir. Sonucu: JPA'yı MongoDB ile değiştirmek sadece yeni bir adapter yazmaktır; çekirdek koduna ve domain kurallarına dokunulmaz.
 
-- `id` (AccountId), `ownerId` (OwnerId), `currency` (Currency), `balance` (Money) tutar
-- Constructor private veya factory ile çağrılır: `Account.open(OwnerId owner, Currency currency)` → balance 0 ile başlar
-- `deposit(Money amount)` ve `withdraw(Money amount)` metodları
-- Currency mismatch ve insufficient funds için kendi exception'larını fırlat
-- `domain/account/exception/` paketine `InsufficientFundsException`, `CurrencyMismatchException` koy
-- Setter yok. Tüm değişiklik metot ile.
+</details>
 
-### Task 1.1.4 — Klasör yapısını oluştur (10 dk)
+**S3. Port ile adapter farkı nedir? Driving ve driven taraflar için birer banking örneği ver.**
 
-`~/projects/core-banking/` içinde **henüz boş** olsa bile şu klasörleri oluştur (Maven yapısı henüz değil, sadece package planı):
+<details>
+<summary>Cevabı göster</summary>
 
-```
-core-banking/
-└── src/
-    └── main/
-        └── java/
-            └── com/
-                └── mavibank/
-                    └── banking/
-                        ├── account/
-                        │   ├── domain/
-                        │   ├── application/
-                        │   │   ├── port/
-                        │   │   │   ├── in/
-                        │   │   │   └── out/
-                        │   │   └── service/
-                        │   └── adapter/
-                        │       ├── in/
-                        │       │   └── web/
-                        │       └── out/
-                        │           └── persistence/
-                        ├── transfer/
-                        │   └── ... (account ile aynı yapı)
-                        └── common/
-                            └── domain/
+Port, çekirdeğin dış dünyayla konuşma **kontratıdır** (çekirdeğin tanımladığı interface); adapter ise o kontratı gerçek bir teknolojiyle somutlaştıran koddur. Driving port "beni dışarıdan çağırın" der — örnek: `TransferMoneyUseCase`; onu çağıran driving adapter HTTP `TransferController`'dır (gRPC handler veya Kafka consumer da olabilir). Driven port "bana bunları sağlayın" der — örnek: `AccountRepository`, `NotificationSender`; onları implement eden driven adapter'lar `JpaAccountRepository` ve Kafka producer'dır. Kısaca: driving taraf uygulamayı çağırır, driven taraf uygulama tarafından çağrılır.
+
+</details>
+
+**S4. Entity ile value object farkı nedir? `Money` neden immutable bir value object ve currency-mismatch kontrolü neden `Money`'nin içinde yaşamalı?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Entity kimliğiyle tanımlanır — iki müşterinin adı aynı olsa da farklı entity'dirler (`Account`, `Customer`). Value object değeriyle tanımlanır — her `Money(100.00, TRY)` birbirine eşittir. `Money` immutable olmalıdır çünkü `add`/`subtract` mevcut nesneyi değiştirmeyip yeni bir `Money` döndürür; böylece paylaşılan bir bakiye nesnesi yan etkiyle bozulamaz. Kural içeride olunca da onu kullanan hiçbir servis kontrolü unutamaz:
+
+```java
+public Money add(Money other) {
+    requireSameCurrency(other);   // kural tek yerde, her operasyonda zorunlu
+    return new Money(amount.add(other.amount), currency);
+}
 ```
 
-### Task 1.1.5 — ADR yaz (15 dk)
+</details>
 
-`core-banking/docs/adr/0001-use-hexagonal-architecture.md` oluştur. Yukarıdaki template'i kullan. Kendi kararını kendi cümlelerinle yaz.
+**S5. Aggregate root nedir? `withdraw` logic'inin service yerine `Account`'un içinde olması neden kritik — bunun ihlaline hangi anti-pattern denir?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Aggregate root, bir tutarlılık sınırının **yegane giriş noktasıdır**; child nesnelerini (örn. `JournalEntry`'leri) kendisi yönetir. `account.withdraw(amount)` insufficient-funds ve currency-mismatch invariant'larını nesnenin içinde uygular — hiçbir çağıran kuralı atlayamaz. Kuralın `getBalance`/`setBalance` üzerinden serviste uygulanması **Anemic Domain Model** anti-pattern'idir: domain sınıfı davranışsız bir veri torbasına dönüşür ve başka bir servis aynı kontrolü unutursa bakiye negatife düşer.
+
+</details>
+
+**S6. Domain sınıfına `@Entity` koymak yerine ayrı bir `AccountJpaEntity` + mapper tutmanın kazancı ve bedeli nedir?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Kazanç: domain saf Java kalır — Spring/JPA olmadan derlenir ve unit test'ler mock'suz yazılır; persistence teknolojisi değişince sadece adapter, JPA entity ve mapper değişir; test piramidi sağlıklı olur (çok sayıda hızlı domain testi, az sayıda integration testi). Bedel: mapper kodu yazma yükü ve küçük bir CRUD admin paneli için gerçek bir over-engineering riski. Banking'de tercih nedeni: domain kuralları on yıllarca yaşar, teknoloji ~3 yılda bir değişir — ayrım seni yaşatır.
+
+</details>
+
+**S7. Package yapısında feature-first (Variant A) yaklaşımını layer-first'e neden tercih ediyoruz?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Üç sebep: (1) bir feature'a dokunmak istediğinde domain, service ve adapter kodunun tamamı aynı klasörün altında; (2) ileride microservice'e bölmek gerektiğinde feature'ı tek klasör halinde çıkarırsın; (3) DDD'nin bounded context fikriyle birebir eşleşir — `account` ve `transfer` kendi modelleriyle ayrı yaşar. Layer-first'te ise tek bir feature değişikliği üç ayrı package ağacına dokunmayı gerektirir.
+
+</details>
+
+**S8. ADR nedir, hangi bölümlerden oluşur ve neden yazılır?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Architectural Decision Record — mimari bir kararın markdown dosyası olarak kayıt altına alınmasıdır (`docs/adr/` klasöründe, karar başına bir dosya). Tipik bölümleri: başlık, tarih ve status; **Context** (kararın alındığı ortam ve kısıtlar), **Decision** (ne seçildi), **Consequences** (artılar ve eksiler — dürüstçe, eksiler dahil). Amacı: altı ay sonra "biz neden hexagonal seçmiştik?" sorusunun cevabının kaybolmaması. Banking şirketlerinde production'a giren her major karar bu şekilde belgelenir.
+
+</details>
 
 ---
 
-## Test yazma rehberi
+## Tamamlama kriterleri (kendine sor)
+
+- [ ] "Kendini Sına" bölümündeki tüm soruları cevaba bakmadan yanıtlayabildim
+- [ ] Hexagonal architecture'ın "dependency direction"ını birine 2 dakikada anlatabilirim
+- [ ] Port ile adapter farkını driving/driven örnekleriyle açıklayabiliyorum
+- [ ] Value object ile entity farkını ve `Money`'nin neden immutable olduğunu açıklayabiliyorum
+- [ ] Anti-pattern'leri tanıyabiliyorum (Anemic Domain Model özellikle)
+- [ ] (Pratik yaptıysan) `Money` ve `Account`'u framework annotation'sız yazdım, `MoneyTest`/`AccountTest` AssertJ ile geçiyor, ADR'ımı yazdım
+
+Hepsi onaylı → Topic 1.2'ye geç → [02-project-setup/](../02-project-setup/index.md)
+
+---
+
+## Notlar (defterine yaz)
+
+Aşağıdaki cümleleri **kendi kelimelerinle** doldur:
+
+1. "Hexagonal architecture'ın temel prensibi ____ ve bunun banking projesinde önemi ____ çünkü ____."
+2. "Bir port ve bir adapter farkı şu: ____. Driving port örneği ____, driven port örneği ____."
+3. "Anemic Domain Model'in problemi ____. Bunun yerine ____ yaparım."
+4. "DDD'nin Entity ve Value Object farkı ____. `Money` value object'tir çünkü ____."
+5. "Aggregate root nedir, neden önemli? ____."
+
+---
+
+```admonish success title="Bölüm Özeti"
+- Mimarinin can damarı **bağımlılık yönüdür**: hexagonal'de dış dünya çekirdeğe bağımlıdır, çekirdek dış dünyayı bilmez
+- **Port** çekirdeğin tanımladığı interface, **adapter** onu bir teknolojiyle somutlaştıran koddur; driving taraf uygulamayı çağırır, driven taraf uygulama tarafından çağrılır
+- Domain modeli **saf Java** kalır: `@Entity` gibi framework annotation'ları domain'e girmez, JPA entity'si ayrı tutulup mapper ile dönüştürülür
+- `Money` gibi **value object'ler immutable** olur ve kendi kurallarını (currency mismatch, scale) içinde taşır; `Account` gibi **aggregate root'lar** iç tutarlılığı kendi metotlarıyla korur
+- Package yapısında **feature-first** (Variant A) tercih edilir; bounded context ile eşleşir ve microservice'e bölünmeyi kolaylaştırır
+- **Anemic Domain Model**'den kaç: logic getter/setter'la dışarıda değil, `account.withdraw(amount)` gibi davranış olarak domain'in içinde yaşar
+```
+
+---
+
+## Pratik yapmak istersen
+
+Kavramları koda dökmek en kalıcı öğrenme yöntemidir. `~/projects/core-banking/` altında `Money` value object'ini, `AccountId`/`OwnerId`/`TransferId` record'larını ve `Account` aggregate root'unu **framework'süz saf Java** ile yaz (Kavramlar bölümündeki örnekleri referans al, `docs/adr/0001-use-hexagonal-architecture.md` için ADR template'ini kullan). Sonra aşağıdaki rehberle test et ve Claude'a verify ettir.
+
+<details>
+<summary>Test yazma rehberi</summary>
 
 Bu topic'te framework olmadığı için **saf JUnit 5 + AssertJ** ile başlıyoruz. Test class'larını `src/test/java/com/mavibank/banking/...` altında entity ile aynı paket yapısında yaz.
 
-### Test 1.1.1 — `MoneyTest`
+**Test 1 — `MoneyTest`**
 
 Şu senaryoları yaz (her biri ayrı `@Test`):
 
@@ -657,6 +842,7 @@ Bu topic'te framework olmadığı için **saf JUnit 5 + AssertJ** ile başlıyor
 9. `null` currency ile construction → NullPointerException veya IllegalArgumentException
 
 AssertJ kullan:
+
 ```java
 import static org.assertj.core.api.Assertions.*;
 
@@ -664,7 +850,7 @@ assertThat(result).isEqualTo(Money.of(new BigDecimal("150.00"), TRY));
 assertThatThrownBy(() -> money1.add(money2)).isInstanceOf(CurrencyMismatchException.class);
 ```
 
-### Test 1.1.2 — `AccountTest`
+**Test 2 — `AccountTest`**
 
 1. `Account.open(ownerId, TRY)` → balance 0 TRY
 2. Account'a `deposit(100 TRY)` → balance 100 TRY
@@ -674,7 +860,7 @@ assertThatThrownBy(() -> money1.add(money2)).isInstanceOf(CurrencyMismatchExcept
 6. Birden fazla deposit/withdraw kombinasyonu sonrası balance doğru
 7. Withdraw amount 0 ise → IllegalArgumentException (sınır durumu)
 
-### Test 1.1.3 — Pattern öğrenmek için: Test Data Builder
+**Test 3 — Pattern öğrenmek için: Test Data Builder**
 
 Test'lerinde her sefer `Account.open(new OwnerId(UUID.randomUUID()), Currency.getInstance("TRY"))` yazmak yorucu. Test helper class'ı yaz:
 
@@ -704,17 +890,17 @@ class AccountTestBuilder {
 ```
 
 Kullanım:
+
 ```java
 var account = anAccount().withCurrency("TRY").withBalance("100.00").build();
 ```
 
-```admonish tip title="İpucu"
-Bu pattern (Object Mother / Test Data Builder) banka tarafında **çok yaygın**, alışkanlık kazan.
-```
+> **İpucu:** Bu pattern (Object Mother / Test Data Builder) banka tarafında **çok yaygın**, alışkanlık kazan.
 
----
+</details>
 
-## Claude-verify prompt
+<details>
+<summary>Claude-verify prompt</summary>
 
 Topic'i bitirdiğinde, kodunu Claude'a verify ettir. **Sadece verify**, kod yazdırma. Aşağıdaki prompt'u kopyala, kodunu (yapıştırarak veya repo linki ile) ver:
 
@@ -762,41 +948,4 @@ Her madde için PASS / FAIL / EKSIK olarak işaretle ve kısa açıklama yap. Ko
 düzeltme. Sadece neyin eksik/yanlış olduğunu söyle. Ben düzelteceğim.
 ```
 
----
-
-## Tamamlama kriterleri (kendine sor)
-
-- [ ] `Money`, `AccountId`, `OwnerId`, `TransferId`, `Account` class'larını yazdım
-- [ ] Domain class'larımın hiçbirinde `@Entity` veya Spring annotation'ı yok
-- [ ] `InsufficientFundsException` ve `CurrencyMismatchException` yazdım, kullanıyorum
-- [ ] Paket yapısı `account/domain`, `account/application/port/{in,out}`, `account/application/service`, `account/adapter/{in/web, out/persistence}` şeklinde
-- [ ] `MoneyTest` ve `AccountTest` yazdım, AssertJ kullandım
-- [ ] Test Data Builder pattern'i öğrendim ve kullandım
-- [ ] `docs/adr/0001-use-hexagonal-architecture.md` yazdım
-- [ ] Hexagonal architecture'ın "dependency direction"ını birine 2 dakikada anlatabilirim
-- [ ] Anti-pattern'leri tanıyabiliyorum (Anemic Domain Model özellikle)
-
-Hepsi onaylı → Topic 1.2'ye geç → [02-project-setup/](../02-project-setup/index.md)
-
----
-
-## Notlar (defterine yaz)
-
-Aşağıdaki cümleleri **kendi kelimelerinle** doldur:
-
-1. "Hexagonal architecture'ın temel prensibi ____ ve bunun banking projesinde önemi ____ çünkü ____."
-2. "Bir port ve bir adapter farkı şu: ____. Driving port örneği ____, driven port örneği ____."
-3. "Anemic Domain Model'in problemi ____. Bunun yerine ____ yaparım."
-4. "DDD'nin Entity ve Value Object farkı ____. `Money` value object'tir çünkü ____."
-5. "Aggregate root nedir, neden önemli? ____."
-
----
-
-```admonish success title="Bölüm Özeti"
-- Mimarinin can damarı **bağımlılık yönüdür**: hexagonal'de dış dünya çekirdeğe bağımlıdır, çekirdek dış dünyayı bilmez
-- **Port** çekirdeğin tanımladığı interface, **adapter** onu bir teknolojiyle somutlaştıran koddur; driving taraf uygulamayı çağırır, driven taraf uygulama tarafından çağrılır
-- Domain modeli **saf Java** kalır: `@Entity` gibi framework annotation'ları domain'e girmez, JPA entity'si ayrı tutulup mapper ile dönüştürülür
-- `Money` gibi **value object'ler immutable** olur ve kendi kurallarını (currency mismatch, scale) içinde taşır; `Account` gibi **aggregate root'lar** iç tutarlılığı kendi metotlarıyla korur
-- Package yapısında **feature-first** (Variant A) tercih edilir; bounded context ile eşleşir ve microservice'e bölünmeyi kolaylaştırır
-- **Anemic Domain Model**'den kaç: logic getter/setter'la dışarıda değil, `account.withdraw(amount)` gibi davranış olarak domain'in içinde yaşar
-```
+</details>

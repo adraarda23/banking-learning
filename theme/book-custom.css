@@ -114,6 +114,33 @@
     font-weight: 650;
 }
 
+/* Katlanır kutular: Soru-Cevap ve "Tam kod" bölümleri */
+.content details {
+    border: 1px solid var(--table-border-color);
+    border-radius: 8px;
+    padding: 0.6em 1em;
+    margin: 0.8em 0 1.4em;
+    background: var(--quote-bg);
+}
+
+.content details summary {
+    cursor: pointer;
+    font-weight: 600;
+    color: var(--links);
+    user-select: none;
+    padding: 0.2em 0;
+}
+
+.content details[open] summary {
+    border-bottom: 1px solid var(--table-border-color);
+    padding-bottom: 0.5em;
+    margin-bottom: 0.8em;
+}
+
+.content details pre {
+    margin: 0.8em 0;
+}
+
 /* Yazdırma: her bölüm yeni sayfadan başlasın */
 @media print {
     .content h1 {

@@ -14,7 +14,7 @@ Hatalar için **tutarlı, standartlara uyumlu ve information-leak'siz** response
 
 ## Süre
 
-Okuma: 1.5 saat • Mini task: 2 saat • Test: 1 saat • Toplam: ~4.5 saat
+Okuma: 1.5 saat • Kendini sınama: 30 dk • Toplam: ~2 saat (opsiyonel pratik bölümü: ~3 saat)
 
 ## Önbilgi
 
@@ -123,7 +123,59 @@ sequenceDiagram
     H-->>C: 422 application/problem+json
 ```
 
-Handler'ın iskeleti şöyle. İki örnek yeter — domain exception ve **catch-all**; diğer domain exception'lar (`AccountNotFoundException` → 404, `CurrencyMismatchException` → 422 vb.) birebir aynı kalıbı izler, validation'ı da bölüm 11'de göreceğiz:
+Handler'ın iskeleti şöyle. İki örnek yeter — domain exception ve **catch-all**; diğer domain exception'lar (`AccountNotFoundException` → 404, `CurrencyMismatchException` → 422 vb.) birebir aynı kalıbı izler, validation'ı da bölüm 11'de göreceğiz. Önce domain exception handler'ının standart alanları kurduğu kısım:
+
+```java
+@RestControllerAdvice
+class GlobalExceptionHandler {
+
+    @ExceptionHandler(InsufficientFundsException.class)
+    ProblemDetail handle(InsufficientFundsException ex, HttpServletRequest request) {
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(
+            HttpStatus.UNPROCESSABLE_ENTITY,
+            "Hesabınızdaki bakiye yetersiz."
+        );
+        problem.setType(URI.create("https://api.mavibank.com/problems/insufficient-funds"));
+        problem.setTitle("Yetersiz bakiye");
+        problem.setInstance(URI.create(request.getRequestURI()));
+```
+
+Standart alanlardan sonra extension property'ler gelir: programmatic `code`, client'ın ekranda kullanacağı structured data ve log'la köprüyü kuran `traceId`.
+
+```java
+        problem.setProperty("code", "ACCOUNT_INSUFFICIENT_FUNDS");
+        problem.setProperty("accountId", ex.getAccountId().value());
+        problem.setProperty("availableBalance", ex.getAvailable().amount().toPlainString());
+        problem.setProperty("requestedAmount", ex.getRequested().amount().toPlainString());
+        problem.setProperty("currency", ex.getRequested().currency().getCurrencyCode());
+        problem.setProperty("traceId", MDC.get("traceId"));
+        return problem;
+    }
+```
+
+Catch-all ise beklenmedik her şeyi yakalayıp 500'e çevirir — buradaki iki yoruma dikkat:
+
+```java
+    @ExceptionHandler(Exception.class)
+    ProblemDetail handleUnexpected(Exception ex, HttpServletRequest request) {
+        log.error("Unexpected error", ex);     // ← stacktrace log'a
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(
+            HttpStatus.INTERNAL_SERVER_ERROR,
+            "Beklenmedik bir hata oluştu. Lütfen daha sonra tekrar deneyin."   // ← stacktrace YOK
+        );
+        problem.setType(URI.create("https://api.mavibank.com/problems/internal-error"));
+        problem.setTitle("Sunucu hatası");
+        problem.setInstance(URI.create(request.getRequestURI()));
+        problem.setProperty("code", "INTERNAL_ERROR");
+        problem.setProperty("traceId", MDC.get("traceId"));
+        return problem;
+    }
+```
+
+Catch-all handler'daki kalıba dikkat et: <mark>stacktrace **log'a** gider, response'a sadece generic mesaj + `traceId` yazılır</mark>. Bu, bölümün en kritik refleksi.
+
+<details>
+<summary>Tam kod: GlobalExceptionHandler (~38 satır)</summary>
 
 ```java
 @RestControllerAdvice
@@ -166,7 +218,7 @@ class GlobalExceptionHandler {
 }
 ```
 
-Catch-all handler'daki kalıba dikkat et: <mark>stacktrace **log'a** gider, response'a sadece generic mesaj + `traceId` yazılır</mark>. Bu, bölümün en kritik refleksi.
+</details>
 
 ### 5. Exception hierarchy — banking için tasarım
 
@@ -390,7 +442,31 @@ sequenceDiagram
     F->>F: MDC temizle
 ```
 
-Filter implementasyonu:
+Filter implementasyonunun kalbi traceId'nin çözümlenmesi: gelen `X-Trace-Id` header'ı varsa korunur (upstream sistemle iz sürekliliği), yoksa yeni UUID üretilir; ardından hem MDC'ye hem response header'a yazılır.
+
+```java
+String traceId = ((HttpServletRequest) req).getHeader("X-Trace-Id");
+if (traceId == null || traceId.isBlank()) {
+    traceId = UUID.randomUUID().toString();
+}
+MDC.put("traceId", traceId);
+((HttpServletResponse) res).setHeader("X-Trace-Id", traceId);
+```
+
+Request zinciri ise mutlaka try/finally içinde çalıştırılır:
+
+```java
+try {
+    chain.doFilter(req, res);
+} finally {
+    MDC.remove("traceId");
+}
+```
+
+`finally` bloğundaki `MDC.remove`'a dikkat: thread'ler pool'dan geri dönüşümlü kullanılır, <mark>temizlemezsen bir sonraki request eski traceId'yi miras alır</mark>.
+
+<details>
+<summary>Tam kod: TraceIdFilter (~20 satır)</summary>
 
 ```java
 @Component
@@ -415,7 +491,7 @@ class TraceIdFilter implements Filter {
 }
 ```
 
-`finally` bloğundaki `MDC.remove`'a dikkat: thread'ler pool'dan geri dönüşümlü kullanılır, <mark>temizlemezsen bir sonraki request eski traceId'yi miras alır</mark>.
+</details>
 
 Logback pattern'ine MDC'yi ekle:
 
@@ -430,6 +506,39 @@ Phase 9'da (Observability) full distributed tracing'i OpenTelemetry ile kuracağ
 ### 11. Spring Boot 3 — ResponseEntityExceptionHandler
 
 Spring'in kendi fırlattığı exception'lar (`MethodArgumentNotValidException`, `HttpMessageNotReadableException` vb.) için sıfırdan handler yazmak yerine `ResponseEntityExceptionHandler` extend etmek daha temiz — built-in exception'ların hepsi için override edilebilir hazır metotlar sunar:
+
+```java
+@RestControllerAdvice
+class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
+
+    @Override
+    protected ResponseEntity<Object> handleMethodArgumentNotValid(
+        MethodArgumentNotValidException ex,
+        HttpHeaders headers,
+        HttpStatusCode status,
+        WebRequest request) {
+```
+
+Override'ın gövdesinde yine bir ProblemDetail kurulur; validation'a özgü fark, field bazlı hataların **structured** bir map olarak extension property'ye eklenmesi — client hangi alanın neden hatalı olduğunu programmatic olarak görür:
+
+```java
+        Map<String, String> errors = new HashMap<>();
+        ex.getBindingResult().getFieldErrors().forEach(e ->
+            errors.put(e.getField(), e.getDefaultMessage())
+        );
+        problem.setProperty("fieldErrors", errors);
+```
+
+Built-in override'lar `ResponseEntity<Object>` döndürdüğü için content type'ı elle set etmen gerekir; domain exception'ları için ayrı `@ExceptionHandler`'lar aynı class'ta yaşamaya devam eder:
+
+```java
+        return ResponseEntity.badRequest()
+            .contentType(MediaType.APPLICATION_PROBLEM_JSON)
+            .body(problem);
+```
+
+<details>
+<summary>Tam kod: GlobalExceptionHandler + ResponseEntityExceptionHandler (~37 satır)</summary>
 
 ```java
 @RestControllerAdvice
@@ -470,6 +579,8 @@ class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     }
 }
 ```
+
+</details>
 
 ### 12. Error response example collection — kataloğun
 
@@ -545,115 +656,130 @@ Kapanış olarak, exception fırlatırken uyacağın 5 kural:
 
 ---
 
-## Mini task'ler
+## Kendini Sına
 
-### Task 1.7.1 — Domain exception'larını yaz (30 dk)
+Aşağıdaki soruları önce kendi başına cevapla, sonra cevabı açıp karşılaştır. Bunlar mülakatta da karşına çıkabilecek sorular.
 
-`banking/common/domain/exception/BankingException.java` (abstract base).
+**S1. RFC 7807'nin 5 standart alanı nedir ve extension alanlarından nasıl ayrılır?**
 
-`banking/account/domain/exception/`:
-- `AccountNotFoundException(AccountId)`
-- `AccountClosedException(AccountId)`
-- `AccountFrozenException(AccountId)`
-- `InsufficientFundsException(AccountId, Money available, Money requested)`
+<details>
+<summary>Cevabı göster</summary>
 
-`banking/common/domain/exception/`:
-- `CurrencyMismatchException(Currency expected, Currency actual)`
+`type` (hata tipinin tanımına link veren URI), `title` (kısa, insan-okur özet), `status` (HTTP status code), `detail` (bu hataya özgü, kullanıcıya gösterilebilir açıklama) ve `instance` (hatanın oluştuğu kaynak URI'si). Bu beşinin dışındaki her alan extension'dır: `code`, `traceId`, `availableBalance` gibi alanları serbestçe ekleyebilirsin — Spring'de `problem.setProperty(...)` ile. Response'un content type'ı `application/problem+json` olur; client bunu görünce "bu bir problem detail" deyip özel handle edebilir.
 
-`banking/transfer/domain/exception/`:
-- `SameAccountTransferException(AccountId)`
+</details>
 
-Hepsi `BankingException` extend etsin, `code` field'ı set etsin.
+**S2. Account enumeration saldırısı nedir? Hata response'ları buna karşı nasıl tasarlanır?**
 
-### Task 1.7.2 — `ErrorCodes` catalog class'ı (10 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-`banking/common/error/ErrorCodes.java` yaz (yukarıda örnek). Tüm error code'ları tek yerde topla.
+Saldırgan farklı `accountId`'ler deneyerek response farklarından (hangileri 404, hangileri 401/403 dönüyor) sistemde hangi hesapların **var olduğunu** çıkarır. Koruma iki adımdır: önce authentication kontrol edilir, başarısızsa 401 önce döner; sonra "erişim yok" ile "kaynak yok" aynı yanıtı verir — örneğin `AccountNotFoundException` ve `AccessDeniedException` aynı handler'da 404 + "İstenilen kaynak bulunamadı." ile karşılanır, ayrım yapılmaz. Ayrıca response'a `accountId` gibi varlığı doğrulayan detaylar yazılmaz.
 
-### Task 1.7.3 — `GlobalExceptionHandler` yaz (60 dk)
+</details>
 
-`banking/common/adapter/in/web/GlobalExceptionHandler.java`:
+**S3. Catch-all `Exception.class` handler'ında hangi bilgi log'a, hangi bilgi response'a gider? Neden?**
 
-- `extends ResponseEntityExceptionHandler`
-- `@RestControllerAdvice`
-- `@ExceptionHandler` her domain exception için
-- Override `handleMethodArgumentNotValid` (validation 400)
-- `@ExceptionHandler(Exception.class)` catch-all → 500, stacktrace log, generic response
+<details>
+<summary>Cevabı göster</summary>
 
-Her handler:
-- `ProblemDetail` döndür
-- `type`, `title`, `detail`, `instance` set
-- `code` property
-- `traceId` property (MDC'den)
-- Domain-specific property'ler (accountId, available, requested)
+Log'a tam detay: `log.error("Unexpected error", ex)` ile ERROR seviyesinde stacktrace. Response'a ise sadece generic mesaj + `INTERNAL_ERROR` code'u + `traceId`. Sebep: stacktrace, internal class isimleri, DB schema'sı gibi detaylar saldırgana sistemin haritasını verir. Bir exception'ın iki muhatabı vardır — client kullanıcı dostu response alır, sysadmin/developer teknik detayı log'da `traceId` üzerinden bulur.
 
-### Task 1.7.4 — `TraceIdFilter` (20 dk)
+</details>
 
-`banking/common/adapter/in/web/filter/TraceIdFilter.java` yaz. `@Component @Order(HIGHEST_PRECEDENCE)` ile en başta çalışsın.
+**S4. Client neden hata mesajını parse ederek karar veremez? Error code kataloğu hangi kurallara uyar?**
 
-Logback pattern'ini güncelle:
-```yaml
-logging:
-  pattern:
-    console: "%d{HH:mm:ss.SSS} [%X{traceId:-no-trace}] %-5level [%thread] %logger{36} - %msg%n"
-```
+<details>
+<summary>Cevabı göster</summary>
 
-Bir endpoint çağır, response'da `X-Trace-Id` header'ını gör. Log'da aynı traceId'nin geçtiğini doğrula.
+Mesaj metni değişebilir ve lokalize edilir — üzerine mantık kurarsan client kırılır. Karar mekanizması stabil, programmatic `code`'dur; örneğin `ACCOUNT_INSUFFICIENT_FUNDS` gelince client "para yükle" ekranı açar. Kurallar: UPPER_SNAKE_CASE, kategori prefix'i (`ACCOUNT_`, `TRANSFER_`, `CARD_`) ve bir kez yayınlandı mı **asla değiştirilmez** — client'lar ona bağımlıdır. Code'lar `ErrorCodes` gibi tek bir class'ta toplanır ve `docs/error-catalog.md` gibi bir katalogda client/partner ekipleri için dokümante edilir.
 
-### Task 1.7.5 — Tamamlama: tüm exception'ları map et (30 dk)
+</details>
 
-Bu listede her birini handle et:
+**S5. `TraceIdFilter`'da `MDC.remove`'un `finally` bloğunda olması neden kritik?**
 
-- `InsufficientFundsException` → 422 + tüm detay
-- `AccountNotFoundException` → 404 + accountId
-- `AccountClosedException` → 409 (state conflict)
-- `AccountFrozenException` → 403
-- `CurrencyMismatchException` → 422
-- `SameAccountTransferException` → 422
-- `InvalidCurrencyException` → 400
-- `HttpMessageNotReadableException` (JSON parse hatası — Spring built-in) → 400
-- `MethodArgumentTypeMismatchException` (UUID parse fail) → 400
-- `NoHandlerFoundException` (404 endpoint) → 404
-- `Exception.class` (catch-all) → 500
+<details>
+<summary>Cevabı göster</summary>
 
-Her biri için **ayrı `@ExceptionHandler` method** yaz.
+Servlet container'lar thread pool kullanır ve thread'ler request'ler arasında geri dönüşümlüdür. MDC thread-local'da yaşadığı için temizlenmezse bir sonraki request eski request'in `traceId`'sini miras alır ve log'larda yanlış korelasyon oluşur. `finally` içinde olması, request exception ile bitse bile temizliğin garanti çalışmasını sağlar.
 
-### Task 1.7.6 — Error catalog dökümanı (15 dk)
+</details>
 
-`docs/error-catalog.md` yaz. Yukarıdaki örnek formatı kullan. **Her ErrorCode için** bir bölüm. Banking'in real-life dokümantasyonu bu — alışkanlık kazan.
+**S6. `InsufficientFundsException` neden 400 veya 409 değil de 422 döner? Status seçim mantığını açıkla.**
 
-### Task 1.7.7 — Manuel test (15 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-Curl ile error scenarios test et:
+Mantık şu: "kaynak yok" → 404, "state uygun değil" → 409, "istek anlaşıldı ama iş kuralı engelledi" → 422, "istek bozuk" → 400. Yetersiz bakiyede istek sözdizimsel olarak geçerlidir (400 değil) ve kapalı hesaba işlem gibi bir state çakışması da yoktur (409 değil); istek anlaşılmış ama iş kuralı (bakiye yeterliliği) işlenmesini engellemiştir — bu tam olarak 422 Unprocessable Entity'dir.
 
-```bash
-# 1. Validation error (currency invalid)
-curl -X POST http://localhost:8080/v1/accounts \
-  -H "Content-Type: application/json" \
-  -d '{"currency": "tr"}'
+</details>
 
-# 2. Not found
-curl http://localhost:8080/v1/accounts/00000000-0000-0000-0000-000000000000
+**S7. Neden her hatayı ERROR seviyesinde loglamazsın? Log level stratejisini örneklerle açıkla.**
 
-# 3. Bad JSON
-curl -X POST http://localhost:8080/v1/accounts \
-  -H "Content-Type: application/json" \
-  -d 'not even json'
+<details>
+<summary>Cevabı göster</summary>
 
-# 4. UUID parse fail
-curl http://localhost:8080/v1/accounts/not-a-uuid
-```
+Her 422'yi ERROR yazarsan **alarm yorgunluğu** oluşur ve gerçek incident'lar gürültüde kaybolur; ERROR yalnızca operator'ın bakması gereken durumlar içindir. Strateji: beklenen domain hataları (`InsufficientFundsException`) WARN + structured context; 4xx client hataları INFO/DEBUG; beklenmedik 500'ler ERROR + stacktrace; security violation'lar WARN/ERROR (security team monitoring); retry edilen recoverable infra sorunları WARN, unrecoverable olanlar ERROR.
 
-Her response için:
-- Content-Type `application/problem+json` mı?
-- `type`, `title`, `status`, `detail`, `instance` doğru mu?
-- `code` ve `traceId` var mı?
-- 500 hatasında stacktrace **YOK** mu (yalnızca log'da)?
+</details>
 
-Sonuçları **defterine** yapıştır.
+**S8. Exception class'ları ile `GlobalExceptionHandler` mimaride nerede durur ve neden?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Exception'lar **domain** paketinde (`banking/.../domain/exception/`), handler ise `adapter/in/web/` içinde durur. Sebep: domain HTTP'den habersiz kalmalıdır — `InsufficientFundsException` bir iş kuralı ihlalidir; 422'ye çevrilmesi web adapter'ının sorumluluğudur. Ortak base `BankingException` her exception'ı stabil bir `code` ile fırlatmaya zorlar; concrete exception'lar handler'ın kullanacağı context'i (accountId, available, requested) field olarak taşır.
+
+</details>
 
 ---
 
-## Test yazma rehberi
+## Tamamlama kriterleri
+
+- [ ] RFC 7807'nin 5 standart alanını, extension mantığını ve `application/problem+json` content type'ını açıklayabiliyorum
+- [ ] `ProblemDetail` + `@RestControllerAdvice` ile global exception handler'ın nasıl kurulduğunu anladım
+- [ ] Exception hiyerarşisini (`BankingException` base, domain paketinde yerleşim) ve HTTP status haritasını (404/409/422/400/500) mantığıyla kavradım
+- [ ] Error code kataloğunun kurallarını (UPPER_SNAKE_CASE, stabil, kategori prefix) ve neden mesaj yerine code parse edildiğini açıklayabiliyorum
+- [ ] Information leak listesini ve account enumeration korumasını açıklayabiliyorum
+- [ ] `traceId` akışını uçtan uca (filter → MDC → log satırı → `X-Trace-Id` header → MDC temizliği) anlatabiliyorum
+- [ ] Log level stratejisini (WARN vs ERROR, alarm yorgunluğu) gerekçesiyle açıklayabiliyorum
+- [ ] "Kendini Sına" bölümündeki 8 sorunun tamamını cevaplara bakmadan yanıtlayabiliyorum
+- [ ] (Opsiyonel) "Pratik yapmak istersen" bölümündeki handler/filter testlerini yazıp Claude-verify prompt'u ile denetlettim
+
+---
+
+## Defter notları
+
+1. "RFC 7807'nin 5 standart alanı: ____."
+2. "Banking'de stacktrace response'a neden yazılmaz: ____."
+3. "Account enumeration attack nedir, nasıl korunulur: ____."
+4. "ProblemDetail'da kullanılan `application/problem+json` content type'ın amacı: ____."
+5. "`traceId` neden gerekli, nereden gelir, nereye gider: ____."
+6. "Error code naming convention ve neden değiştirilemez: ____."
+7. "Banking exception'larında context bilgisi (accountId, amount) neden field olarak tutulur: ____."
+8. "`Exception.class` catch-all'ın sıralama önemi (specific önce mi catch-all önce mi): ____."
+9. "Log level kararı: 422 hatası neden ERROR değil de WARN/INFO: ____."
+10. "ProblemDetail extension property'leri ne için kullanılır: ____."
+
+---
+
+```admonish success title="Bölüm Özeti"
+- RFC 7807, hata response'ları için standart: `type`, `title`, `status`, `detail`, `instance` + istediğin extension alanları; content type `application/problem+json`
+- Spring 6'nın `ProblemDetail` API'si + `@RestControllerAdvice` ile tüm exception'lar tek merkezde HTTP error'a haritalanır — controller'lar temiz kalır
+- Exception'lar domain paketinde, `BankingException` base'inden türer; her biri stabil bir error code taşır ve doğru HTTP status'a (404, 409, 422, 400, 500) map edilir
+- Stacktrace ve internal detaylar **asla** response'a yazılmaz — log'a tam detay, response'a generic mesaj + `traceId`
+- Account enumeration'a karşı 404 ve 403 ayrımı yapılmaz; erişim yok ile kaynak yok aynı yanıtı döner
+- `TraceIdFilter` her request'e traceId verir: MDC ile log'lara, `X-Trace-Id` header ile response'a yazılır — production'da hata izinin anahtarı budur
+```
+
+---
+
+## Pratik yapmak istersen
+
+Bu bölümdeki kavramları koda dökmek istersen aşağıdaki iki kaynak hazır: önce handler ve filter testlerini yaz, sonra Claude-verify prompt'u ile kendi kodunu banking-grade kriterlere göre denetlet.
+
+<details>
+<summary>Test yazma rehberi — @WebMvcTest handler testleri + TraceIdFilter testleri</summary>
 
 ### Test 1.7.1 — Exception handler integration (`@WebMvcTest`)
 
@@ -812,9 +938,10 @@ class TraceIdFilterTest {
 }
 ```
 
----
+</details>
 
-## Claude-verify prompt
+<details>
+<summary>Claude-verify prompt — kodunu banking-grade kriterlere göre denetlet</summary>
 
 ```
 Aşağıdaki hata yönetimi kodumu banking-grade kriterlere göre değerlendir. Sadece 
@@ -884,45 +1011,4 @@ eksik veya yanlışları işaretle, kod yazma:
 Her madde için PASS / FAIL / EKSIK işaretle, sebep açıkla. Kod yazma.
 ```
 
----
-
-## Tamamlama kriterleri
-
-- [ ] `BankingException` abstract base ve concrete exception'lar yazıldı
-- [ ] `ErrorCodes` catalog class'ı
-- [ ] `GlobalExceptionHandler` tüm domain exception'larını ProblemDetail ile handle ediyor
-- [ ] Spring built-in exception'lar (`MethodArgumentNotValid`, `HttpMessageNotReadable`, `MethodArgumentTypeMismatch`) handle ediliyor
-- [ ] `Exception.class` catch-all 500 + generic mesaj, stacktrace log'a, NO LEAK
-- [ ] `TraceIdFilter` çalışıyor, log pattern'inde traceId görünüyor
-- [ ] Response header `X-Trace-Id` set ediliyor
-- [ ] `docs/error-catalog.md` her error code için bölüm
-- [ ] Curl ile manuel test yapıldı, response'lar **defterimde**
-- [ ] `@WebMvcTest` ile handler integration test yazıldı (8+ test)
-- [ ] 500 hatası test edildi — stacktrace response'ta YOK
-- [ ] Content-Type `application/problem+json` her error response'ta
-
----
-
-## Defter notları
-
-1. "RFC 7807'nin 5 standart alanı: ____."
-2. "Banking'de stacktrace response'a neden yazılmaz: ____."
-3. "Account enumeration attack nedir, nasıl korunulur: ____."
-4. "ProblemDetail'da kullanılan `application/problem+json` content type'ın amacı: ____."
-5. "`traceId` neden gerekli, nereden gelir, nereye gider: ____."
-6. "Error code naming convention ve neden değiştirilemez: ____."
-7. "Banking exception'larında context bilgisi (accountId, amount) neden field olarak tutulur: ____."
-8. "`Exception.class` catch-all'ın sıralama önemi (specific önce mi catch-all önce mi): ____."
-9. "Log level kararı: 422 hatası neden ERROR değil de WARN/INFO: ____."
-10. "ProblemDetail extension property'leri ne için kullanılır: ____."
-
----
-
-```admonish success title="Bölüm Özeti"
-- RFC 7807, hata response'ları için standart: `type`, `title`, `status`, `detail`, `instance` + istediğin extension alanları; content type `application/problem+json`
-- Spring 6'nın `ProblemDetail` API'si + `@RestControllerAdvice` ile tüm exception'lar tek merkezde HTTP error'a haritalanır — controller'lar temiz kalır
-- Exception'lar domain paketinde, `BankingException` base'inden türer; her biri stabil bir error code taşır ve doğru HTTP status'a (404, 409, 422, 400, 500) map edilir
-- Stacktrace ve internal detaylar **asla** response'a yazılmaz — log'a tam detay, response'a generic mesaj + `traceId`
-- Account enumeration'a karşı 404 ve 403 ayrımı yapılmaz; erişim yok ile kaynak yok aynı yanıtı döner
-- `TraceIdFilter` her request'e traceId verir: MDC ile log'lara, `X-Trace-Id` header ile response'a yazılır — production'da hata izinin anahtarı budur
-```
+</details>

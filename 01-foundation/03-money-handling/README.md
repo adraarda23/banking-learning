@@ -15,7 +15,7 @@ Para tipinin Java'da neden `double` veya `float` olmaması gerektiğini, `BigDec
 
 ## Süre
 
-Okuma: 2 saat • Mini task: 2 saat • Test: 1 saat • Toplam: ~5 saat
+Okuma: 2 saat • Kendini Sına: 30 dk • Pratik (opsiyonel): 2-3 saat • Toplam: ~2.5 saat (+ pratik)
 
 ## Önbilgi
 
@@ -491,6 +491,145 @@ flowchart LR
     O --> O3["compareTo tabanlı karşılaştırmalar"]
 ```
 
+Şimdi sınıfı parça parça inşa edelim; tam listing bölüm sonunda katlanmış halde duruyor. İşin kalbi **compact constructor**: record hangi yoldan yaratılırsa yaratılsın çalışır ve currency'nin izin verdiğinden fazla ondalık taşıyan amount'u (ör. 100.123 TRY) daha kapıda reddeder:
+
+```java
+public record Money(BigDecimal amount, Currency currency) {
+
+    public Money {
+        Objects.requireNonNull(amount, "amount must not be null");
+        Objects.requireNonNull(currency, "currency must not be null");
+
+        if (amount.scale() > currency.getDefaultFractionDigits()) {
+            throw new IllegalArgumentException(
+                "Scale %d exceeds default fraction digits %d for %s"
+                    .formatted(amount.scale(),
+                              currency.getDefaultFractionDigits(),
+                              currency.getCurrencyCode())
+            );
+        }
+```
+
+Fazla scale reddedilir ama **eksik scale yukarı çekilir**: `100` TRY içeride `100.00` olur. `RoundingMode.UNNECESSARY` burada güvenlidir çünkü scale büyütmek asla rounding gerektirmez:
+
+```java
+        // Normalize: scale below default → bring up
+        if (amount.scale() < currency.getDefaultFractionDigits()) {
+            amount = amount.setScale(currency.getDefaultFractionDigits(),
+                                     RoundingMode.UNNECESSARY);
+        }
+    }
+```
+
+Yaratma işini static factory'lere veriyoruz. Dikkat: String overload `new BigDecimal(String)` kullanır; `double` alan bir overload **bilinçli olarak yok** — bölüm başındaki construction tuzağını API seviyesinde imkansız kılıyoruz:
+
+```java
+    public static Money of(BigDecimal amount, Currency currency) {
+        return new Money(amount, currency);
+    }
+
+    public static Money of(String amount, Currency currency) {
+        return new Money(new BigDecimal(amount), currency);
+    }
+
+    public static Money of(String amount, String currencyCode) {
+        return of(amount, Currency.getInstance(currencyCode));
+    }
+```
+
+Sıfır bile currency-aware: `zero(TRY)` scale 2 ile `0.00`, `zero(JPY)` scale 0 ile `0` üretir:
+
+```java
+    public static Money zero(Currency currency) {
+        return new Money(
+            BigDecimal.ZERO.setScale(currency.getDefaultFractionDigits()),
+            currency
+        );
+    }
+```
+
+Aritmetik operasyonlar **aynı currency'yi şart koşar** — 100 TRY + 100 USD derlenmemeli değil, çalışma anında patlamalı demiştik; `requireSameCurrency` tam bunu yapar:
+
+```java
+    public Money add(Money other) {
+        requireSameCurrency(other);
+        return new Money(amount.add(other.amount), currency);
+    }
+
+    public Money subtract(Money other) {
+        requireSameCurrency(other);
+        return new Money(amount.subtract(other.amount), currency);
+    }
+
+    private void requireSameCurrency(Money other) {
+        if (!currency.equals(other.currency)) {
+            throw new CurrencyMismatchException(currency, other.currency);
+        }
+    }
+```
+
+`multiply` ise çarpma sonucu scale büyüyeceği için caller'ı **RoundingMode seçmeye zorlar** — faiz hesabında HALF_EVEN, pay-out'ta FLOOR geçersin; default yok:
+
+```java
+    public Money multiply(BigDecimal factor, RoundingMode roundingMode) {
+        BigDecimal result = amount.multiply(factor)
+            .setScale(currency.getDefaultFractionDigits(), roundingMode);
+        return new Money(result, currency);
+    }
+
+    public Money negate() {
+        return new Money(amount.negate(), currency);
+    }
+```
+
+İşaret sorguları `signum()` üzerinden — scale'den bağımsız çalışır, `-0.00` bile doğru şekilde zero sayılır:
+
+```java
+    public boolean isZero() {
+        return amount.signum() == 0;
+    }
+
+    public boolean isPositive() {
+        return amount.signum() > 0;
+    }
+
+    public boolean isNegative() {
+        return amount.signum() < 0;
+    }
+```
+
+Karşılaştırmalar `equals` değil **`compareTo` tabanlı** — equality vs comparison dersinin koda yansıması. Currency kontrolü burada da var:
+
+```java
+    public boolean isLessThan(Money other) {
+        requireSameCurrency(other);
+        return amount.compareTo(other.amount) < 0;
+    }
+
+    public boolean isGreaterThan(Money other) {
+        requireSameCurrency(other);
+        return amount.compareTo(other.amount) > 0;
+    }
+
+    public boolean isGreaterThanOrEqual(Money other) {
+        requireSameCurrency(other);
+        return amount.compareTo(other.amount) >= 0;
+    }
+```
+
+Son dokunuş `toString`: `toPlainString()` sayesinde scientific notation (`1E+2`) asla sızmaz:
+
+```java
+    @Override
+    public String toString() {
+        return amount.toPlainString() + " " + currency.getCurrencyCode();
+    }
+}
+```
+
+<details>
+<summary>Tam kod: Money (~105 satır)</summary>
+
 ```java
 package com.mavibank.banking.common.domain;
 
@@ -500,104 +639,106 @@ import java.util.Currency;
 import java.util.Objects;
 
 public record Money(BigDecimal amount, Currency currency) {
-    
+
     public Money {
         Objects.requireNonNull(amount, "amount must not be null");
         Objects.requireNonNull(currency, "currency must not be null");
-        
+
         if (amount.scale() > currency.getDefaultFractionDigits()) {
             throw new IllegalArgumentException(
                 "Scale %d exceeds default fraction digits %d for %s"
-                    .formatted(amount.scale(), 
+                    .formatted(amount.scale(),
                               currency.getDefaultFractionDigits(),
                               currency.getCurrencyCode())
             );
         }
         // Normalize: scale below default → bring up
         if (amount.scale() < currency.getDefaultFractionDigits()) {
-            amount = amount.setScale(currency.getDefaultFractionDigits(), 
+            amount = amount.setScale(currency.getDefaultFractionDigits(),
                                      RoundingMode.UNNECESSARY);
         }
     }
-    
+
     public static Money of(BigDecimal amount, Currency currency) {
         return new Money(amount, currency);
     }
-    
+
     public static Money of(String amount, Currency currency) {
         return new Money(new BigDecimal(amount), currency);
     }
-    
+
     public static Money of(String amount, String currencyCode) {
         return of(amount, Currency.getInstance(currencyCode));
     }
-    
+
     public static Money zero(Currency currency) {
         return new Money(
             BigDecimal.ZERO.setScale(currency.getDefaultFractionDigits()),
             currency
         );
     }
-    
+
     public Money add(Money other) {
         requireSameCurrency(other);
         return new Money(amount.add(other.amount), currency);
     }
-    
+
     public Money subtract(Money other) {
         requireSameCurrency(other);
         return new Money(amount.subtract(other.amount), currency);
     }
-    
+
     public Money multiply(BigDecimal factor, RoundingMode roundingMode) {
         BigDecimal result = amount.multiply(factor)
             .setScale(currency.getDefaultFractionDigits(), roundingMode);
         return new Money(result, currency);
     }
-    
+
     public Money negate() {
         return new Money(amount.negate(), currency);
     }
-    
+
     public boolean isZero() {
         return amount.signum() == 0;
     }
-    
+
     public boolean isPositive() {
         return amount.signum() > 0;
     }
-    
+
     public boolean isNegative() {
         return amount.signum() < 0;
     }
-    
+
     public boolean isLessThan(Money other) {
         requireSameCurrency(other);
         return amount.compareTo(other.amount) < 0;
     }
-    
+
     public boolean isGreaterThan(Money other) {
         requireSameCurrency(other);
         return amount.compareTo(other.amount) > 0;
     }
-    
+
     public boolean isGreaterThanOrEqual(Money other) {
         requireSameCurrency(other);
         return amount.compareTo(other.amount) >= 0;
     }
-    
+
     private void requireSameCurrency(Money other) {
         if (!currency.equals(other.currency)) {
             throw new CurrencyMismatchException(currency, other.currency);
         }
     }
-    
+
     @Override
     public String toString() {
         return amount.toPlainString() + " " + currency.getCurrencyCode();
     }
 }
 ```
+
+</details>
 
 İki inceliğe dikkat:
 
@@ -620,139 +761,154 @@ public record Money(BigDecimal amount, Currency currency) {
 
 ---
 
-## Mini task'ler
+## Kendini Sına
 
-### Task 1.3.1 — Topic 1.1'deki `Money`'i revize et (45 dk)
+Aşağıdaki soruları önce **cevaba bakmadan** kendi cümlelerinle yanıtlamayı dene — hepsi mülakatta karşına çıkabilecek tarzda. Takıldığın soru olursa ilgili Kavramlar başlığına dön, sonra tekrar dene.
 
-Yukarıdaki production-grade `Money` record'unu yaz. Topic 1.1'deki taslağın yerine geçer.
+**S1. Neden `new BigDecimal(0.1)` tehlikeli ama `BigDecimal.valueOf(0.1)` güvenli?**
 
-Eklenenler:
-- Scale validation ve normalization (compact constructor'da)
-- `multiply(BigDecimal, RoundingMode)` metodu
-- `negate()` metodu
-- `isPositive()`, `isLessThan()`, `isGreaterThanOrEqual()` karşılaştırmaları
-- `String` factory methodları
-- Düzgün `toString()`
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 1.3.2 — `RoundingMode` deney (30 dk)
-
-`src/main/java/com/mavibank/banking/playground/RoundingPlayground.java` (geçici bir class, sonra silersin):
+`new BigDecimal(double)` constructor'ı, double'ın IEEE 754 binary temsilini **olduğu gibi** decimal'e döker: sonuç `0.1000000000000000055511151231257827...` olur, çünkü 0.1'in binary'de kesin karşılığı yoktur. `BigDecimal.valueOf(double)` ise önce `Double.toString(0.1)` ile `"0.1"` string'ini üretir, sonra onu parse eder — yani insanın gördüğü kısa decimal temsili yakalar.
 
 ```java
-public class RoundingPlayground {
-    public static void main(String[] args) {
-        BigDecimal[] values = {
-            new BigDecimal("2.5"), new BigDecimal("3.5"), 
-            new BigDecimal("-2.5"), new BigDecimal("2.4")
-        };
-        
-        for (BigDecimal v : values) {
-            System.out.printf("%s -> HALF_UP: %s, HALF_DOWN: %s, HALF_EVEN: %s, " +
-                            "CEILING: %s, FLOOR: %s%n",
-                v, 
-                v.setScale(0, RoundingMode.HALF_UP),
-                v.setScale(0, RoundingMode.HALF_DOWN),
-                v.setScale(0, RoundingMode.HALF_EVEN),
-                v.setScale(0, RoundingMode.CEILING),
-                v.setScale(0, RoundingMode.FLOOR)
-            );
-        }
-    }
-}
+new BigDecimal(0.1);        // 0.1000000000000000055511...
+BigDecimal.valueOf(0.1);    // 0.1 (exact)
+new BigDecimal("0.1");      // 0.1 (exact) — tercih edilen yol
 ```
 
-Çalıştır, çıktıyı **defterine yapıştır**. Her satırın neden o şekilde olduğunu kendine açıkla. HALF_EVEN'in 2.5 → 2 ama 3.5 → 4 sonucunu **anlamadan** geçme.
+Banking kuralı: para değerini her zaman String constructor veya `valueOf` ile yarat; `new BigDecimal(double)` code review'da doğrudan reject sebebidir.
 
-### Task 1.3.3 — `CurrencyNormalizer` adapter'ı yaz (30 dk)
+</details>
 
-`banking/common/adapter/CurrencyNormalizer.java`:
+**S2. `new BigDecimal("100").equals(new BigDecimal("100.00"))` neden `false` döner? İki para miktarını nasıl karşılaştırmalısın?**
 
-- `TRY`, `TL`, `TRL`, `₺`, `tl`, `try` (lowercase) hepsi `Currency.getInstance("TRY")` döndürsün
-- Bilinmeyen kod → `InvalidCurrencyException`
-- Null veya empty → `IllegalArgumentException`
+<details>
+<summary>Cevabı göster</summary>
 
-Test'ini de yaz (Test 1.3.3'te detayı var).
+`BigDecimal.equals` hem unscaled value'yu hem **scale**'i karşılaştırır: `100` scale 0, `100.00` scale 2 taşıdığı için equals `false` döner. `compareTo` ise sadece matematiksel değere bakar ve `0` döner. Bu yüzden `compareTo`, `equals` ile consistent değildir — `HashSet`/`HashMap` key'i olarak BigDecimal kullanmak bu nedenle tuzaktır.
 
-### Task 1.3.4 — `ExchangeRate` ve conversion (45 dk)
+Banking pratiği: iki para miktarını her zaman `compareTo` (veya AssertJ'de `isEqualByComparingTo`) ile karşılaştır. `Money` record'umuzun compact constructor'ının scale'i normalize etmesinin sebebi de tam olarak bu: record'un ürettiği `equals`, scale'e duyarlı BigDecimal.equals'a dayanır.
 
-`banking/common/domain/ExchangeRate.java`:
+</details>
+
+**S3. HALF_EVEN 2.5'i neden 2'ye ama 3.5'i 4'e yuvarlar? Neden banking standardı bu mode?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+HALF_EVEN'de tam ortada kalan `5`, en yakın **çift** sayıya gider: 2.5'in komşuları 2 ve 3 — çift olan 2'ye; 3.5'in komşuları 3 ve 4 — çift olan 4'e. Yani yön sabit değil, hedefin çiftliğine bağlı.
+
+Banking standardı olmasının sebebi **bias'sızlık**: HALF_UP'ta 5'ler hep yukarı gider ve milyonlarca işlemde sistematik para kayması birikir. HALF_EVEN'de ise ortadaki değerler istatistiksel olarak yarı yarıya yukarı/aşağı dağılır — toplam sapma sıfıra yakınsar. IEEE 754'ün default rounding'i de budur; faiz hesabı ve FX conversion'da HALF_EVEN kullan.
+
+</details>
+
+**S4. Banka müşteriye ödeme (pay-out) yaparken neden FLOOR, tahsilat (charge) yaparken neden CEILING tercih edebilir?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+İkisi de **konservatif** seçimlerdir: pay-out'ta FLOOR (negatif sonsuza yuvarla) banka fazla ödeme yapmasın ve müşteri aleyhine yukarı yazım olmasın diye; charge'da CEILING banka eksik tahsil etmesin diye kullanılır. Buna karşılık sürekli tekrarlanan hesaplarda (faiz, komisyon, FX) bias'sızlık kritik olduğu için HALF_EVEN standarttır.
+
+Asıl mülakat cevabı şu cümlede saklı: RoundingMode bir teknik detay değil, **business kararıdır** — hangi mode'un kullanılacağını domain expert / business analyst ile doğrulaman gerekir ve her hesapta explicit verilmelidir.
+
+</details>
+
+**S5. `Money` record'unun compact constructor'ı scale'i neden normalize ediyor? Normalization olmasaydı ne bozulurdu?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Record'un otomatik ürettiği `equals`/`hashCode`, BigDecimal'ın scale'e duyarlı `equals`'ını kullanır. Normalization olmasaydı `Money.of("100", TRY)` ile `Money.of("100.00", TRY)` **farklı** nesneler sayılırdı — aynı para, equals false. Compact constructor scale'i currency'nin default fraction digits'ine çektiği için ikisi de içeride `100.00 TRY` olur ve equals doğru çalışır.
+
+Constructor ayrıca iki kural daha uygular: fazla ondalık reddedilir (100.123 TRY → exception, çünkü TRY 2 hane) ve normalization `RoundingMode.UNNECESSARY` ile yapılır — scale büyütmek rounding gerektirmediği için bu güvenlidir. JPY (0 hane) ve BHD (3 hane) da aynı mekanizmayla doğru handle edilir.
+
+</details>
+
+**S6. `a.divide(b)` çağrısı ne zaman ve neden `ArithmeticException` fırlatır? Doğru kullanım nedir?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Sonuç sonsuz haneli olduğunda fırlatır: `10 / 3 = 3.3333...` gibi bölmelerde BigDecimal kesin sonucu temsil edemez ve sen rounding'e izin vermediğin için exception atar. Çözüm, scale ve RoundingMode'u explicit vermek:
 
 ```java
-public record ExchangeRate(
-    Currency from,
-    Currency to,
-    BigDecimal rate,
-    Instant timestamp
-) {
-    public ExchangeRate {
-        Objects.requireNonNull(from);
-        Objects.requireNonNull(to);
-        Objects.requireNonNull(rate);
-        Objects.requireNonNull(timestamp);
-        if (from.equals(to)) {
-            throw new IllegalArgumentException("from and to cannot be same");
-        }
-        if (rate.signum() <= 0) {
-            throw new IllegalArgumentException("Rate must be positive");
-        }
-    }
-    
-    public Money convert(Money source) {
-        if (!source.currency().equals(from)) {
-            throw new IllegalArgumentException(
-                "Source currency must be " + from + " but got " + source.currency()
-            );
-        }
-        BigDecimal converted = source.amount()
-            .multiply(rate)
-            .setScale(to.getDefaultFractionDigits(), RoundingMode.HALF_EVEN);
-        return Money.of(converted, to);
-    }
-    
-    public ExchangeRate inverse() {
-        BigDecimal inverseRate = BigDecimal.ONE.divide(
-            rate, 
-            10,  // significant precision
-            RoundingMode.HALF_EVEN
-        );
-        return new ExchangeRate(to, from, inverseRate, timestamp);
-    }
-}
+a.divide(b);                                    // ArithmeticException riski
+a.divide(b, 4, RoundingMode.HALF_EVEN);         // 3.3333
+a.divide(b, new MathContext(10, RoundingMode.HALF_EVEN));
 ```
 
-### Task 1.3.5 — Bid/ask spread modeli (30 dk)
+Kural: `divide` çağrısında her zaman scale ve roundingMode belirt — default'a güvenilen her bölme potansiyel production hatasıdır.
 
-`banking/common/domain/ExchangeQuote.java`:
+</details>
 
-```java
-public record ExchangeQuote(
-    Currency base,
-    Currency quote,
-    BigDecimal bidRate,   // banka base alır, müşteriye quote verir
-    BigDecimal askRate,   // banka base satar, müşteriden quote alır
-    Instant timestamp
-) {
-    public Money convertForCustomerBuy(Money source) {
-        // müşteri base satın alıyor → banka SAT → ask rate
-        // ...
-    }
-    
-    public Money convertForCustomerSell(Money source) {
-        // müşteri base satıyor → banka AL → bid rate
-        // ...
-    }
-    
-    public BigDecimal spread() {
-        return askRate.subtract(bidRate);
-    }
-}
-```
+**S7. Round-trip conversion (USD → TRY → USD) neden aynı tutarı garanti etmez? Cross-rate hesabında rounding nerede yapılmalı?**
 
-Tamamla. Bid/ask logic'i konfüze edici — kafan karışırsa **defterine** şu cümleyi yaz: "Müşterinin işlemine değil, bankanın pozisyonuna bakarak rate seç."
+<details>
+<summary>Cevabı göster</summary>
+
+Her conversion adımı sonucu target currency'nin fraction digits'ine yuvarlar; ileri ve geri dönüşteki iki ayrı rounding birbirini her zaman götürmez — büyük tutarlarda 1 kuruşluk kayıp normaldir. Bu yüzden round-trip'i asla expectation olarak kabul etme; testlerde tolerance ile assert et.
+
+Cross-rate'te (TRY → USD → JPY) aynı hata kümülatif büyür: iki ayrı `convert` çağrısı iki ayrı rounding demektir. Doğrusu rate'leri önce çarpıp tek bir cross rate elde etmek, ara adımda scale'i korumak ve **rounding'i sadece son adımda** uygulamaktır.
+
+</details>
+
+**S8. Bid/ask spread nedir? Müşteri bankadan USD almak istediğinde hangi rate uygulanır ve bunu nasıl akılda tutarsın?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Banka tek kur kullanmaz: **bid** bankanın döviz **aldığı**, **ask** bankanın döviz **sattığı** kurdur; spread = ask − bid bankanın karıdır (ör. USD/TRY bid 33.45, ask 33.55 → spread 0.10). Müşteri USD alıyorsa banka USD **satıyordur** → ask rate (33.55) uygulanır; müşteri USD satıyorsa banka alır → bid (33.45).
+
+Ezber formülü: "Müşterinin işlemine değil, **bankanın pozisyonuna** bakarak rate seç." Bu yüzden conversion API'sine işlem yönü (`BUY`/`SELL`) bilgisi eklenmelidir.
+
+</details>
 
 ---
 
-## Test yazma rehberi
+## Tamamlama kriterleri
+
+- [ ] "Kendini Sına" bölümündeki tüm soruları cevaba bakmadan açıklayabiliyorum
+- [ ] `Money` record'unun scale validation + normalization mantığını ve neden gerekli olduğunu anladım
+- [ ] BigDecimal `equals` vs `compareTo` farkını biliyorum
+- [ ] HALF_EVEN'in 2.5 → 2 ama 3.5 → 4 sonucunu açıklayabiliyorum
+- [ ] Bid/ask spread konseptini kendi cümlemle anlatabiliyorum
+- [ ] Multi-currency conversion tuzaklarını (round-trip, cross rate) sayabiliyorum
+- [ ] Banking projesinde **hiçbir yerde** `double` para olarak kullanmıyorum
+- [ ] (Opsiyonel) "Pratik yapmak istersen" bölümündeki testleri yazdım ve Claude-verify prompt'uyla doğrulattım
+
+---
+
+## Defter notları
+
+1. "`double` para için neden kullanılmaz: ____."
+2. "`new BigDecimal(0.1)` neden tehlikeli: ____."
+3. "`BigDecimal.equals` ve `compareTo` farkı: ____."
+4. "HALF_EVEN'in bias-free olmasının sebebi: ____."
+5. "Banking'de RoundingMode kararı için domain expert ile konuşmak gerekir çünkü: ____."
+6. "Multi-currency conversion'da round-trip kaybının kaynağı: ____."
+7. "Bid/ask spread = ____. Banka karı buradadır çünkü ____."
+8. "TR'de TRY, TL, TRL kodlarının tarihi: ____."
+9. "JPY scale 0, BHD scale 3 — `Money` class'ım bunu nasıl handle ediyor: ____."
+
+```admonish success title="Bölüm Özeti"
+- Para için asla `double`/`float` kullanma — IEEE 754 binary temsili decimal kesinliği garanti edemez; `BigDecimal` (String veya `valueOf` ile yaratılmış) tek doğru seçim
+- `BigDecimal.equals` scale'e duyarlıdır; iki para miktarını her zaman `compareTo` ile karşılaştır
+- Banking standardı HALF_EVEN (banker's rounding) — bias'sızdır; her hesapta RoundingMode'u explicit ver, default'a güvenme
+- Her currency'nin fraction digits'i farklıdır (TRY 2, JPY 0, BHD 3); `Money` scale'i currency'ye göre valide ve normalize etmeli
+- Multi-currency conversion'da round-trip kaybı, cross-rate kümülatif hatası ve bid/ask spread'i hesaba kat
+- DB'de `NUMERIC(19,4)` kullan, JSON'da amount'u string olarak serialize et; farklı currency'ler arası aritmetik otomatik hata olmalı
+```
+
+---
+
+## Pratik yapmak istersen
+
+Kavramları koda dökmek istersen aşağıdaki iki ek hazır: test yazma rehberi `Money`, `ExchangeRate` ve `CurrencyNormalizer` için örnek testler içerir; Claude-verify prompt'u ile yazdığın kodu banking-grade perspektiften denetletebilirsin.
+
+<details>
+<summary>Test yazma rehberi</summary>
 
 ### Test 1.3.1 — `MoneyTest` (gelişmiş)
 
@@ -938,9 +1094,10 @@ void doubleConstructorIsDangerous() {
 }
 ```
 
----
+</details>
 
-## Claude-verify prompt
+<details>
+<summary>Claude-verify prompt</summary>
 
 ```
 Aşağıdaki `Money`, `ExchangeRate`, `CurrencyNormalizer` Java kodumu banking-grade 
@@ -992,39 +1149,4 @@ Her madde için PASS / FAIL / EKSIK işaretle. Kod yazma, düzeltme. Sadece neyi
 yanlış olduğunu açıkla.
 ```
 
----
-
-## Tamamlama kriterleri
-
-- [ ] `Money` record production-grade (scale validation, normalization, multiply with rounding mode)
-- [ ] `ExchangeRate` ve conversion logic implement edildi
-- [ ] `CurrencyNormalizer` TR-specific alias'larıyla yazıldı
-- [ ] `RoundingMode` farklarını canlı kodda gördüm (`RoundingPlayground`)
-- [ ] `MoneyTest`'te 15+ test, AssertJ + ParameterizedTest kullanıldı
-- [ ] BigDecimal equals vs compareTo farkını biliyorum (test yazıp gördüm)
-- [ ] HALF_EVEN'in 2.5 → 2 ama 3.5 → 4 sonucunu açıklayabiliyorum
-- [ ] Bid/ask spread konseptini kendi cümlemle anlatabiliyorum
-- [ ] Banking projesinde **hiçbir yerde** `double` para olarak kullanmıyorum
-
----
-
-## Defter notları
-
-1. "`double` para için neden kullanılmaz: ____."
-2. "`new BigDecimal(0.1)` neden tehlikeli: ____."
-3. "`BigDecimal.equals` ve `compareTo` farkı: ____."
-4. "HALF_EVEN'in bias-free olmasının sebebi: ____."
-5. "Banking'de RoundingMode kararı için domain expert ile konuşmak gerekir çünkü: ____."
-6. "Multi-currency conversion'da round-trip kaybının kaynağı: ____."
-7. "Bid/ask spread = ____. Banka karı buradadır çünkü ____."
-8. "TR'de TRY, TL, TRL kodlarının tarihi: ____."
-9. "JPY scale 0, BHD scale 3 — `Money` class'ım bunu nasıl handle ediyor: ____."
-
-```admonish success title="Bölüm Özeti"
-- Para için asla `double`/`float` kullanma — IEEE 754 binary temsili decimal kesinliği garanti edemez; `BigDecimal` (String veya `valueOf` ile yaratılmış) tek doğru seçim
-- `BigDecimal.equals` scale'e duyarlıdır; iki para miktarını her zaman `compareTo` ile karşılaştır
-- Banking standardı HALF_EVEN (banker's rounding) — bias'sızdır; her hesapta RoundingMode'u explicit ver, default'a güvenme
-- Her currency'nin fraction digits'i farklıdır (TRY 2, JPY 0, BHD 3); `Money` scale'i currency'ye göre valide ve normalize etmeli
-- Multi-currency conversion'da round-trip kaybı, cross-rate kümülatif hatası ve bid/ask spread'i hesaba kat
-- DB'de `NUMERIC(19,4)` kullan, JSON'da amount'u string olarak serialize et; farklı currency'ler arası aritmetik otomatik hata olmalı
-```
+</details>

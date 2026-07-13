@@ -14,7 +14,7 @@ Boş bir klasörden çalışan bir Spring Boot 3 uygulamasına gelmek. Ama sadec
 
 ## Süre
 
-Okuma: 1 saat • Mini task: 2 saat • Test: 30 dk • Toplam: ~3.5 saat
+Okuma: 1 saat • Kendini Sına: 30 dk • Toplam: ~1.5 saat • Pratik yapmak istersen: +2 saat
 
 ## Önbilgi
 
@@ -47,7 +47,73 @@ Bu projede **Initializr ile başla.** Sonra `pom.xml`'i inceleyip "Initializr ne
 
 ### 3. `pom.xml` anatomisi
 
-`pom.xml` projenin kimliği: hangi Java, hangi Spring Boot, hangi kütüphaneler. Bir Spring Boot uygulamasınınki şöyle görünür:
+`pom.xml` projenin kimliği: hangi Java, hangi Spring Boot, hangi kütüphaneler. Uzun bir dosya ama dört kritik parçadan oluşur; tek tek bakalım.
+
+İlk parça `<parent>` — Spring Boot'un parent POM'u versiyon yönetimini devralır:
+
+```xml
+<parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.3.4</version>  <!-- Bu projedeki Spring Boot versiyonu -->
+    <relativePath/>
+</parent>
+```
+
+Hemen altında projenin kimliği ve Java hedefi:
+
+```xml
+<groupId>com.mavibank</groupId>
+<artifactId>core-banking</artifactId>
+<version>0.1.0-SNAPSHOT</version>
+
+<properties>
+    <java.version>21</java.version>
+</properties>
+```
+
+Bağımlılıklar starter'lar üzerinden gelir. Dikkat: Spring Boot starter'larında `<version>` yok — parent yönetiyor. Scope'lar da anlamlı: PostgreSQL driver sadece `runtime`, test kütüphaneleri `test`:
+
+```xml
+<dependencies>
+    <!-- Web (Tomcat + Spring MVC) -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+
+    <!-- PostgreSQL driver -->
+    <dependency>
+        <groupId>org.postgresql</groupId>
+        <artifactId>postgresql</artifactId>
+        <scope>runtime</scope>
+    </dependency>
+
+    <!-- Test -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-test</artifactId>
+        <scope>test</scope>
+    </dependency>
+    <!-- validation, data-jpa, flyway, actuator, testcontainers -> tam kodda -->
+</dependencies>
+```
+
+Son parça build plugin'i — `mvn spring-boot:run` ve fat JAR build bunun sayesinde:
+
+```xml
+<build>
+    <plugins>
+        <plugin>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-maven-plugin</artifactId>
+        </plugin>
+    </plugins>
+</build>
+```
+
+<details>
+<summary>Tam kod: pom.xml (~90 satır)</summary>
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -142,6 +208,8 @@ Bu projede **Initializr ile başla.** Sonra `pom.xml`'i inceleyip "Initializr ne
 </project>
 ```
 
+</details>
+
 Bu dosyada üç şeye dikkat et:
 
 - **`<parent>`:** Spring Boot'un parent POM'u `dependencyManagement` getirir — Spring Boot dependency'lerine versiyon yazmazsın, parent yönetir. Versiyon uyumsuzluğu derdi biter.
@@ -193,6 +261,54 @@ Phase 1'de **single module + iyi package yapısı** kullanacağız. Multi-module
 
 Konfigürasyonu koda gömmek yerine dışarıda tutarsın — böylece aynı JAR farklı ortamlarda farklı davranır. Spring Boot bunu `src/main/resources/application.yml` (veya `.properties`) dosyasından okur; YAML daha okunabilir, onu kullanacağız.
 
+En kritik blok datasource — password'ün yml'de olmadığına ve HikariCP pool ayarlarına dikkat:
+
+```yaml
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/banking
+    username: ${DB_USERNAME:banking_app}
+    password: ${DB_PASSWORD:}
+    hikari:
+      maximum-pool-size: 10
+      connection-timeout: 5000
+      leak-detection-threshold: 30000
+```
+
+JPA tarafında tek altın kural var: schema'yı Hibernate değil Flyway yönetir:
+
+```yaml
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: validate   # Flyway yönetir, Hibernate dokunmasın
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+```
+
+Actuator'da neyin dışarı açılacağını bilinçli seçersin; server tarafında graceful shutdown da banking standardı:
+
+```yaml
+server:
+  port: 8080
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when_authorized
+```
+
+Hibernate batch ayarları ve log seviyeleri dahil dosyanın tamamı:
+
+<details>
+<summary>Tam kod: application.yml (~46 satır)</summary>
+
 ```yaml
 spring:
   application:
@@ -240,6 +356,8 @@ logging:
     com.mavibank: DEBUG
     org.hibernate.SQL: DEBUG    # sadece development'ta
 ```
+
+</details>
 
 Üç satır özellikle önemli:
 
@@ -549,191 +667,144 @@ Kural net: <mark>sadece main class'ın **paketi ve alt paketleri** taranır.</ma
 
 ---
 
-## Mini task'ler
+## Kendini Sına
 
-Tüm task'leri `~/projects/core-banking/` içinde yap. Topic 1.1'deki domain class'ları kalsın, üzerine Spring Boot ekliyoruz.
+Aşağıdaki sorular bu bölümün kritik noktalarını mülakat gözüyle yoklar. Önce kendi cevabını ver, sonra aç.
 
-### Task 1.2.1 — Spring Initializr ile proje oluştur (15 dk)
+**S1. Spring Boot ile Spring Framework aynı şey mi? Spring Boot'un üç temel taahhüdünü sayar mısın?**
 
-[start.spring.io](https://start.spring.io)'a git:
+<details>
+<summary>Cevabı göster</summary>
 
-- Project: Maven
-- Language: Java
-- Spring Boot: 3.3.x veya 3.4.x (en güncel stabil)
-- Group: `com.mavibank`
-- Artifact: `core-banking`
-- Name: `core-banking`
-- Description: `Banking backend learning project`
-- Package name: `com.mavibank.banking`
-- Packaging: Jar
-- Java: 21
+Aynı şey değil. Spring Framework (Core, MVC, Data, Security) altyapıdır; Spring Boot bu altyapının üstüne **starter dependency + auto-configuration + opinionated defaults** katmanı ekler. Üç taahhüt: (1) **Opinionated defaults** — logging, JSON, embedded server sıfır config çalışır; (2) **Auto-configuration** — classpath'te `spring-boot-starter-data-jpa` görürse Hibernate'i kurar, EntityManager bean'ini hazırlar; (3) **Production-ready** — Actuator ile health/metrics, externalized config ve profile yönetimi hazır gelir.
 
-Dependencies:
+</details>
 
-- Spring Web
-- Spring Data JPA
-- Validation
-- Spring Boot Actuator
-- PostgreSQL Driver
-- Flyway Migration
-- Spring Boot DevTools
-- Lombok (opsiyonel — Topic 1.5'te tartışacağız)
+**S2. `pom.xml`'de Spring Boot dependency'lerine neden `<version>` yazmıyoruz? Bunu hangi mekanizma sağlıyor?**
 
-İndir, zip'i `~/projects/core-banking/` içine aç. **Önemli:** Topic 1.1'de yazdığın `Account`, `Money`, vb. class'larını Initializr'ın oluşturduğu `src/main/java/com/mavibank/banking/` altına taşı (paket yapın korunsun).
+<details>
+<summary>Cevabı göster</summary>
 
-`mvn spring-boot:run` ile boş bir Spring Boot ayağa kalkmalı.
+`spring-boot-starter-parent` parent POM'u `dependencyManagement` getirir: tüm Spring Boot dependency versiyonları, birbirleriyle uyumlu şekilde parent'tan yönetilir. Böylece versiyon uyumsuzluğu derdi biter ve Spring Boot upgrade'i tek satırdır — sadece parent'ın `<version>`'ı değişir. Elle `<version>` yazmak bu yönetimi devre dışı bırakır ve uyumsuzluk riski doğurur.
 
-### Task 1.2.2 — `pom.xml`'i inceleyerek not al (20 dk)
+</details>
 
-`pom.xml`'i aç. Şunları kendine sor ve **defterine cevap yaz**:
+**S3. `spring-boot-starter-web` pom'da tek satır — arkada gerçekte ne geliyor ve bunu nasıl doğrularsın?**
 
-1. `<parent>` neden var, neyi sağlıyor?
-2. `spring-boot-starter-web`'in transitive olarak getirdiği ana kütüphaneler neler? (`mvn dependency:tree | head -50`)
-3. `spring-boot-maven-plugin`'in `repackage` goal'u ne yapar?
-4. `spring-boot-starter-test` hangi test kütüphanelerini getirir?
-5. Tomcat versiyonu kaç? Bunu nereden tespit ettin?
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 1.2.3 — `application.yml` ile profile yapısı kur (30 dk)
-
-`src/main/resources/` altında:
-
-- `application.yml` — ortak ayarlar
-- `application-dev.yml` — local PostgreSQL
-- `application-test.yml` — TestContainers
-- `application-prod.yml` — env vars
-
-`application.yml`'da default profile'i `dev` yap:
-
-```yaml
-spring:
-  profiles:
-    active: dev
-```
-
-Test:
+**Starter** = bir grup ilgili dependency. `starter-web` arkasında Spring MVC + embedded Tomcat + Jackson dahil ~30 jar gelir. Doğrulamak için:
 
 ```bash
-mvn spring-boot:run                              # dev profile (default)
-SPRING_PROFILES_ACTIVE=prod mvn spring-boot:run  # prod profile (DB env var yoksa hata)
+mvn dependency:tree | head -50
 ```
 
-```admonish warning title="Dikkat"
-**Anti-pattern uyarısı:** `application.yml`'a default profile yazmak — production'da unutursun. Bunu Phase 1'de pedagojik amaçla yapıyoruz; gerçek üretimde **profile aktivasyonu deployment'tan gelmeli** (env var, K8s ConfigMap).
-```
+Bu komut transitive dependency ağacını gösterir; versiyon çakışması avlarken de ilk başvurduğun araçtır.
 
-### Task 1.2.4 — `@ConfigurationProperties` class yaz (30 dk)
+</details>
 
-`banking/account/config/AccountProperties.java`:
+**S4. Aynı config key'i hem `application.yml`'da, hem `application-prod.yml`'da, hem OS environment variable'da, hem de command-line argümanında set edilmiş. Uygulama hangisini kullanır? Banking'de bu sırayı pratikte nasıl kullanırız?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Command-line argümanı kazanır. Öncelik sırası zayıftan güçlüye: `application.yml` < profile yml < OS env variable < JVM system property < command-line argümanı — sondaki kazanır. Pratik kural: sabit default'lar `application.yml`'a, ortam farkları `application-{profile}.yml`'a, secret'lar environment variable'a (asla yml'e değil), acil prod override'ı command-line'a.
+
+</details>
+
+**S5. Business rule config'leri için neden `@Value` değil `@ConfigurationProperties` kullanıyoruz? Nasıl kurulur?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+`@Value` kötü scale eder: field başına annotation, validation yok, string key refactor'da sessizce kırılır, typo ancak runtime'da patlar. `@ConfigurationProperties` ise bir prefix altındaki tüm config'i type-safe bir record'a bind eder; `@Validated` + Jakarta anotasyonlarıyla hatalı config daha uygulama boot olurken yakalanır ve sıradan constructor injection ile test edilir:
 
 ```java
-@ConfigurationProperties(prefix = "banking.account")
+@ConfigurationProperties(prefix = "banking.transfer")
 @Validated
-public record AccountProperties(
-    @NotNull @DecimalMin("0.00") BigDecimal minOpeningBalance,
-    @NotEmpty Set<String> supportedCurrencies,
-    @NotNull Duration accountInactivityThreshold
+public record TransferProperties(
+    @NotNull @DecimalMin("1.00") BigDecimal maxAmount
 ) {}
 ```
 
-`application.yml`:
+Aktive etmek için main class'a `@ConfigurationPropertiesScan` eklenir (veya per-class `@EnableConfigurationProperties`).
 
-```yaml
-banking:
-  account:
-    min-opening-balance: 0.00
-    supported-currencies:
-      - TRY
-      - USD
-      - EUR
-    account-inactivity-threshold: P365D    # ISO-8601 duration
-```
+</details>
 
-`CoreBankingApplication`'a `@ConfigurationPropertiesScan` ekle. Bir test class'tan inject ederek değerlerin doğru bind olduğunu doğrula.
+**S6. `application.yml`'a `spring.profiles.active: dev` yazmak neden anti-pattern? Profile aktifleştirmenin doğru yolları neler?**
 
-### Task 1.2.5 — Health check ve actuator (15 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-`application.yml`'a:
+Bu satır JAR'ın içine gömülür; production'da unutulursa uygulama dev config'iyle açılır — bir bankada felakettir. Doğrusu, profile aktivasyonunun deployment'tan gelmesi: `SPRING_PROFILES_ACTIVE=prod` environment variable, `java -jar -Dspring.profiles.active=prod`, `mvn spring-boot:run -Dspring-boot.run.profiles=dev` veya K8s ConfigMap. Birden fazla profile virgülle verilebilir (`prod,monitoring,debug`); sırasıyla uygulanır, aynı key'de sondaki kazanır.
 
-```yaml
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health,info,metrics,env
-  endpoint:
-    health:
-      show-details: always   # dev için OK, prod'da `when_authorized`
-```
+</details>
 
-Uygulamayı çalıştır, `curl http://localhost:8080/actuator/health` ile UP cevabını al.
-`http://localhost:8080/actuator/env` ile property kaynaklarını incele.
+**S7. Code review'da `application-prod.yml` içinde `password: S3cr3t!` ve `ddl-auto: update` görüyorsun. İkisine de neden itiraz edersin, doğrusu ne?**
 
-### Task 1.2.6 — Logging configuration (15 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-`application.yml` log seviyelerini ayarla:
+Plain password yml'de git'e girer; bankada sızmış bir DB password'ü regülasyon olayıdır. Doğrusu `password: ${DB_PASSWORD}` gibi env var referansı — değer Vault / AWS Secrets Manager gibi bir secret manager'dan gelir (K8s Secrets'a dikkat: base64'tür, encrypted değil). Local dev için gitignored `.env` veya `application-local.yml` kullanılır. `ddl-auto: update` ise Hibernate'in schema'yı kontrolsüz değiştirmesi demek — schema değişikliği Flyway migration'ın işidir; prod'da `validate` (veya `none`) olmalı.
 
-```yaml
-logging:
-  level:
-    root: INFO
-    com.mavibank: DEBUG
-    org.springframework.web: INFO
-    org.hibernate.SQL: DEBUG     # dev'de SQL'i gör
-  pattern:
-    console: "%d{HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n"
-```
+</details>
 
-Logger inject et:
+**S8. Yeni yazdığın `@Service` class'ı Spring tarafından bulunmuyor. İlk nereye bakarsın?**
 
-```java
-@Service
-class AccountService {
-    private static final Logger log = LoggerFactory.getLogger(AccountService.class);
-    
-    void doSomething() {
-        log.debug("Doing something for account {}", accountId);
-    }
-}
-```
+<details>
+<summary>Cevabı göster</summary>
 
-`DEBUG` ve `INFO` log'larının görünür olduğunu doğrula.
+Class'ın paketine. `@SpringBootApplication` üç annotation'ın birleşimidir: `@SpringBootConfiguration` + `@EnableAutoConfiguration` + `@ComponentScan`; component scan **sadece main class'ın paketi ve alt paketlerini** tarar. Main class `com.mavibank.banking`'deyse `com.mavibank.other.*` taranmaz ve oradaki bean'ler görünmez. Çözüm: main class'ı en üst paketin altına koy — gerisini component scan halleder.
 
-### Task 1.2.7 — `.gitignore` ve `.env` (10 dk)
+</details>
 
-Project root'a `.gitignore`:
+---
 
-```
-# Maven
-target/
-*.iml
-.idea/
-.vscode/
+## Tamamlama kriterleri
 
-# Spring Boot
-HELP.md
-application-local.yml
-.env
+Kendini Sına sorularını kaynağa bakmadan cevaplayabiliyorsan bölüm tamam. Pratik yaptıysan şunları da sağlamalısın:
 
-# OS
-.DS_Store
-Thumbs.db
-```
+- [ ] `mvn spring-boot:run` ile uygulama ayağa kalkıyor
+- [ ] 3 profile dosyası ayrı, ortak ayarlar `application.yml`'da
+- [ ] `application-prod.yml`'da hiçbir secret YAZILI değil, hepsi `${ENV_VAR}` referansı
+- [ ] `.gitignore`'da `application-local.yml` ve `.env` var
+- [ ] `@ConfigurationProperties` ile en az 1 typed config class
+- [ ] `mvn test` geçiyor (en az `contextLoads` testi)
+- [ ] `/actuator/health` UP dönüyor
+- [ ] Logger ile DEBUG ve INFO log'ları ayırt edebiliyorum
+- [ ] `mvn dependency:tree`'yi okuyup nereden ne geldiğini anlayabiliyorum
 
-`application-local.yml` (gitignored — secret'larınla aynı yere):
+---
 
-```yaml
-spring:
-  datasource:
-    password: my_local_dev_password
-```
+## Defter notları
 
-```admonish warning title="Dikkat"
-Bunu commit ediyor musun? Hayır. **`.env`/`*-local.*` asla git'e gitmesin.**
+1. "Spring Boot'un üç temel taahhüdü: ____, ____, ____."
+2. "`@Value` yerine `@ConfigurationProperties` tercih etmemin sebebi ____, ____, ____."
+3. "Configuration source precedence: en güçlüden zayıfa ____."
+4. "Banking projesinde secret'ları neden yml'de tutmam? ____."
+5. "Bir profile aktifleştirmenin 4 yolu: ____, ____, ____, ____."
+6. "Spring Boot'un component scan'i hangi paketleri tarar? ____."
+
+---
+
+```admonish success title="Bölüm Özeti"
+- Spring Boot = Spring Framework + starter dependency'ler + auto-config + opinionated defaults; parent POM versiyon yönetimini senin yerine yapar
+- Ortam ayrımı profile sistemiyle: `application.yml` ortak, `application-{profile}.yml` override eder; aynı key'de profile-specific kazanır
+- Config precedence sondan güçlü: yml < profile yml < env variable < JVM property < command-line argümanı
+- Business rules için `@Value` değil `@ConfigurationProperties` + `record` + `@Validated` — type-safe, test edilebilir, banking standardı
+- Secret'lar asla yml'de veya git'te olmaz: env variable, Vault veya secret manager; local için gitignored `.env` / `application-local.yml`
+- Main class en üst pakette durur — component scan sadece kendi paketi ve alt paketlerini tarar
 ```
 
 ---
 
-## Test yazma rehberi
+## Pratik yapmak istersen
+
+Kavramları kendi makinende uygulamak istersen: [start.spring.io](https://start.spring.io)'dan Maven + Java 21, `com.mavibank` group ve `com.mavibank.banking` package'ıyla bir proje oluştur (dependency'ler: Spring Web, Spring Data JPA, Validation, Spring Boot Actuator, PostgreSQL Driver, Flyway Migration, Spring Boot DevTools). Ardından profile dosyalarını (`dev`, `test`, `prod`) ve `banking.account` prefix'li bir `@ConfigurationProperties` record'u (`AccountProperties`) kur. Aşağıdaki iki ek doğrulamada yol gösterir.
+
+<details>
+<summary>Test yazma rehberi</summary>
 
 ### Test 1.2.1 — `@SpringBootTest` smoke test
 
@@ -827,9 +898,10 @@ void shouldFailWhenMinOpeningBalanceIsNegative() {
 }
 ```
 
----
+</details>
 
-## Claude-verify prompt
+<details>
+<summary>Claude-verify prompt</summary>
 
 ```
 Aşağıdaki Spring Boot 3 + Maven projemin yapısını ve konfigürasyonunu değerlendir. 
@@ -872,38 +944,4 @@ Her madde için PASS / FAIL / EKSIK işaretle ve nedenini söyle. Kod düzeltmel
 yapma, sadece açıklama yap.
 ```
 
----
-
-## Tamamlama kriterleri
-
-- [ ] `mvn spring-boot:run` ile uygulama ayağa kalkıyor
-- [ ] 3 profile dosyası ayrı, ortak ayarlar `application.yml`'da
-- [ ] `application-prod.yml`'da hiçbir secret YAZILI değil, hepsi `${ENV_VAR}` referansı
-- [ ] `.gitignore`'da `application-local.yml` ve `.env` var
-- [ ] `@ConfigurationProperties` ile en az 1 typed config class
-- [ ] `mvn test` geçiyor (en az `contextLoads` testi)
-- [ ] `/actuator/health` UP dönüyor
-- [ ] Logger ile DEBUG ve INFO log'ları ayırt edebiliyorum
-- [ ] `mvn dependency:tree`'yi okuyup nereden ne geldiğini anlayabiliyorum
-
----
-
-## Defter notları
-
-1. "Spring Boot'un üç temel taahhüdü: ____, ____, ____."
-2. "`@Value` yerine `@ConfigurationProperties` tercih etmemin sebebi ____, ____, ____."
-3. "Configuration source precedence: en güçlüden zayıfa ____."
-4. "Banking projesinde secret'ları neden yml'de tutmam? ____."
-5. "Bir profile aktifleştirmenin 4 yolu: ____, ____, ____, ____."
-6. "Spring Boot'un component scan'i hangi paketleri tarar? ____."
-
----
-
-```admonish success title="Bölüm Özeti"
-- Spring Boot = Spring Framework + starter dependency'ler + auto-config + opinionated defaults; parent POM versiyon yönetimini senin yerine yapar
-- Ortam ayrımı profile sistemiyle: `application.yml` ortak, `application-{profile}.yml` override eder; aynı key'de profile-specific kazanır
-- Config precedence sondan güçlü: yml < profile yml < env variable < JVM property < command-line argümanı
-- Business rules için `@Value` değil `@ConfigurationProperties` + `record` + `@Validated` — type-safe, test edilebilir, banking standardı
-- Secret'lar asla yml'de veya git'te olmaz: env variable, Vault veya secret manager; local için gitignored `.env` / `application-local.yml`
-- Main class en üst pakette durur — component scan sadece kendi paketi ve alt paketlerini tarar
-```
+</details>
