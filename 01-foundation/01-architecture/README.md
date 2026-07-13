@@ -1,5 +1,13 @@
 # Topic 1.1 — Mimari: Hexagonal, Ports & Adapters, Layered
 
+```admonish info title="Bu bölümde"
+- Layered ve hexagonal mimarilerin farkını ve **bağımlılık yönünün** neden kritik olduğunu öğreneceksin
+- Port ve adapter kavramlarını (driving / driven) banking örnekleri üzerinden tanıyacaksın
+- DDD'nin temel yapı taşlarını göreceksin: value object, entity, aggregate root, domain event
+- Feature-first package yapısını ve ADR yazma alışkanlığını kazanacaksın
+- Anemic Domain Model başta olmak üzere yaygın anti-pattern'leri tanımayı öğreneceksin
+```
+
 ## Hedef
 
 Bir Java backend uygulamasının kodunu **neye göre organize edersin** sorusunu derinlemesine cevaplamak. Banking domain'inde neden bu kararın "uygulamayı taşıyabilir/test edilebilir" yapmak için kritik olduğunu görmek.
@@ -46,6 +54,13 @@ Bu yüzden **bağımlılık yönü** mimarinin can damarı: çevre koda mı bağ
 
 Bağımlılık yönü yukarıdan aşağı: Controller → Service → Repository → DB.
 
+```mermaid
+flowchart TD
+    C["Controller - HTTP isteklerini karşılar"] --> S["Service - iş kuralları"]
+    S --> R["Repository - DB ile konuşur"]
+    R --> DB["Database"]
+```
+
 **Neden popüler:** Spring Boot tutorial'larının %95'i bu yapıdadır. Hızlı başlanır. Junior'ın aşina olduğu yapı.
 
 **Basit örnek:**
@@ -81,6 +96,7 @@ interface AccountRepository extends JpaRepository<Account, Long> { }
 
 **Sorunlar (banking için):**
 
+```admonish warning title="Dikkat — Layered'ın banking için tuzakları"
 1. **Domain modeli framework'e bağımlı.** `Account` entity'si `@Entity`, `@Id`, `@Column` annotation'ları ile JPA'ya yapıştı. JPA bırakırsan domain modelini yeniden yazarsın.
 
 2. **Service'i unit test etmek zor.** `AccountRepository` Spring bean olduğu için mock veya `@DataJpaTest` gerekir. Saf bir Java birim testi yazamazsın.
@@ -90,6 +106,7 @@ interface AccountRepository extends JpaRepository<Account, Long> { }
 4. **Dış sistem entegrasyonu sızar.** Bir external bank API'sini servise enjekte ettiğin anda, servisin domain logic'i ile network detayları birbirine girer.
 
 5. **Bağımlılık yönü domain'e dayatma yapar.** Service, JPA repository'e bağımlıdır → service domain'i değil, persistence'ı tanır.
+```
 
 ---
 
@@ -129,6 +146,22 @@ Alistair Cockburn tarafından önerildi (2005). **Aynı şey** "Ports & Adapters
         ┌──────────────┐
         │  PostgreSQL  │
         └──────────────┘
+```
+
+Aynı yapının katman ve bağımlılık ilişkisi:
+
+```mermaid
+flowchart TD
+    subgraph CORE["Application Core"]
+        IN["Use Case - driving port"] --> SVC["Application Service"]
+        SVC --> DOM["Domain Model - saf Java"]
+        SVC --> OUT["AccountRepository - driven port"]
+        SVC --> OUT2["NotificationSender - driven port"]
+    end
+    HTTP["HTTP Controller - driving adapter"] --> IN
+    JPA["JPA Adapter - driven adapter"] -. "implement eder" .-> OUT
+    KAFKA["Kafka Adapter - driven adapter"] -. "implement eder" .-> OUT2
+    JPA --> PG["PostgreSQL"]
 ```
 
 **Anahtar kavramlar:**
@@ -252,6 +285,28 @@ class TransferController {
 }
 ```
 
+Bir transfer isteğinin bu yapıda uçtan uca akışı şöyle:
+
+```mermaid
+sequenceDiagram
+    participant C as TransferController
+    participant S as TransferMoneyService
+    participant A as Account aggregate
+    participant R as JpaAccountRepository
+    participant DB as PostgreSQL
+    C->>S: transfer via TransferMoneyUseCase
+    S->>R: findById via AccountRepository port
+    R->>DB: SELECT
+    R-->>S: Account domain nesnesi
+    S->>A: debit ve credit
+    A-->>S: kurallar uygulandi
+    S->>R: save via port
+    R->>DB: UPDATE
+    S-->>C: tamam
+```
+
+Controller sadece **port interface'ini** bilir, service sadece **port üzerinden** persistence'a ulaşır — hiçbir ok domain'den dışarı çıkmaz.
+
 **Avantajlar:**
 
 1. **Domain saf Java.** Spring veya JPA olmadan IDE'de çalıştırırsın. Unit test'leri mock'sız yazılır.
@@ -265,7 +320,9 @@ class TransferController {
 2. **Junior için karmaşık.** İlk bakışta over-engineering gibi gelir.
 3. **Küçük projede gereksiz.** CRUD bir admin paneli için çok ağır.
 
-**Banking için neden değer:** Domain kuralları (negative balance, double-entry invariant, faiz formülü) **on yıllarca yaşayacak**. Teknoloji 3 yılda bir değişir. Hexagonal seni yaşatır.
+```admonish tip title="İpucu — banking için neden değer"
+Domain kuralları (negative balance, double-entry invariant, faiz formülü) **on yıllarca yaşayacak**. Teknoloji 3 yılda bir değişir. Hexagonal seni yaşatır.
+```
 
 ---
 
@@ -365,7 +422,9 @@ public class Account {
 }
 ```
 
-Dikkat: `Account` saf Java. `@Entity` yok. JPA ayrı bir `AccountJpaEntity` ile temsil edilir, mapper ile dönüşür.
+```admonish warning title="Dikkat"
+`Account` saf Java. `@Entity` yok. JPA ayrı bir `AccountJpaEntity` ile temsil edilir, mapper ile dönüşür.
+```
 
 ---
 
@@ -423,12 +482,14 @@ com.mavibank.banking
         └── transfer
 ```
 
-**Hangisini seçmeli?** A (feature-first). Sebep:
+```admonish tip title="İpucu — hangisini seçmeli?"
+A (feature-first). Sebep:
 - Bir feature'a dokunmak istediğinde tüm kod aynı yerde
 - Microservice'e ayırmak gerektiğinde feature'ı tek klasör çıkarırsın
 - Bounded context fikriyle daha iyi eşleşir
 
 Bu projede Variant A kullanacağız.
+```
 
 ---
 
@@ -449,6 +510,17 @@ core-banking/
 │   └── pom.xml                      (application'a depend, Spring Web dep)
 └── banking-app/                     (main class, configuration)
     └── pom.xml                      (tüm adapter'lara depend)
+```
+
+Modüller arası bağımlılık yönü — dikkat et, tüm oklar domain'e doğru akar:
+
+```mermaid
+flowchart TD
+    APP["banking-app"] --> WEB["banking-adapter-web"]
+    APP --> PERS["banking-adapter-persistence"]
+    WEB --> APPL["banking-application"]
+    PERS --> APPL
+    APPL --> DOM["banking-domain"]
 ```
 
 **Avantaj:** Compile-time enforcement. Domain modülünde Spring import'una **derleyici izin vermez**, çünkü Spring dependency'si yok.
@@ -484,7 +556,9 @@ Hexagonal architecture (Ports & Adapters) kullanılacak. Domain saf Java tutulac
 - Junior için ilk başta karmaşık
 ```
 
+```admonish tip title="İpucu"
 Banking şirketlerinde ADR çok yaygın — production'a giren her major karar belgelenir. Bu alışkanlığı şimdiden kazan.
+```
 
 ---
 
@@ -536,7 +610,9 @@ Sorunlar: lazy loading patlaması, internal field'lar dışarı sızar, JSON for
 
 **Anti-pattern 4: "Circular Dependency Between Layers"**
 
+```admonish warning title="Dikkat"
 Domain, persistence adapter'a import yapar. Bu hexagonal'i çürütür. Domain hiçbir şeye bağımlı olmamalı.
+```
 
 ---
 
@@ -691,7 +767,9 @@ Kullanım:
 var account = anAccount().withCurrency("TRY").withBalance("100.00").build();
 ```
 
+```admonish tip title="İpucu"
 Bu pattern (Object Mother / Test Data Builder) banka tarafında **çok yaygın**, alışkanlık kazan.
+```
 
 ---
 
@@ -770,3 +848,14 @@ Aşağıdaki cümleleri **kendi kelimelerinle** doldur:
 3. "Anemic Domain Model'in problemi ____. Bunun yerine ____ yaparım."
 4. "DDD'nin Entity ve Value Object farkı ____. `Money` value object'tir çünkü ____."
 5. "Aggregate root nedir, neden önemli? ____."
+
+---
+
+```admonish success title="Bölüm Özeti"
+- Mimarinin can damarı **bağımlılık yönüdür**: hexagonal'de dış dünya çekirdeğe bağımlıdır, çekirdek dış dünyayı bilmez
+- **Port** çekirdeğin tanımladığı interface, **adapter** onu bir teknolojiyle somutlaştıran koddur; driving taraf uygulamayı çağırır, driven taraf uygulama tarafından çağrılır
+- Domain modeli **saf Java** kalır: `@Entity` gibi framework annotation'ları domain'e girmez, JPA entity'si ayrı tutulup mapper ile dönüştürülür
+- `Money` gibi **value object'ler immutable** olur ve kendi kurallarını (currency mismatch, scale) içinde taşır; `Account` gibi **aggregate root'lar** iç tutarlılığı kendi metotlarıyla korur
+- Package yapısında **feature-first** (Variant A) tercih edilir; bounded context ile eşleşir ve microservice'e bölünmeyi kolaylaştırır
+- **Anemic Domain Model**'den kaç: logic getter/setter'la dışarıda değil, `account.withdraw(amount)` gibi davranış olarak domain'in içinde yaşar
+```

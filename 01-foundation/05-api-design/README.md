@@ -1,5 +1,13 @@
 # Topic 1.5 — API Design: DTO, MapStruct, Lombok kararı
 
+```admonish info title="Bu bölümde"
+- Entity'i API'den dışarı sızdırmanın neden tehlikeli olduğunu ve DTO ayrımının gerekçesini öğreneceksin
+- Request/Response DTO'larını yön bazlı tasarlamayı ve modern Java `record` kullanımını kavrayacaksın
+- Banking'e uygun RESTful kaynak tasarımı, status code seçimi ve idempotency kavramını göreceksin
+- MapStruct ile compile-time mapper üretmeyi ve mapper'ların adapter katmanındaki yerini öğreneceksin
+- Lombok'u nerede kullanıp nerede kullanmayacağına bilinçli karar vereceksin
+```
+
 ## Hedef
 
 Bir REST API'i tasarlarken **entity sızıntısı**ndan kaçınmak; request/response DTO'larını doğru ayrıştırmak; MapStruct ile compile-time mapper'lar üretmek; Lombok kullanıp kullanmamayı **bilinçli** karar olarak almak; banking domain'inde RESTful kaynakları nasıl modelleyeceğini öğrenmek.
@@ -39,6 +47,7 @@ class AccountController {
 }
 ```
 
+```admonish warning title="Dikkat"
 **Problemler:**
 
 1. **Internal field'lar dışarı sızar.** `version` (optimistic lock), `created_by`, sensitive bilgiler API'den çıkar.
@@ -52,6 +61,20 @@ class AccountController {
 5. **Mass assignment vulnerability.** Client `status=APPROVED` gönderir, Jackson deserialize eder → yetkisiz field değiştirme.
 
 6. **API evolution zor.** Eski client `{id, name}` görüyordu, yeni client `{id, name, kyc_status}` görüyor. Aynı entity = aynı JSON = backward compat kırılır.
+```
+
+DTO ayrımıyla veri, katmanlar arasında şu akışla ilerler — entity hiçbir zaman HTTP sınırını geçmez:
+
+```mermaid
+flowchart LR
+    A["Client JSON"] --> B["Request DTO"]
+    B --> C["Controller"]
+    C --> D["Domain Model"]
+    D --> E["JPA Entity"]
+    E --> D
+    D --> F["Response DTO"]
+    F --> G["Client JSON"]
+```
 
 **Doğru yaklaşım — ayrı DTO'lar:**
 
@@ -120,17 +143,21 @@ public class AccountDto {
 }
 ```
 
+```admonish warning title="Dikkat"
 Sorunlar:
 - Hangi field hangi yönde gidiyor belirsiz
 - Validation karışır (request'te zorunlu olan response'da nullable, vb.)
 - Mass assignment riski
+```
 
 **Kural:** Her endpoint için **yön bazlı** DTO yaz:
 - `OpenAccountRequest`, `OpenAccountResponse`
 - `UpdateAccountStatusRequest` (sadece statusu güncelle)
 - `TransferRequest`, `TransferResponse`
 
+```admonish tip title="İpucu"
 Bu yaklaşım PR'da daha çok dosya yaratır ama **explicit > implicit**.
+```
 
 ### 3. RESTful resource design — banking
 
@@ -192,6 +219,23 @@ Server:
 2. Varsa: kayıtlı response'u döndür (yeniden işleme yok).
 3. Yoksa: işle, key + response'u kaydet, response'u dön.
 
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    participant DB as idempotency_keys
+    C->>S: POST /transfers + Idempotency-Key
+    S->>DB: Key kayitli mi?
+    alt Key kayitli
+        DB-->>S: Kayitli response
+        S-->>C: Ayni response, yeniden isleme yok
+    else Key yeni
+        S->>S: Transferi isle
+        S->>DB: Key ve response'u kaydet
+        S-->>C: Yeni response
+    end
+```
+
 `idempotency_keys` tablosu:
 ```sql
 CREATE TABLE idempotency_keys (
@@ -204,7 +248,9 @@ CREATE TABLE idempotency_keys (
 );
 ```
 
+```admonish tip title="İpucu"
 `request_hash`: aynı key + farklı body = client hata yaptı → 422 fırlat.
+```
 
 Bunu Phase 2'de tam implement edeceğiz. Phase 1'de **kavramı oturt**, basit versiyonu yaz.
 
@@ -233,6 +279,19 @@ Bunu Phase 2'de tam implement edeceğiz. Phase 1'de **kavramı oturt**, basit ve
 **Banking'de 400 vs 422:**
 - 400: HTTP/JSON seviyesinde malformed
 - 422: Domain validation hatası
+
+Karar akışı şöyle düşünülebilir:
+
+```mermaid
+flowchart TD
+    A["Istek geldi"] --> B{"JSON parse edildi mi?"}
+    B -- "Hayir" --> C["400 Bad Request"]
+    B -- "Evet" --> D{"Domain kurallari gecti mi?"}
+    D -- "Hayir" --> E["422 Unprocessable Entity"]
+    D -- "Evet" --> F{"State cakismasi var mi?"}
+    F -- "Evet" --> G["409 Conflict"]
+    F -- "Hayir" --> H["Islem basarili"]
+```
 
 ### 6. Response shape — tutarlılık
 
@@ -305,7 +364,9 @@ public PageResponse<TransactionResponse> getTransactions(
 GET /transactions?cursor=eyJpZCI6Ii4uLiJ9&limit=20
 ```
 
+```admonish tip title="İpucu"
 Çok büyük datasette `OFFSET` performans kıran (10M satır transaction). Cursor stabil ve hızlı. Phase 2'de detaylandıracağız.
+```
 
 ### 8. MapStruct — compile-time mapper'lar
 
@@ -405,7 +466,17 @@ banking/account/adapter/in/web/AccountWebMapper.java
 banking/account/adapter/out/persistence/AccountPersistenceMapper.java
 ```
 
+```mermaid
+flowchart LR
+    W["HTTP DTO"] <--> WM["AccountWebMapper"]
+    WM <--> D["Domain Account"]
+    D <--> PM["AccountPersistenceMapper"]
+    PM <--> E["JPA Entity"]
+```
+
+```admonish warning title="Dikkat"
 İki farklı mapper — biri HTTP DTO ↔ domain, diğeri JPA entity ↔ domain. **Karıştırma.**
+```
 
 ### 9. Lombok — kullan veya kullanma kararı
 
@@ -788,7 +859,9 @@ public record AccountJpaEntity(
 ) {}
 ```
 
+```admonish warning title="Dikkat"
 JPA entity'sinin `record` olamayacağını bil — JPA proxy gerektirir, record final. Bu yüzden JPA entity'leri için Lombok mantıklı olabilir.
+```
 
 ---
 
@@ -1024,3 +1097,12 @@ Her madde için PASS / FAIL / EKSIK işaretle ve neden olduğunu açıkla. Kod y
 8. "URL versioning vs header versioning farkı: ____."
 9. "RFC 7807 nedir, ne işe yarar (kısaca): ____."
 10. "Banking API'sinde 422 ve 400 farkı: ____."
+
+```admonish success title="Bölüm Özeti"
+- Domain entity asla HTTP'ye sızmaz — her endpoint için yön bazlı Request/Response DTO yaz
+- DTO'lar için modern standart `record`: immutable, setter yok, boilerplate yok
+- Banking'de `POST /transfers` gibi kritik uçlarda `Idempotency-Key` header şart — çift ödeme felakettir
+- Status code ayrımı net olsun: 400 malformed input, 422 domain validation hatası, 409 state conflict
+- MapStruct compile-time mapper üretir; web ve persistence mapper'ları adapter katmanında ayrı tut
+- Lombok'u domain'de kullanma; JPA entity'de `@Getter`/`@Setter` OK, `@Data` riskli
+```

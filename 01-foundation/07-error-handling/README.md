@@ -1,5 +1,13 @@
 # Topic 1.7 — Hata Yönetimi: RFC 7807 ProblemDetail + @ControllerAdvice
 
+```admonish info title="Bu bölümde"
+- RFC 7807 Problem Details standardını ve 5 temel alanını (`type`, `title`, `status`, `detail`, `instance`) öğreneceksin
+- Spring 6'nın `ProblemDetail` API'si ve `@RestControllerAdvice` ile global exception handler yazacaksın
+- Banking'e uygun exception hiyerarşisi (`BankingException` base) ve stabil error code kataloğu tasarlayacaksın
+- Information leak tuzaklarını (stacktrace, account enumeration) tanıyıp korunmayı göreceksin
+- `TraceIdFilter` ile traceId üretip log ve response arasında iz sürmeyi kuracaksın
+```
+
 ## Hedef
 
 Hatalar için **tutarlı, standartlara uyumlu ve information-leak'siz** response'lar üretmek. RFC 7807 ProblemDetail standardını uygulamak. Spring 6'nın `ProblemDetail` API'sini kullanmak. Domain exception'larını HTTP error'a haritalamak. Banking-specific error catalog'u tasarlamak.
@@ -103,6 +111,22 @@ problem.setProperty("currency", "TRY");
 Otomatik `application/problem+json` content type.
 
 ### 4. `@RestControllerAdvice` — global exception handler
+
+Bir domain exception fırlatıldığında controller'a değil, merkezi handler'a düşer ve orada RFC 7807 response'a dönüşür:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant K as Controller
+    participant S as Service
+    participant H as GlobalExceptionHandler
+    C->>K: POST /v1/transfers
+    K->>S: transfer
+    S--xK: InsufficientFundsException
+    K--xH: exception yakalanir
+    H->>H: ProblemDetail olustur
+    H-->>C: 422 application/problem+json
+```
 
 ```java
 @RestControllerAdvice
@@ -217,6 +241,27 @@ RuntimeException
             └── InvalidCurrencyException
 ```
 
+Aynı hiyerarşinin görsel hali:
+
+```mermaid
+flowchart TD
+    RE["RuntimeException"] --> BE["BankingException"]
+    BE --> AE["AccountException"]
+    BE --> BLE["BalanceException"]
+    BE --> CE["CurrencyException"]
+    BE --> TE["TransferException"]
+    BE --> VE["ValidationException"]
+    AE --> ANF["AccountNotFoundException"]
+    AE --> ACL["AccountClosedException"]
+    AE --> AFR["AccountFrozenException"]
+    BLE --> IFE["InsufficientFundsException"]
+    BLE --> DLE["DailyLimitExceededException"]
+    CE --> CME["CurrencyMismatchException"]
+    TE --> SAT["SameAccountTransferException"]
+    TE --> TLE["TransferLimitExceededException"]
+    VE --> ICE["InvalidCurrencyException"]
+```
+
 Her exception bir HTTP status'a karşılık geliyor:
 
 | Exception | Status |
@@ -280,7 +325,9 @@ public class InsufficientFundsException extends BankingException {
 }
 ```
 
+```admonish warning title="Dikkat"
 **Önemli detay:** Exception message **internal log için**. Kullanıcıya gösterilecek mesaj `ProblemDetail.detail`'da, **i18n + lokalize**.
+```
 
 ### 7. Error code catalog — banking standartı
 
@@ -306,13 +353,16 @@ public final class ErrorCodes {
 
 Client (mobile/web app) bu code'lara göre özel ekran açar (örn. "Yetersiz bakiye" için para yükleme butonu).
 
+```admonish tip title="İpucu"
 **Code naming kuralı:**
 - UPPER_SNAKE_CASE
 - Stabil — bir kez yayınlandı mı **asla değiştirme**
 - Açıklayıcı, prefix kategori (`ACCOUNT_`, `TRANSFER_`, `CARD_`)
+```
 
 ### 8. Information leak — neyi göstermeyeceğin
 
+```admonish warning title="Dikkat"
 Banking'de **asla** API response'a sızdırılmayacak şeyler:
 
 - **Stacktrace** (production'da)
@@ -322,6 +372,7 @@ Banking'de **asla** API response'a sızdırılmayacak şeyler:
 - **Connection string, hostname**
 - **Başka kullanıcının bilgileri** (örn. "Account 123 belongs to user X — but you're user Y")
 - **Sistemde bir hesabın varlığı/yokluğu** (account enumeration attack)
+```
 
 **Production exception handler stratejisi:** `Exception.class` yakalanır, log'a tam detail, response'a generic mesaj + traceId.
 
@@ -336,7 +387,9 @@ ProblemDetail handle(AccountNotFoundException ex, ...) {
 }
 ```
 
+```admonish warning title="Dikkat"
 Saldırgan farklı `accountId`'ler dener, hangileri 404 hangileri 401/403 dönüyor diye bakar. Sonra var olan hesap ID'lerini öğrenir.
+```
 
 **Çözüm:** Her zaman authenticate'i kontrol et, authentication başarısızsa **401 önce dön**. Authenticated user'ın **kendi** hesabını sorgulamasa bile aynı tipte yanıt ver:
 
@@ -356,6 +409,15 @@ Phase 8 (Security) topic'inde tam handle edeceğiz.
 Bir exception'ın iki muhatabı var:
 - **Client** → API response (kullanıcı dostu)
 - **Sysadmin/Developer** → log dosyaları (teknik detay)
+
+```mermaid
+flowchart LR
+    EX["Exception"] --> H["GlobalExceptionHandler"]
+    H --> LOG["Log dosyasi: teknik detay + stacktrace"]
+    H --> RESP["API response: kullanici dostu ProblemDetail"]
+    LOG --> DEV["Sysadmin / Developer"]
+    RESP --> CL["Client"]
+```
 
 ```java
 @ExceptionHandler(InsufficientFundsException.class)
@@ -386,6 +448,21 @@ Production'da bir kullanıcı "hata aldım, bu kod ne?" dediğinde:
 3. Tam stacktrace bulur, sorunu çözer
 
 `traceId` her request'in başında üretilir, log'larda MDC'de tutulur, response'a da yazılır.
+
+```mermaid
+sequenceDiagram
+    participant U as Kullanici
+    participant F as TraceIdFilter
+    participant A as Uygulama
+    participant L as Log
+    U->>F: request
+    F->>F: X-Trace-Id var mi kontrol et
+    F->>F: yoksa yeni UUID uret
+    F->>A: MDC traceId set edildi
+    A->>L: her log satiri traceId icerir
+    A-->>U: response + X-Trace-Id header
+    F->>F: MDC temizle
+```
 
 **Filter ile traceId üretmek:**
 
@@ -469,7 +546,7 @@ class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 
 `docs/error-catalog.md` dosyası tut. Her error code için:
 
-```markdown
+````markdown
 ## ACCOUNT_INSUFFICIENT_FUNDS
 **Status:** 422 Unprocessable Entity
 **Description:** Hesapta yapılmak istenen işlem için yeterli bakiye yok.
@@ -491,7 +568,7 @@ class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 
 **Client handling:** Show "Insufficient funds" screen with "Top up" button.
 **Retry:** Not automatic — user action required.
-```
+````
 
 Banking ekiplerinde error catalog **publicly documented** ve client/partner ekipleri buradan referans alır.
 
@@ -508,7 +585,9 @@ Hangi exception hangi log level'da?
 | Recoverable infra issue (DB connection timeout, retried) | WARN |
 | Unrecoverable | ERROR |
 
+```admonish tip title="İpucu"
 **Kural:** ERROR sadece operator'ın bakması gereken durumlar için. 422 her log'a ERROR yazarsan log'lar yararsızlaşır.
+```
 
 ### 15. Exception throwing kuralları — banking
 
@@ -907,3 +986,14 @@ Her madde için PASS / FAIL / EKSIK işaretle, sebep açıkla. Kod yazma.
 8. "`Exception.class` catch-all'ın sıralama önemi (specific önce mi catch-all önce mi): ____."
 9. "Log level kararı: 422 hatası neden ERROR değil de WARN/INFO: ____."
 10. "ProblemDetail extension property'leri ne için kullanılır: ____."
+
+---
+
+```admonish success title="Bölüm Özeti"
+- RFC 7807, hata response'ları için standart: `type`, `title`, `status`, `detail`, `instance` + istediğin extension alanları; content type `application/problem+json`
+- Spring 6'nın `ProblemDetail` API'si + `@RestControllerAdvice` ile tüm exception'lar tek merkezde HTTP error'a haritalanır — controller'lar temiz kalır
+- Exception'lar domain paketinde, `BankingException` base'inden türer; her biri stabil bir error code taşır ve doğru HTTP status'a (404, 409, 422, 400, 500) map edilir
+- Stacktrace ve internal detaylar **asla** response'a yazılmaz — log'a tam detay, response'a generic mesaj + `traceId`
+- Account enumeration'a karşı 404 ve 403 ayrımı yapılmaz; erişim yok ile kaynak yok aynı yanıtı döner
+- `TraceIdFilter` her request'e traceId verir: MDC ile log'lara, `X-Trace-Id` header ile response'a yazılır — production'da hata izinin anahtarı budur
+```

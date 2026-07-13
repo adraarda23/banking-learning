@@ -1,5 +1,14 @@
 # Topic 1.3 — Para İşleme: BigDecimal, RoundingMode, Currency
 
+```admonish info title="Bu bölümde"
+- Para için `double`/`float` neden kullanılamaz — IEEE 754'ün banking'deki gerçek maliyeti
+- `BigDecimal` iç yapısı: unscaled value + scale modeli, construction ve equality tuzakları
+- 8 `RoundingMode`'un farkları ve banking standardı olan HALF_EVEN (banker's rounding)
+- `Currency`, fraction digits farkları (JPY, BHD) ve TR'ye özgü TRY/TL/TRL normalizasyonu
+- Multi-currency conversion tuzakları: round-trip loss, cross rate, bid/ask spread
+- Production-grade `Money` value object: scale validation, normalization, currency-aware aritmetik
+```
+
 ## Hedef
 
 Para tipinin Java'da neden `double` veya `float` olmaması gerektiğini, `BigDecimal`'ın derin detaylarını, rounding mode tuzaklarını, multi-currency handling'i banking-grade seviyede öğrenmek. `Money` value object'ini production-ready hale getirmek.
@@ -34,7 +43,21 @@ Bir hesaba günde 10.000 işlem geliyor, her birinde 0.1 TL eklendiğini düşü
 
 `float` daha kötü — 7 basamak hassasiyet. `double` 15-17 basamak ama yine de finansal kesinlik için yetersiz.
 
+```admonish warning title="Dikkat"
 **Kural:** Banking projelerinde **HİÇBİR YERDE** para için `double` veya `float` görme. Code review'da reject sebebi.
+```
+
+Tip seçimi kararını akışta görelim:
+
+```mermaid
+flowchart TD
+    A["Para değeri temsil edilecek"] --> B{"Kesin decimal sonuç şart mı"}
+    B -->|"Evet - banking"| C["BigDecimal kullan"]
+    B -->|"Hayır - bilimsel yaklaşık hesap"| D["double olabilir"]
+    C --> E["String veya valueOf ile yarat"]
+    D --> F["Ama parayla işin varsa asla"]
+    F --> C
+```
 
 ### 2. `BigDecimal` — kesin decimal aritmetik
 
@@ -61,7 +84,22 @@ BigDecimal c = BigDecimal.valueOf(0.1);  // String'e çevirip parse eder
 BigDecimal d = BigDecimal.valueOf(100);  // long argument exact
 ```
 
+```admonish warning title="Dikkat"
 **Kural:** Money değerini **String veya `valueOf` ile** yarat. `new BigDecimal(double)` constructor'ını **asla kullanma** (kod review'da kırmızı bayrak).
+```
+
+```mermaid
+flowchart TD
+    A["BigDecimal yaratılacak"] --> B{"Kaynak nedir"}
+    B -->|"String"| C["String constructor"]
+    B -->|"long / int"| D["valueOf long"]
+    B -->|"double"| E{"Hangi yol"}
+    E -->|"valueOf double"| F["Güvenli - String üzerinden parse"]
+    E -->|"double constructor"| G["TEHLİKELİ - FP hatası taşınır"]
+    C --> H["Exact değer"]
+    D --> H
+    F --> H
+```
 
 #### Equality vs comparison
 
@@ -75,7 +113,9 @@ a.compareTo(b) == 0;    // TRUE — değer aynı
 
 `equals` scale'i hesaba katar. `compareTo` sadece değeri karşılaştırır.
 
+```admonish tip title="İpucu"
 **Banking pratiği:** İki para miktarını **`compareTo` ile** karşılaştır, `equals` ile asla.
+```
 
 #### Arithmetic — BigDecimal immutable
 
@@ -177,6 +217,16 @@ Rounding gerekirse `ArithmeticException` fırlatır. Kontrollü yerlerde kullan 
 
 #### Pratik karar matrisi (banking)
 
+```mermaid
+flowchart TD
+    A["Yuvarlama gerekiyor"] --> B{"İşlem tipi ne"}
+    B -->|"Faiz, FX, komisyon"| C["HALF_EVEN - bias yok"]
+    B -->|"Müşteriye fatura"| D["HALF_UP - muhasebe konvansiyonu"]
+    B -->|"Pay-out - banka ödüyor"| E["FLOOR - konservatif"]
+    B -->|"Charge - banka tahsil ediyor"| F["CEILING - konservatif"]
+    B -->|"Rounding hiç olmamalı"| G["UNNECESSARY - assertion"]
+```
+
 | İşlem | RoundingMode | Sebep |
 |---|---|---|
 | Faiz hesabı (sürekli işlem) | HALF_EVEN | Bias'sızlık |
@@ -186,7 +236,9 @@ Rounding gerekirse `ArithmeticException` fırlatır. Kontrollü yerlerde kullan 
 | Pay-out (banka müşteriye ödüyor) | FLOOR | Konservatif, müşteri haklarına saygı |
 | Charge (banka müşteriden tahsilat) | CEILING | Konservatif, banka eksik tahsil etmesin |
 
+```admonish tip title="İpucu"
 **Kural:** Her finans hesap kodunda RoundingMode **explicit** ver. Default'a güvenme. Domain expert/business analyst ile hangi mode kullanılacağını doğrula.
+```
 
 ### 4. `divide` ve hassasiyet kaybı
 
@@ -297,6 +349,17 @@ USD/TRY ask: 33.55 (banka USD satıyor, müşteriden 33.55 TRY alıyor)
 ```
 
 Spread = ask - bid = 0.10. Banka karı buradan.
+
+```mermaid
+sequenceDiagram
+    participant M as Müşteri
+    participant B as Banka
+    M->>B: USD satmak istiyorum
+    B-->>M: bid rate 33.45 uygulanır
+    M->>B: USD almak istiyorum
+    B-->>M: ask rate 33.55 uygulanır
+    Note over B: Spread 0.10 banka karı
+```
 
 Conversion API'ne **direction** bilgisi ekle: `BUY` veya `SELL` perspektifinden.
 
@@ -412,7 +475,9 @@ Veya custom serializer.
 PostgreSQL: `NUMERIC(19, 4)` veya `NUMERIC(20, 4)` (19-20 toplam basamak, 4 decimal).
 Oracle: `NUMBER(19, 4)`.
 
+```admonish warning title="Dikkat"
 **Asla `FLOAT` veya `DOUBLE PRECISION` kolonu ile para tutma.**
+```
 
 İki kolon yaklaşımı:
 ```sql
@@ -442,7 +507,9 @@ usFormatter.format(1234.56);  // "$1,234.56"
 - PDF dekont
 - Web UI
 
+```admonish tip title="İpucu"
 API response'ta **format etme** — raw `amount` + `currency` ver, formatting client'ın işi.
+```
 
 ### 12. Edge case'ler — bilmen gereken tuzaklar
 
@@ -466,7 +533,9 @@ new BigDecimal("100.00").stripTrailingZeros();  // 1E+2 (scientific notation!)
 new BigDecimal("100.10").stripTrailingZeros();  // 100.1
 ```
 
+```admonish warning title="Dikkat"
 `stripTrailingZeros` scale'i -2 yapabilir → sonuç `1E+2`. Para olarak göstermek istemediğin scientific notation. **Bunu kullanma**, kullanırsan `toPlainString()` ile birleştir.
+```
 
 #### d) `precision()` vs `scale()`
 
@@ -488,11 +557,27 @@ a.compareTo(b) == 0;  // true
 a.equals(b);          // false
 ```
 
+```admonish warning title="Dikkat"
 `HashSet<BigDecimal>`, `HashMap<BigDecimal, ?>` kullanırken **dikkat**. Map key olarak BigDecimal kullanma — string veya normalize edilmiş scale ile kullan.
+```
 
 ### 13. `Money` value object — production-grade revize
 
-Topic 1.1'deki `Money`'i şimdi geliştir:
+Topic 1.1'deki `Money`'i şimdi geliştir. Önce yapıyı kuşbakışı gör:
+
+```mermaid
+flowchart LR
+    M["Money record"] --> A["amount - BigDecimal"]
+    M --> C["currency - Currency"]
+    M --> K["Compact constructor"]
+    K --> K1["Null check"]
+    K --> K2["Scale validation"]
+    K --> K3["Scale normalization"]
+    M --> O["Operasyonlar"]
+    O --> O1["add / subtract - aynı currency şart"]
+    O --> O2["multiply - explicit RoundingMode"]
+    O --> O3["compareTo tabanlı karşılaştırmalar"]
+```
 
 ```java
 package com.mavibank.banking.common.domain;
@@ -1021,3 +1106,12 @@ yanlış olduğunu açıkla.
 7. "Bid/ask spread = ____. Banka karı buradadır çünkü ____."
 8. "TR'de TRY, TL, TRL kodlarının tarihi: ____."
 9. "JPY scale 0, BHD scale 3 — `Money` class'ım bunu nasıl handle ediyor: ____."
+
+```admonish success title="Bölüm Özeti"
+- Para için asla `double`/`float` kullanma — IEEE 754 binary temsili decimal kesinliği garanti edemez; `BigDecimal` (String veya `valueOf` ile yaratılmış) tek doğru seçim
+- `BigDecimal.equals` scale'e duyarlıdır; iki para miktarını her zaman `compareTo` ile karşılaştır
+- Banking standardı HALF_EVEN (banker's rounding) — bias'sızdır; her hesapta RoundingMode'u explicit ver, default'a güvenme
+- Her currency'nin fraction digits'i farklıdır (TRY 2, JPY 0, BHD 3); `Money` scale'i currency'ye göre valide ve normalize etmeli
+- Multi-currency conversion'da round-trip kaybı, cross-rate kümülatif hatası ve bid/ask spread'i hesaba kat
+- DB'de `NUMERIC(19,4)` kullan, JSON'da amount'u string olarak serialize et; farklı currency'ler arası aritmetik otomatik hata olmalı
+```

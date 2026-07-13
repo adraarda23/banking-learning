@@ -1,0 +1,30 @@
+[book]
+title = "Banking Backend Öğrenme Yolu"
+description = "TR bankacılık backend rolü için 12 fazlık junior → mid öğrenme kitabı"
+authors = ["Arda Aydın Kılınç"]
+language = "tr"
+src = "."
+
+[build]
+build-dir = "_book"
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[preprocessor.admonish]
+command = "mdbook-admonish"
+assets_version = "3.1.0" # do not edit: managed by `mdbook-admonish install`
+
+[output.html]
+additional-css = ["theme/mdbook-admonish.css", "theme/book-custom.css"]
+additional-js = ["theme/mermaid.min.js", "theme/mermaid-init.js"]
+default-theme = "light"
+preferred-dark-theme = "navy"
+smart-punctuation = true
+
+[output.html.fold]
+enable = true
+level = 0
+
+[output.html.search]
+limit-results = 20

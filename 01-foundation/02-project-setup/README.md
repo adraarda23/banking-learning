@@ -1,5 +1,13 @@
 # Topic 1.2 — Proje Setup: Spring Boot 3 + Maven + Profiles
 
+```admonish info title="Bu bölümde"
+- Spring Boot 3 felsefesini ve auto-configuration mantığını kavrayacaksın
+- `pom.xml` anatomisini ve günlük Maven komutlarını öğreneceksin
+- dev / test / prod profile sistemi ile ortam bazlı konfigürasyon kuracaksın
+- `@ConfigurationProperties` ile type-safe config binding yazacaksın
+- Secret'ları yml'den uzak tutmanın banking standardını göreceksin
+```
+
 ## Hedef
 
 Boş bir klasörden çalışan bir Spring Boot 3 uygulamasına kadar gelmek. Sadece "çalıştır" değil, **production-grade konfigürasyon** ile: profil ayrımı, type-safe config binding, secrets'ı yml'den uzakta tutma.
@@ -165,7 +173,9 @@ mvn -DskipTests package  # test'siz build
 mvn test -Dtest=AccountTest  # sadece bir test class
 ```
 
-**Önemli:** TR bankalarında çoğu yerde Maven kullanılır. Gradle bazı modern startup'larda. Maven'a hakim ol.
+```admonish tip title="İpucu"
+TR bankalarında çoğu yerde Maven kullanılır. Gradle bazı modern startup'larda. Maven'a hakim ol.
+```
 
 ### 5. Single module vs Multi-module
 
@@ -185,6 +195,15 @@ core-banking/
 └── banking-adapter-web/
     ├── pom.xml
     └── src/main/java/
+```
+
+```mermaid
+flowchart TD
+    P["core-banking parent pom.xml"] --> D["banking-domain"]
+    P --> A["banking-application"]
+    P --> W["banking-adapter-web"]
+    W -- "depends on" --> A
+    A -- "depends on" --> D
 ```
 
 **Phase 1'de:** Single module + iyi package yapısı. Sebep:
@@ -274,6 +293,16 @@ src/main/resources/
 
 **Override mekaniği:** Üstte `application.yml`, üzerine profile-specific dosya. Aynı key varsa profile-specific kazanır.
 
+```mermaid
+flowchart TD
+    BASE["application.yml ortak ayarlar"] --> DEV["application-dev.yml"]
+    BASE --> TEST["application-test.yml"]
+    BASE --> PROD["application-prod.yml"]
+    DEV --> RES["Aktif profil dosyasi ayni key'de kazanir"]
+    TEST --> RES
+    PROD --> RES
+```
+
 **Örnek `application-dev.yml`:**
 
 ```yaml
@@ -340,6 +369,15 @@ Spring Boot config kaynaklarının önceliği (sondaki en güçlü):
 3. OS environment variables (`DB_PASSWORD=...`)
 4. JVM system properties (`-Dspring.datasource.url=...`)
 5. Command-line arguments (`--spring.datasource.url=...`)
+
+```mermaid
+flowchart LR
+    A["application.yml"] --> B["profile yml"]
+    B --> C["OS env variables"]
+    C --> D["JVM system properties"]
+    D --> E["Command-line args"]
+    E --> WIN["Sondaki kazanir"]
+```
 
 **Banking pratik kuralı:**
 
@@ -481,10 +519,12 @@ logging:
 
 Banking'de credential yönetimi:
 
+```admonish warning title="Dikkat"
 **Asla:**
 - `application.yml`'de plain password
 - Git'e commit edilmiş secret
 - Slack/email üzerinden paylaşılan password
+```
 
 **Üretim:**
 - HashiCorp Vault
@@ -536,6 +576,15 @@ Faydaları:
 public @interface SpringBootApplication { }
 ```
 
+```mermaid
+flowchart TD
+    SBA["SpringBootApplication"] --> C1["SpringBootConfiguration"]
+    SBA --> C2["EnableAutoConfiguration"]
+    SBA --> C3["ComponentScan"]
+    C2 --> AC["Classpath bazli auto-config"]
+    C3 --> CS["Main class paketi ve alt paketleri taranir"]
+```
+
 **Component scan kuralı:** `@SpringBootApplication` annotation'lı class'ın **paketi ve alt paketleri** taranır.
 
 Yani main class'ını `com.mavibank.banking` paketine koyarsan:
@@ -543,7 +592,9 @@ Yani main class'ını `com.mavibank.banking` paketine koyarsan:
 - `com.mavibank.banking.transfer.adapter.out.persistence.*` ✓ taranır
 - `com.mavibank.other.*` ✗ taranmaz
 
+```admonish tip title="İpucu"
 **Sonuç:** Main class'ını **en üst paketin altına** koy.
+```
 
 ---
 
@@ -624,7 +675,9 @@ mvn spring-boot:run                              # dev profile (default)
 SPRING_PROFILES_ACTIVE=prod mvn spring-boot:run  # prod profile (DB env var yoksa hata)
 ```
 
+```admonish warning title="Dikkat"
 **Anti-pattern uyarısı:** `application.yml`'a default profile yazmak — production'da unutursun. Bunu Phase 1'de pedagojik amaçla yapıyoruz, gerçek üretimde **profile aktivasyonu deployment'tan gelmeli** (env var, K8s ConfigMap).
+```
 
 ### Task 1.2.4 — `@ConfigurationProperties` class yaz (30 dk)
 
@@ -730,7 +783,9 @@ spring:
     password: my_local_dev_password
 ```
 
-**Önemli:** Bunu commit ediyor musun? Hayır. **`.env`/`*-local.*` asla git'e gitmesin.**
+```admonish warning title="Dikkat"
+Bunu commit ediyor musun? Hayır. **`.env`/`*-local.*` asla git'e gitmesin.**
+```
 
 ---
 
@@ -896,3 +951,14 @@ yapma, sadece açıklama yap.
 4. "Banking projesinde secret'ları neden yml'de tutmam? ____."
 5. "Bir profile aktifleştirmenin 4 yolu: ____, ____, ____, ____."
 6. "Spring Boot'un component scan'i hangi paketleri tarar? ____."
+
+---
+
+```admonish success title="Bölüm Özeti"
+- Spring Boot = Spring Framework + starter dependency'ler + auto-config + opinionated defaults; parent POM versiyon yönetimini senin yerine yapar
+- Ortam ayrımı profile sistemiyle: `application.yml` ortak, `application-{profile}.yml` override eder; aynı key'de profile-specific kazanır
+- Config precedence sondan güçlü: yml < profile yml < env variable < JVM property < command-line argümanı
+- Business rules için `@Value` değil `@ConfigurationProperties` + `record` + `@Validated` — type-safe, test edilebilir, banking standardı
+- Secret'lar asla yml'de veya git'te olmaz: env variable, Vault veya secret manager; local için gitignored `.env` / `application-local.yml`
+- Main class en üst pakette durur — component scan sadece kendi paketi ve alt paketlerini tarar
+```

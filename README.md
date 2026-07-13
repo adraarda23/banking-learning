@@ -2,6 +2,26 @@
 
 TR major bank backend rolüne **junior → mid** seviyede çıkmak için 12 fazlık öğrenme programı.
 
+## Yolculuğun haritası
+
+```mermaid
+flowchart LR
+    subgraph Temel["Temel (Faz 1-4)"]
+        F1["1. Foundation"] --> F2["2. JPA & Tx"] --> F3["3. Concurrency"] --> F4["4. SQL & Oracle"]
+    end
+    subgraph Entegrasyon["Entegrasyon (Faz 5-8)"]
+        F5["5. Batch"] --> F6["6. Messaging"] --> F7["7. Microservices"] --> F8["8. Security"]
+    end
+    subgraph Ustalik["Ustalık (Faz 9-12)"]
+        F9["9. Observability"] --> F10["10. Domain"] --> F11["11. DevOps"] --> F12["12. Testing"]
+    end
+    F4 --> F5
+    F8 --> F9
+    F12 --> HEDEF(["Mid-level Banking Backend Dev"])
+
+    style HEDEF fill:#e8f5e9,stroke:#43a047,color:#1b5e20
+```
+
 ## Bu klasör ne, nasıl kullanılır
 
 Her faz bağımsız bir klasör. Her fazın içinde sıralı topic'ler var.
