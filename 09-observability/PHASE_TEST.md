@@ -1,6 +1,10 @@
 # Faz 9 — PHASE TEST
 
-Faz 10'a geçmeden önce kendini sına.
+```admonish question title="Bu test ne işe yarar?"
+Faz 10'a geçmeden önce kendini sına. Bu bir sınav değil, **dürüstlük kontrolü**:
+işaretleyemediğin her madde, hangi topic'e geri döneceğini gösterir.
+Hepsine "evet" diyebiliyorsan hazırsın.
+```
 
 ## Pratik test
 
@@ -164,4 +168,8 @@ Phase 9 = **banking operational excellence**. TR bankaları için:
 
 Mid+ engineer artık **production operations** sorumluluğu da alabilir. SRE roller TR banking sektöründe rekabetçi maaş, çok arananan profil.
 
-Phase 9 → Phase 10 (Domain Mastery): observability + business domain kombinasyonu = senior banking engineer.
+```admonish success title="Sonraki durak: Faz 10"
+Phase 9 → Phase 10 (Domain Mastery): observability + business domain kombinasyonu =
+senior banking engineer'a giden yol.
+→ [Faz 10 — Domain Mastery](../10-domain/index.md)
+```

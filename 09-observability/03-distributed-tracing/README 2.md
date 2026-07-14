@@ -282,10 +282,6 @@ Grafana panelinde "Exemplars" toggle'ı açıldığında spike noktasında küç
 
 Banking pratiği: SLO breach alarmı → Grafana exemplar → Jaeger trace → root cause. Alarm ile root cause arasındaki mesafeyi dakikalardan saniyelere indirir.
 
-```admonish tip title="traceId'yi loglara da taşı"
-Korelasyonun log ayağının çalışması için `traceId`'nin log satırlarında da bulunması şart. Micrometer Tracing bunu otomatik olarak MDC'ye koyar; log pattern'ine `%X{traceId}` ekleyip Loki/ELK'de bu alanla arattığında, trace'ten log'a ve log'dan trace'e iki yönlü geçiş açılır.
-```
-
 ### 8. Baggage — servisler arası business context
 
 Trace context sadece kimlik (traceId/spanId) taşır. Bazen bir **business** değeri de (tenant, müşteri segmenti) tüm downstream servislere taşımak istersin — işte **baggage** budur.
@@ -349,13 +345,7 @@ processors:
         probabilistic: {sampling_percentage: 5}
 ```
 
-Bedeli: Collector, karar için trace'in tüm span'lerini 10-30 saniye RAM'de tutmak zorunda — bellek ve karmaşıklık artışı.
-
-```admonish warning title="Tail sampling'de span'ler geç kaybolabilir"
-`decision_wait` süresi içinde bir trace'in tüm span'leri Collector'a ulaşmazsa (yavaş servis, network gecikmesi), karar eksik trace üzerinden verilir ve parçalar kaybolur. Yüksek hacimde `num_traces` buffer'ı taşarsa da drop yaşanır — Collector belleğini ve `decision_wait`'i yük testiyle boyutlandır.
-```
-
-Karar ağacı şöyle işler:
+Bedeli: Collector, karar için trace'in tüm span'lerini 10-30 saniye RAM'de tutmak zorunda — bellek ve karmaşıklık artışı. Karar ağacı şöyle işler:
 
 ```mermaid
 flowchart LR

@@ -1,35 +1,4 @@
-<div class="phase-cover-kicker">Dokuzuncu Bölüm</div>
-
 # Faz 9 — Observability & Performance
-
-<div class="phase-cover-meta">
-<div><strong>Süre</strong> 2-3 hafta</div>
-<div><strong>Topic</strong> 7 konu + mini proje</div>
-<div><strong>Çıktı</strong> Gözlenebilir core-banking</div>
-<div><strong>Ön koşul</strong> Faz 1-8 tamamlandı</div>
-</div>
-
-```admonish info title="Bu fazda ne öğreneceksin?"
-Banking sistemini **production-grade gözlenebilir** hale getireceksin: Three Pillars
-(logs, metrics, traces) stack'ini kurup yorumlamayı, performance bottleneck'leri delil ile
-bulup düzeltmeyi. Structured logging (Loki), Micrometer + Prometheus + Grafana, OpenTelemetry + Jaeger,
-profiling (JFR/async-profiler), heap/thread dump analizi, JMH ve Gatling ile yük testi.
-```
-
-## Fazın haritası
-
-```mermaid
-flowchart TD
-    subgraph Pillars["Hafta 1 — Three Pillars"]
-        direction LR
-        A["9.1 Logging"] --> B["9.2 Metrics"] --> C["9.3 Tracing"]
-    end
-    subgraph Perf["Hafta 2 — Performans Avı"]
-        direction LR
-        D["9.4 Profiling"] --> E["9.5 Heap/Thread Dumps"] --> F["9.6 JMH Deep"] --> G["9.7 Load Testing"]
-    end
-    Pillars --> Perf --> MP(["Mini Proje: Full Observability Stack + Faz Testi"])
-```
 
 ## Hedef
 
@@ -224,9 +193,27 @@ Bu çıktılar **CV-ready**. Banka interviewer'ı "Grafana dashboard'unu nasıl 
 
 ## Sıralama
 
-Bağımlılık zinciri baştaki haritayla aynı: 9.1 Logging (MDC/traceId Faz 1.7'den) → 9.2 Metrics → 9.3 Tracing (metric exemplar ile linklenir) → 9.4 Profiling → 9.5 Heap/Thread Dumps → 9.6 JMH Deep (Faz 3'ün devamı) → 9.7 Load Testing → Mini-project → Faz Testi → Faz 10 (Türk bankacılığı domain'i).
-
-```admonish success title="Başla"
-İlk durak: [Topic 9.1 — Structured Logging](./01-structured-logging/index.md).
-Her topic'i teorik bırakma, `core-banking` üzerinde uygula — mini proje bu birikimle yapılır.
+Fazın bağımlılık zinciri:
 ```
+9.1 Structured Logging   ← MDC, traceId (Faz 1.7'den geliyor)
+        ↓
+9.2 Metrics              ← Micrometer + Prometheus
+        ↓
+9.3 Distributed Tracing  ← OpenTelemetry + Jaeger; metric exemplar ile linkleniyor
+        ↓
+9.4 Profiling            ← JFR + async-profiler
+        ↓
+9.5 Heap & Thread Dumps  ← MAT + GC log
+        ↓
+9.6 JMH Deep             ← Faz 3 JMH'in devamı
+        ↓
+9.7 Load Testing         ← Gatling, full stack üzerinde
+        ↓
+Mini-project (full stack)
+        ↓
+PHASE_TEST
+        ↓
+Faz 10 (Domain — Türk bankacılığı: IBAN, EFT, FAST, BDDK)
+```
+
+→ Topic 9.1'e başla → [01-structured-logging/](./01-structured-logging/index.md)

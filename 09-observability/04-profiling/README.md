@@ -1,97 +1,96 @@
 # Topic 9.4 — Profiling: JFR + async-profiler + Flame Graphs
 
+```admonish info title="Bu bölümde"
+- Metrics "yavaş var mı" der, profiling "neresi yavaş" der — ve production-safe profiling'in temel kuralı: sampling vs instrumentation
+- JFR (JDK Flight Recorder) ile continuous kayıt + on-demand dump, JMC ile analiz pipeline'ı
+- async-profiler'ın dört modu (CPU, alloc, lock, wall-clock) ve banking için neden wall-clock kritik
+- Flame graph okuma mantığı — "geniş kutu = çok zaman" — ve banking hotspot pattern'leri (BigDecimal, logging, N+1, serialization)
+- Continuous profiling (Pyroscope/Parca) + gerçek bir "slow transfer" incident'ini alert'ten root cause'a kadar çözmek
+```
+
 ## Hedef
 
-Production-safe profiling banking serverlerda: JVM Flight Recorder (JFR), async-profiler, flame graph okuma. CPU hotspot, allocation hotspot, lock contention bulma. Continuous profiling (Pyroscope, Parca, Datadog Profiler) tools. Banking case studies (slow transfer, high CPU, GC pressure).
+Banking serverlarında production-safe profiling yapabilmek: JVM Flight Recorder (JFR), async-profiler ve flame graph okuma. CPU hotspot, allocation hotspot ve lock contention'ı doğru araçla bulup yorumlayabilmek. Continuous profiling araçlarını (Pyroscope, Parca, Datadog Profiler) tanımak. Bir incident'i "metric alert → trace → profile → root cause → fix → verify" akışıyla çözebilmek.
 
 ## Süre
 
-Okuma: 2 saat • Mini task: 3 saat • Test: 1 saat • Toplam: ~6 saat
+Okuma: ~2 saat • Kendini Sına: 45 dk • Pratik (opsiyonel): 3 saat • Toplam: ~2.5 saat (+ pratik)
 
 ## Önbilgi
 
-- Topic 9.1-9.3 bitti
-- JVM temel (heap, stack, GC duy)
-- Thread, lock kavramı
+- Topic 9.1-9.3 bitti — logging, metrics ve tracing üçlüsü oturdu
+- JVM temeli: heap, stack, GC duyarlılığı
+- Thread ve lock kavramı
 
 ---
 
 ## Kavramlar
 
-### 1. Profiling vs Metrics
+### 1. Profiling vs Metrics — neden iki farklı araca ihtiyacın var
+
+CPU %100'e vurdu, ama sebep kod tabanının neresinde? Metric bunu söylemez; işte profiling'in doğduğu boşluk burası.
+
+**Metric** aggregate bir ölçümdür ("transfer p99 latency 1.5s"): bir problem olduğunu söyler ama nedenini göstermez. **Profiling** ise per-stack-frame çözünürlükte bakar: "1.2s'i `BigDecimal.divide()` çağrısında geçiriyor, ~%80 CPU `MathContext` setup'ında."
 
 | | Metrics | Profiling |
 |---|---|---|
 | Granularity | Aggregate (timer p99) | Per-stack-frame |
-| Use case | "Slow var mı?" | "Neresi slow?" |
+| Soru | "What" — slow var mı? | "Why" — neresi slow? |
 | Cost | Cheap | Medium |
-| Production | Always-on | On-demand or continuous |
-| Question | "What" | "Why" |
+| Production | Always-on | On-demand veya continuous |
 
-Metric: "Transfer p99 latency 1.5s". Profile: "1.2s'i `BigDecimal.divide()` çağrısında geçiyor, ~80% CPU `MathContext` setup."
+Kısaca: metric alarmı çalar, profiling suçluyu bulur. İkisi birbirinin yerine geçmez; birlikte çalışır.
 
-### 2. Sampling vs Instrumentation
+### 2. Sampling vs Instrumentation — production'da hangisi güvenli
 
-**Sampling profiler:**
-- Periodic snapshot (~10-100 Hz)
-- Düşük overhead (1-3%)
-- Production-safe
-- async-profiler, JFR, Datadog Profiler
+Yanlış profiler seçersen çareyi hastalıktan beter yaparsın: bir profiler prod'da CPU'yu %50 artırırsa incident'i çözerken yenisini yaratırsın.
 
-**Instrumentation profiler:**
-- Bytecode injection
-- Her method enter/exit kaydet
-- Yüksek overhead (5-50%)
-- Production'da risky
-- VisualVM (instrumentation mode), YourKit
+**Sampling profiler** periyodik olarak (~10-100 Hz) stack snapshot alır. Overhead düşüktür (%1-3), production-safe'tir. Örnekler: async-profiler, JFR, Datadog Profiler.
 
-Banking pratiği: **Sampling** always; instrumentation sadece dev/CI.
+**Instrumentation profiler** bytecode inject eder; her method enter/exit'i kaydeder. Detay yüksektir ama overhead da yüksektir (%5-50) — production'da riskli. Örnekler: VisualVM (instrumentation mode), YourKit.
 
-### 3. JFR — Java Flight Recorder
+```mermaid
+flowchart LR
+    subgraph SMP["Sampling"]
+        A["Periyodik stack snapshot"] --> B["Dusuk overhead yuzde 1-3"]
+        B --> C["Production-safe"]
+    end
+    subgraph INS["Instrumentation"]
+        D["Her method enter-exit"] --> E["Yuksek overhead yuzde 5-50"]
+        E --> F["Sadece dev ve CI"]
+    end
+```
 
-JDK built-in. Low overhead. JDK 11+ free.
+<mark>Banking pratiği: production'da her zaman sampling, instrumentation sadece dev/CI ortamında.</mark>
+
+### 3. JFR — JDK'nın built-in uçuş kayıt cihazı
+
+Ayrı bir ajan kurmadan, düşük overhead'le sürekli kayıt istiyorsan cevap JDK'nın içinde: **JFR (Java Flight Recorder)**. JDK 11+ ile ücretsizdir ve continuous çalışmak için tasarlanmıştır.
+
+JVM'i başlatırken inline açabilir, veya çalışan bir process'e `jcmd` ile attach edebilirsin:
 
 ```bash
-# Inline (when starting JVM)
+# Inline (JVM başlarken)
 java -XX:StartFlightRecording=duration=60s,filename=app.jfr,settings=profile \
      -jar app.jar
 
-# Attach to running JVM
+# Çalışan JVM'e attach
 jcmd <pid> JFR.start name=banking duration=60s filename=app.jfr settings=profile
 
-# Stop and dump
+# Dump ve stop
 jcmd <pid> JFR.dump name=banking filename=app.jfr
 jcmd <pid> JFR.stop name=banking
 ```
 
-Settings:
-- `default` — low overhead, continuous (~0.5%)
-- `profile` — detailed, short-term (~2-3%)
+İki hazır settings profili var: `default` düşük overhead'li ve continuous içindir (~%0.5), `profile` ise daha detaylı ama kısa süreliktir (~%2-3).
 
-**JFR events:**
-- CPU usage
-- Method profiling (sampling)
-- Allocation (in TLAB)
-- GC pause + stats
-- Lock contention
-- I/O (file, socket)
-- Class loading
-- Exception throw
-- Network
-- Thread state
+JFR neyi kaydeder? CPU usage, method profiling (sampling), TLAB allocation, GC pause + stats, lock contention, I/O (file, socket), class loading, exception throw, network ve thread state. Banking için tipik kurulum: JFR sürekli `default` settings ile açık, incident anında `JFR.dump` ile son pencereyi al.
 
-Banking için JFR sürekli on (default settings) — incident'te dump.
+### 4. JFR analizi — JDK Mission Control (JMC)
 
-### 4. JFR analysis — JDK Mission Control (JMC)
+JFR bir `.jfr` dosyası üretir ama içindeki milyonlarca event'i çıplak gözle okuyamazsın; **JMC (JDK Mission Control)** tam olarak bu dosyayı görselleştiren analiz UI'ıdır.
 
-JMC = JFR analiz UI. Aspect'ler:
-- Method Profiling (flame graph)
-- Memory (TLAB allocations)
-- GC (pauses, throughput)
-- Thread (state, contention)
-- I/O
-- Exceptions
-- Hot Classes
+JMC dosyayı açtığında aspect'lere böler:
 
 ```
 JMC opens app.jfr
@@ -104,66 +103,84 @@ JMC opens app.jfr
   └── JVM Internals
 ```
 
-Banking örnek workflow:
-```
-1. Alert: p99 latency spike
-2. jcmd <pid> JFR.dump filename=spike.jfr
-3. Open JMC → Method Profiling
-4. Hot method: BigDecimalUtil.normalize (40% CPU)
-5. Drill down: MathContext allocation per call (anti-pattern)
-6. Fix: Single MathContext static instance
+Tipik incident workflow'u — alert'ten fix'e kadar tek bir hat:
+
+```mermaid
+flowchart LR
+    A["Alert p99 spike"] --> B["jcmd JFR.dump"]
+    B --> C["spike.jfr dosyasi"]
+    C --> D["JMC ile ac"]
+    D --> E["Method Profiling"]
+    E --> F["Hot method BigDecimalUtil.normalize"]
+    F --> G["Fix ve re-profile"]
 ```
 
-### 5. async-profiler — superior alternative
+Somut örnek: alert p99 latency spike verdi → `jcmd <pid> JFR.dump filename=spike.jfr` → JMC'de Method Profiling → hot method `BigDecimalUtil.normalize` %40 CPU → drill down: her çağrıda `MathContext` allocation (anti-pattern) → fix: tek static `MathContext` instance.
 
-Production'da daha popüler. Sampling, low overhead, CPU + alloc + lock + wall-clock + cache miss.
+### 5. async-profiler — production'ın gözdesi
+
+JFR iyi ama allocation ve lock'ta bazen kör kalır; async-profiler production'da daha popülerdir çünkü tek araçla CPU + alloc + lock + wall-clock + cache-miss profili verir — hepsi sampling, hepsi low overhead.
+
+Önce indir ve aç:
 
 ```bash
-# Download
 curl -L -o async-profiler.tar.gz \
   https://github.com/async-profiler/async-profiler/releases/download/v3.0/async-profiler-3.0-linux-x64.tar.gz
 tar xf async-profiler.tar.gz
+```
 
-# Run
-./profiler.sh -d 30 -f profile.html <pid>
+Sonra ne aradığına göre event tipini (`-e`) seç — dört ana mod bankacılığın dört ayrı sorusuna karşılık gelir:
 
-# CPU profile
+```bash
+# CPU profile — "neresi CPU yakıyor?"
 ./profiler.sh -d 60 -e cpu -f cpu.html <pid>
 
-# Allocation profile
+# Allocation profile — "kim young gen'i dolduruyor?"
 ./profiler.sh -d 60 -e alloc -f alloc.html <pid>
 
-# Lock contention
+# Lock contention — "kim kimi bekletiyor?"
 ./profiler.sh -d 60 -e lock -f lock.html <pid>
 
-# Wall-clock (sees blocked threads too — banking I/O)
+# Wall-clock — "blocked thread'ler nerede bekliyor?" (banking I/O)
 ./profiler.sh -d 60 -e wall -f wall.html <pid>
-
-# Continuous (background)
-./profiler.sh -d 300 -f $(date +%s).html <pid>
 ```
 
-**Wall-clock profiling** banking için **özellikle değerli** — I/O blocked (DB query, external API) görür. CPU profile sadece running thread'leri.
+Hangi mode ne bulur — seçim haritası:
 
-### 6. Flame graph reading
-
-Flame graph = stack frame y-axis, time x-axis.
-
-```
-         [main]
-        /      \
-   [doWork]  [other]
-    /   \
-[step1] [step2]
-   |       |
-[parse] [compute]
-   |
-[regex.match]    ← width = time spent here
+```mermaid
+flowchart LR
+    Q["Ne ariyorsun"] --> C["CPU hotspot"]
+    Q --> A["Allocation hotspot"]
+    Q --> L["Lock contention"]
+    Q --> W["I-O blocked time"]
+    C --> CE["-e cpu"]
+    A --> AE["-e alloc"]
+    L --> LE["-e lock"]
+    W --> WE["-e wall"]
 ```
 
-**Genişlik = zaman / CPU**. Üstte ne kadar genişse, o kadar fazla zaman.
+<mark>Wall-clock profiling banking için özellikle değerlidir çünkü I/O ile blocked zamanı (DB query, external API) görür — CPU profile sadece running thread'leri sayar ve blocked bekleyişi kaçırır.</mark>
 
-**Banking örnek:**
+```admonish tip title="Continuous async-profiler"
+Incident beklemeden arka planda sürekli profil almak istersen dosyaları zaman damgasıyla döndürebilirsin: `./profiler.sh -d 300 -f $(date +%s).html <pid>`. Her 5 dakikada bir ayrı HTML flame graph üretir; ama disk doluluğuna dikkat, rotate + limit koy.
+```
+
+### 6. Flame graph okuma — genişlik zamandır
+
+Flame graph korkutucu görünür ama tek bir kuralı vardır; onu kavrayınca gerisi okumaya dönüşür.
+
+Y ekseni stack frame derinliğidir (alttan üste çağrı zinciri), X ekseni ise zamandır. Bir kutunun **genişliği** o frame'de geçen toplam zamanı/CPU'yu gösterir — sıralama alfabetik değil, tamamen zaman ağırlıklıdır.
+
+```mermaid
+flowchart TD
+    R["Thread root tam genislik"] --> W["doWork genis kutu cok zaman"]
+    R --> O["other dar kutu az zaman"]
+    W --> H["hot method en genis kutu suphelimiz"]
+```
+
+<mark>Flame graph okurken tek soru sor: en üstteki en geniş kutu hangisi — orası zamanın gittiği yerdir.</mark>
+
+Banking transferinden gerçek bir flame graph (girinti = stack derinliği, yüzde = zaman):
 
 ```
 [Tomcat:exec-5]
@@ -172,30 +189,30 @@ Flame graph = stack frame y-axis, time x-axis.
       → TransferService.transfer
         → AccountRepository.findById                   30%
           → Hibernate query                            20%
-          → BigDecimal.setScale                        10%   ← WAIT, why setScale here?
+          → BigDecimal.setScale                        10%   ← neden setScale burada?
         → BalanceCalculator.calculate                  40%
           → BigDecimal.divide                          25%
-            → MathContext.<init>                       15%   ← Hot allocation!
+            → MathContext.<init>                       15%   ← hot allocation!
             → division                                 10%
         → KafkaProducer.send                           20%
           → Serializer.serialize                       15%
 ```
 
-`MathContext.<init>` 15% = hot allocation per call → fix.
+`MathContext.<init>` %15 = her çağrıda hot allocation → fix hedefi belli.
 
-### 7. CPU profiling banking patterns
+### 7. CPU profiling — banking pattern'leri
 
-**Pattern 1: Hot method**
+CPU profile'ında aynı dört-beş suçlu tekrar tekrar çıkar; onları tanırsan flame graph'a bakar bakmaz teşhisi koyarsın.
+
+**Pattern 1 — Hot method:** Tek bir method CPU'yu domine eder. Çözüm: sonucu cache'le veya hot path'i optimize et.
 
 ```
 BigDecimalUtil.format     40% CPU
-  ↓ called from
+  ↓ çağıran
 TransferController, AccountController, ...
 ```
 
-Cache result veya hot path'i optimize.
-
-**Pattern 2: Excessive logging**
+**Pattern 2 — Excessive logging:** Debug log'u production'da açık kalmış, `expensiveToString()` her çağrıda çalışıyor. Debug level production'da kapalı olmalı (Topic 9.1).
 
 ```
 Logback.encode               25% CPU
@@ -203,34 +220,28 @@ Logback.encode               25% CPU
 TransferService.log.debug("...", expensiveToString())
 ```
 
-Debug level production'da OFF (Topic 9.1).
-
-**Pattern 3: Inefficient SQL**
+**Pattern 3 — Inefficient SQL:** `ResultSet.next()` çok CPU yiyorsa büyük ihtimalle N+1 query var → EXPLAIN PLAN, JOIN FETCH (Phase 3).
 
 ```
 Hibernate ResultSet.next()    35% CPU
 ```
 
-→ N+1 query. EXPLAIN PLAN, JOIN FETCH (Phase 3).
-
-**Pattern 4: Serialization**
+**Pattern 4 — Serialization:** Jackson serialize, özellikle `BigDecimal.toPlainString` → banking için custom serializer yaz.
 
 ```
 Jackson.serialize           20% CPU
   └── BigDecimal.toPlainString    8%
 ```
 
-→ Custom serializer for BigDecimal banking.
+### 8. Allocation profiling — GC baskısının kaynağı
 
-### 8. Allocation profiling
-
-Allocation hotspot → GC pressure → pause time.
+CPU normal ama GC sürekli tetikleniyorsa suçlu CPU profile'ında görünmez; allocation profile gerekir çünkü **allocation hotspot → GC pressure → pause time** zinciri buradan başlar.
 
 ```bash
 ./profiler.sh -e alloc -d 60 -f alloc.html <pid>
 ```
 
-**Banking örnek:**
+Banking örneği — saniyede yüz megabaytlar:
 
 ```
 [TransferService.transfer]
@@ -239,88 +250,76 @@ Allocation hotspot → GC pressure → pause time.
   → String.<init>                      150 MB/s
 ```
 
-200 MB/s BigDecimal allocation → young gen fills fast → GC frequent.
+200 MB/s BigDecimal allocation → young gen hızla dolar → GC sıklaşır. Fix'ler: `BigDecimal.valueOf` (küçük değerler cache'li), `StringBuilder` reuse, ve nadiren object pool (banking'de genelde gerekmez).
 
-**Fix:**
-- BigDecimal.valueOf (cached small values)
-- StringBuilder reuse
-- Object pool (banking için nadiren — usually OK)
+### 9. Lock contention profiling — kim kimi bekletiyor
 
-### 9. Lock contention profiling
+Latency yüksek ama CPU düşükse thread'ler koşmuyor, birbirini bekliyordur; bunu ancak lock profile gösterir.
 
 ```bash
 ./profiler.sh -e lock -d 60 -f lock.html <pid>
 ```
 
-**Banking örnek:**
-
 ```
 ReentrantLock@xyz   500 ms contention
   ↓ holder
-  AccountService.transfer (held for 200 ms)
+  AccountService.transfer (200 ms tutuyor)
   ↓ waiters
-  20 threads, avg wait 50 ms
+  20 thread, ortalama 50 ms bekliyor
 ```
 
-Bottleneck = AccountService.transfer locks too widely.
-
-**Fix:** Lock granularity reduce, optimistic locking (Phase 3.6).
+Bottleneck: `AccountService.transfer` lock'u çok geniş tutuyor. Fix: lock granularity'i düşür, optimistic locking (Phase 3.6).
 
 ### 10. Continuous profiling — Pyroscope / Parca / Datadog
 
-Always-on profiling. Per-second sample stored. Compare time windows.
+On-demand profil incident anında işe yarar ama "dün de böyle miydi?" sorusuna cevap veremez; **continuous profiling** her saniye örnek saklayıp zaman pencerelerini karşılaştırmanı sağlar.
 
 ```yaml
-# Pyroscope agent
+# Pyroscope agent env
 - PYROSCOPE_APPLICATION_NAME=transfer-service
 - PYROSCOPE_SERVER_ADDRESS=http://pyroscope:4040
-- PYROSCOPE_LOG_LEVEL=debug
 - PYROSCOPE_PROFILER_EVENT=itimer    # CPU
 ```
 
 Java agent attach:
+
 ```bash
 java -javaagent:pyroscope.jar -jar app.jar
 ```
 
-**Advantages:**
-- Yesterday baseline vs today
-- Deploy artifact differential
-- A/B test perf comparison
-- Continuous = no need to wait for incident
+Kazandırdıkları: dünkü baseline ile bugünü kıyaslama, deploy öncesi/sonrası differential, A/B perf karşılaştırması ve en önemlisi — incident'i beklemek zorunda kalmadan sürekli görünürlük. Banking'de Pyroscope ve Parca yaygın tercihtir.
 
-Banking için Pyroscope / Parca yaygın choice.
+### 11. Banking case study — yavaş transfer
 
-### 11. Banking case study — slow transfer
+Teoriyi tek bir gerçek incident'te bağlayalım: transfer p99 1.5s, oysa SLO 500ms. Suçluyu adım adım kıstıralım.
 
-**Initial signal:** Transfer p99 1.5s (SLO: 500ms).
+**Adım 1 — Metric ile daralt.** Alarm nereden geldi:
 
-**Step 1: Metrics — narrowing down**
 ```promql
-histogram_quantile(0.99, 
+histogram_quantile(0.99,
   rate(banking_transfer_duration_seconds_bucket[5m]))
 # = 1.5s
 ```
 
-**Step 2: Trace — drill down**
+**Adım 2 — Trace ile drill down.** Exemplar trace hangi span'in yediğini gösterir:
 
-Exemplar trace:
 ```
 [banking.transfer]                  1.5s
   ├── account_lookup                100 ms
   ├── balance_check                  50 ms
   ├── limit_check                   200 ms
-  ├── fraud_score (external)        800 ms   ← culprit
+  ├── fraud_score (external)        800 ms   ← suçlu
   └── kafka_publish                 100 ms
 ```
 
-**Step 3: Profile fraud-service**
+**Adım 3 — fraud-service'i profile et.** Suçlu span belli, şimdi o servisi JFR ile çek:
 
 ```bash
 jcmd <pid> JFR.start duration=60s filename=fraud.jfr settings=profile
 ```
 
-JFR → method profiling:
+JMC method profiling hot path'i verir:
+
 ```
 [FraudController.score]
   → FraudRules.evaluate                70% CPU
@@ -328,91 +327,55 @@ JFR → method profiling:
       → DenseMatrix.multiply           45% CPU   ← hot
 ```
 
-**Step 4: Allocation profile**
+**Adım 4 — allocation profile.** CPU hot ama asıl mesele allocation'da mı:
 
 ```
-DenseMatrix.<init>(int, int)    500 MB/s   ← new matrix per request
+DenseMatrix.<init>(int, int)    500 MB/s   ← her request'te yeni matrix
 ```
 
-Per-request **fresh matrix allocation** → GC pressure → CPU + pause time.
+Her request'te taze matrix allocation → GC pressure → hem CPU hem pause time.
 
-**Step 5: Fix**
+**Adım 5 — fix.** Matrix'i reuse et (object pool), model'i startup'ta warmup et, aynı kullanıcı için sonucu cache'le (5-dk TTL).
 
-- Reuse matrix (object pool)
-- Model warmup on startup
-- Cache results (5-min TTL for same user)
+**Adım 6 — verify.** Deploy sonrası yeniden profile et: p99 200 ms. Ölçmeden "düzeldi" deme.
 
-**Step 6: Verify**
+### 12. Profile'dan JVM tuning ipuçları
 
-Re-profile after deploy. p99 200 ms ✓.
+Profile sana sadece kod değil, JVM ayarı da söyler; semptomu doğru okursan doğru knob'a dokunursun.
 
-### 12. JVM tuning hints from profiling
-
-**Symptom: Frequent GC**
-- Allocation rate yüksek → reduce allocations
-- Heap küçük → `-Xmx` artır
-- Young gen küçük → ratio config
-
-**Symptom: Long GC pauses (>1s)**
-- G1GC tune: `-XX:MaxGCPauseMillis=200`
-- Or switch ZGC / Shenandoah for low-pause
-- Heap çok büyük → split application
-
-**Symptom: High CPU sustained**
-- Profile CPU
-- Check infinite loop / thread spin
-- Excessive logging
-
-**Symptom: High allocation**
-- Allocation profile
-- Common: BigDecimal, String, primitive box
-
-**Symptom: Lock contention**
-- Lock profile
-- Granularity reduce
-- Lock-free data structure
+- **Frequent GC:** allocation rate yüksekse allocation'ları azalt; heap küçükse `-Xmx` artır; young gen küçükse ratio config.
+- **Long GC pauses (>1s):** G1GC'yi tune et (`-XX:MaxGCPauseMillis=200`), veya low-pause için ZGC/Shenandoah'a geç; heap çok büyükse uygulamayı böl.
+- **High CPU sustained:** CPU profile al, infinite loop / thread spin ve excessive logging ara.
+- **High allocation:** allocation profile al; klasik suçlular BigDecimal, String, primitive boxing.
+- **Lock contention:** lock profile al, granularity düşür, lock-free veri yapısı düşün.
 
 ### 13. Banking — profiling anti-pattern'leri
 
-**Anti-pattern 1: Instrumenting profiler production'da**
+Bu on tuzak "bu profiling setup'ında ne yanlış?" sorusunun cephaneliğidir.
 
-Latency spike + memory bloat. Async-profiler / JFR sampling kullan.
+**1 — Instrumenting profiler production'da:** latency spike + memory bloat. Sampling (async-profiler/JFR) kullan.
 
-**Anti-pattern 2: Sampling süre çok kısa**
+**2 — Sampling süresi çok kısa:** 5 saniye = statistical noise. Banking'de minimum 30-60 sn.
 
-5 saniye = statistical noise. Banking min 30-60 sn.
+**3 — Multi-tenant JVM'i tek profile olarak yorumlamak:** farklı traffic pattern'leri karışır, tek profile yanıltır. Per-tenant veya per-endpoint profil al.
 
-**Anti-pattern 3: Single JVM profile aggregate olarak yorumlamak**
+**4 — Profile'ı unattended bırakmak:** JFR dosyası disk doldurur. Rotate + limit koy.
 
-Multi-tenant / multi-traffic-pattern → single profile yanıltır. Per-tenant profile veya per-endpoint.
+**5 — Sensitive data leak:** JFR exception stack trace + argümanlar PII içerebilir. Banking'de profile dosyaları sıkı erişimli olmalı (S3 + IAM + encryption).
 
-**Anti-pattern 4: Profile production'da unattended**
+**6 — Sadece CPU profile, wall-clock yok:** banking I/O-heavy'dir (DB, external API). Wall-clock blocked time'ı görür, CPU profile blocked thread'leri kaçırır.
 
-JFR dosyası disk doldurabilir. Rotate + limit.
+**7 — Ölçmeden optimize etmek:** "bence String yerine StringBuilder olur" → profile çıkmadan değişiklik. Önce ölç.
 
-**Anti-pattern 5: Profile sensitive data leak**
+**8 — Dev environment'ta profile:** dev workload ≠ prod workload, hot path farklıdır. Staging veya controlled prod kullan.
 
-JFR exception stack trace + arg → PII içerebilir. Banking için profile dosyaları **sıkı erişim** (S3 + IAM + encryption).
+**9 — Farklı load altında profile karşılaştırmak:** kıyaslama aynı load'da yapılmalı; bunun için JMH var (Topic 9.6).
 
-**Anti-pattern 6: Wall-clock profile yerine sadece CPU**
+**10 — Continuous profiling maliyetini görmezden gelmek:** Pyroscope storage + retention. Banking için tier'la (günlük detay, haftalık aggregate).
 
-Banking I/O-heavy (DB, external API). Wall-clock görür blocked time. CPU profile blocked thread'leri kaçırır.
-
-**Anti-pattern 7: Optimize before measure**
-
-"Bence String yerine StringBuilder olur" → profile çıkmadan değişiklik. Önce ölç.
-
-**Anti-pattern 8: Profile dev environment**
-
-Dev workload != prod workload. Hot path farklı. Staging veya prod (controlled).
-
-**Anti-pattern 9: Compare profiles different load**
-
-Karşılaştırma yaparken aynı load. JMH bunun için (Topic 9.6).
-
-**Anti-pattern 10: Continuous profiling cost ignore**
-
-Pyroscope storage + retention. Banking için tier (daily detail, weekly aggregate).
+```admonish warning title="En sık yapılan iki hata"
+İkisi de aynı kökten gelir — sabırsızlık. Biri "ölçmeden optimize etmek": profile çıkmadan kod değiştirmek, çoğu zaman yanlış yeri düzeltir. Diğeri "5 saniyelik sampling": istatistiksel gürültüyü gerçek hotspot sanmak. Banking'de her ikisi de production'da yanlış fix'e ve boşa deploy'a mal olur.
+```
 
 ---
 
@@ -421,181 +384,235 @@ Pyroscope storage + retention. Banking için tier (daily detail, weekly aggregat
 - JDK Flight Recorder docs
 - JDK Mission Control
 - async-profiler GitHub
-- Brendan Gregg flame graph (origin)
+- Brendan Gregg — Flame Graphs (origin)
 - Pyroscope docs
 - Datadog Continuous Profiler
 - "Java Performance" — Scott Oaks
 
 ---
 
-## Mini task'ler
+## Kendini Sına
 
-### Task 9.4.1 — JFR continuous recording (30 dk)
+Aşağıdaki soruları önce **cevaba bakmadan** kendi cümlelerinle yanıtlamayı dene — hepsi profiling odaklı bir SRE/backend mülakatında çıkabilecek tarzda. Takıldığın soru olursa ilgili Kavramlar başlığına dön, sonra tekrar dene.
 
-Spring Boot app `-XX:StartFlightRecording=settings=default,maxage=1h,filename=...` ile başlat. JMC ile aç.
+**S1. Flame graph nasıl okunur? "Bu grafikte problem nerede" sorusuna nasıl cevap verirsin?**
 
-### Task 9.4.2 — Hot CPU method JFR (45 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-Banking app'e BigDecimal-heavy compute endpoint. JFR profile çek (60 sn). JMC method profiling hot path identify.
+Y ekseni stack derinliğidir (alttan üste çağrı zinciri), X ekseni zamandır. Kritik kural: bir kutunun genişliği o frame'de geçen toplam zamanı/CPU'yu gösterir — sıralama zaman ağırlıklıdır, alfabetik değil. Problemi bulmak için üstteki en geniş kutuya bakarsın: zamanın gittiği yer orasıdır.
 
-### Task 9.4.3 — async-profiler CPU flame graph (45 dk)
+Yükseklik tek başına kötü değildir (derin stack normaldir); asıl sinyal geniş kutulardır. Örneğin `MathContext.<init>` yatayda %15 yer kaplıyorsa, her çağrıda o allocation'a %15 zaman gidiyor demektir ve optimize edilecek nokta odur.
 
-Same scenario. async-profiler `-e cpu -d 60 -f cpu.html`. Browser'da flame graph aç. JFR ile compare.
+</details>
 
-### Task 9.4.4 — Allocation profiling (45 dk)
+**S2. JFR neden bu kadar düşük overhead ile çalışabiliyor? Nasıl continuous açık bırakabiliyoruz?**
 
-`-e alloc -d 60 -f alloc.html`. Banking BigDecimal allocation hotspot bul.
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 9.4.5 — Lock contention (45 dk)
+JFR sampling tabanlıdır ve JVM'in içine gömülüdür: her method çağrısını instrument etmek yerine periyodik olarak thread'lerin stack'inden snapshot alır ve event'leri verimli bir binary buffer'a yazar. `default` settings ile overhead ~%0.5 civarındadır, bu yüzden production'da sürekli açık bırakılabilir.
 
-Multi-thread test scenario (synchronized block). `-e lock -d 60`. Contention point.
+Continuous kullanım şudur: JFR `default` settings + `maxage`/`maxsize` limitleriyle sürekli döner (ring buffer gibi), incident anında `jcmd JFR.dump` ile son pencereyi diske alırsın. Daha detaylı ama daha pahalı `profile` settings'i (~%2-3) genelde kısa süreli, hedefli çekimlerde kullanılır.
 
-### Task 9.4.6 — Wall-clock profile (30 dk)
+</details>
 
-External API call mock 200ms delay. `-e wall -d 60`. CPU profile'da görünmeyen blocked time.
+**S3. async-profiler ile JFR arasında ne fark var? Ne zaman hangisini seçersin?**
 
-### Task 9.4.7 — Pyroscope / Parca local (60 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-Pyroscope docker. Banking app agent attach. UI'da continuous profile timeline.
+İkisi de sampling ve low overhead'dir. JFR JDK'nın built-in'idir, kurulum gerektirmez, JMC ile zengin analiz sunar ve continuous kayıt için idealdir; ama allocation/lock detayında bazen daha sınırlıdır. async-profiler ayrı bir ajandır ama tek araçla CPU + alloc + lock + wall-clock + cache-miss verir ve doğrudan HTML flame graph üretir.
 
-### Task 9.4.8 — Diff profile (45 dk)
+Pratikte: sürekli açık kalan continuous kayıt ve kurumsal analiz için JFR + JMC; hedefli, özellikle wall-clock veya allocation derinliği gereken ad-hoc profil için async-profiler. Banking'de ikisi bir arada bulunur — JFR baseline, async-profiler derin dalış.
 
-Pre-optimization profile. Apply fix (cache result, static instance). Post-profile. Pyroscope diff view.
+</details>
 
-### Task 9.4.9 — JFR + Mission Control GC analysis (45 dk)
+**S4. Sampling ve instrumentation profiler arasındaki fark nedir? Banking'de hangisini, neden seçersin?**
 
-GC pause distribution. Long pause events. G1GC tune `-XX:MaxGCPauseMillis=200`.
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 9.4.10 — Production incident simulation (60 dk)
+Sampling profiler periyodik olarak (~10-100 Hz) stack snapshot alır; her method çağrısını görmez ama istatistiksel olarak hot path'i doğru bulur, overhead'i düşüktür (%1-3). Instrumentation profiler ise bytecode inject edip her method enter/exit'i kaydeder; tam çağrı sayısı verir ama overhead yüksektir (%5-50).
 
-Slow endpoint senaryo. Metric alert → trace exemplar → JFR dump → root cause → fix.
+Banking'de production'da her zaman sampling kullanılır — canlı sistemde %50 overhead kabul edilemez, incident'i çözerken yenisini yaratır. Instrumentation sadece dev/CI'da, tam çağrı sayısı gerçekten gerektiğinde kullanılır.
 
----
+</details>
 
-## Test yazma rehberi
+**S5. Wall-clock profiling neden banking için özellikle kritik? CPU profile neyi kaçırır?**
 
-```java
-@Test
-void shouldNotHaveExcessiveBigDecimalAllocation() throws Exception {
-    // Run profiling via java agent or AsyncProfiler API
-    AsyncProfiler profiler = AsyncProfiler.getInstance();
-    profiler.start("alloc", 1_000_000);   // 1ms sampling
-    
-    for (int i = 0; i < 10_000; i++) {
-        transferService.transfer(testRequest);
-    }
-    
-    String output = profiler.stop();
-    
-    // Parse output, look for BigDecimal allocation rate
-    long bigDecimalBytes = parseAllocFor(output, "java.math.BigDecimal");
-    assertThat(bigDecimalBytes).isLessThan(100_000_000);   // < 100 MB
-}
+<details>
+<summary>Cevabı göster</summary>
 
-@Test
-void noLockContentionOnHotPath() throws Exception {
-    AsyncProfiler profiler = AsyncProfiler.getInstance();
-    profiler.start("lock", 1_000_000);
-    
-    ExecutorService pool = Executors.newFixedThreadPool(50);
-    for (int i = 0; i < 1000; i++) {
-        pool.submit(() -> transferService.transfer(testRequest));
-    }
-    pool.shutdown();
-    pool.awaitTermination(60, TimeUnit.SECONDS);
-    
-    String output = profiler.stop();
-    
-    long lockContention = parseLockFor(output, "TransferService");
-    assertThat(lockContention).isLessThan(100_000_000);   // < 100ms aggregate
-}
-```
+CPU profile sadece CPU üzerinde koşan (running) thread'leri sampling'ler. Bir thread DB query'si veya external API çağrısı için blocked ise CPU harcamıyordur, dolayısıyla CPU profile'ında görünmez — ama request latency'sinin çoğu tam da o beklemede geçiyor olabilir.
 
----
+Banking iş yükü I/O-heavy'dir (DB, SWIFT, fraud servisi, Kafka). Wall-clock profiling blocked zamanı da dahil eder, yani "800ms'i external fraud çağrısında bekliyoruz" gibi bir gerçeği ortaya çıkarır. Sadece CPU profile'a bakarsan bu bekleyişi tamamen kaçırır, yanlış yeri optimize edersin.
 
-## Claude-verify prompt
+</details>
 
-```
-Profiling stack'imi banking-grade kriterlere göre değerlendir:
+**S6. Prod'da bir endpoint yavaşladı, metric alert geldi. Root cause'a giden adımların neler?**
 
-1. Tooling:
-   - JFR continuous (default settings)?
-   - async-profiler available?
-   - Continuous profiling (Pyroscope/Parca/Datadog)?
+<details>
+<summary>Cevabı göster</summary>
 
-2. Profile types:
-   - CPU profile?
-   - Allocation profile?
-   - Lock contention profile?
-   - Wall-clock (banking I/O için kritik)?
+Akış: metric alert → trace → profile → root cause → fix → verify. Önce metric ile hangi endpoint/SLO ihlali olduğunu daraltırsın (p99 spike). Sonra exemplar trace ile latency'nin hangi span'de yandığını bulursun (ör. external fraud_score 800ms). O servisi hedef alıp profile çekersin (JFR dump veya async-profiler).
 
-3. Banking analysis:
-   - Hot method identification?
-   - Allocation rate (BigDecimal, String)?
-   - Lock contention (transfer service)?
-   - GC pause distribution?
+Profile'da hot method (CPU) ve gerekiyorsa allocation/lock modlarıyla asıl sebebi bulursun (ör. her request'te DenseMatrix allocation → GC pressure). Fix uygularsın (reuse/pool, warmup, cache) ve en kritik adım: deploy sonrası yeniden profile edip p99'un düştüğünü doğrularsın. Ölçmeden "düzeldi" denmez.
 
-4. Workflow:
-   - Metric alert → trace → profile → root cause flow?
-   - Pre/post-fix differential profile?
+</details>
 
-5. Production-safe:
-   - Sampling overhead < 3%?
-   - JFR sürekli on (default settings)?
-   - Profile dump on incident automated?
+**S7. Allocation profiling neyi bulur? BigDecimal bir banking hotspot'u çıkarsa nasıl fixlersin?**
 
-6. Banking domain checks:
-   - BigDecimal allocation hotspot tarandı?
-   - Logging overhead (Logback, JSON serialize)?
-   - DB query hot path (Hibernate)?
-   - Kafka serialization hot path?
+<details>
+<summary>Cevabı göster</summary>
 
-7. JVM tuning:
-   - G1GC `MaxGCPauseMillis` set?
-   - Heap size + young gen ratio?
-   - GC log enabled?
-   - ZGC / Shenandoah considered for low-pause?
+Allocation profiling (`-e alloc`) hangi call site'ın ne hızda (MB/s) heap allocate ettiğini gösterir. Amaç GC baskısının kaynağını bulmaktır: yüksek allocation → young gen hızla dolar → GC sıklaşır → CPU ve pause time artar. Örneğin `BigDecimal.<init>(String)` 200 MB/s allocate ediyorsa bu bir hotspot'tur.
 
-8. Anti-pattern:
-   - Instrumentation profiler prod YOK?
-   - Sampling < 30 sn YOK?
-   - PII profile leak (S3 IAM + encryption)?
-   - Compare profiles different load YOK?
-   - Optimize before measure YOK?
+Fix'ler: küçük/sık değerler için `BigDecimal.valueOf` (cache'li instance'lar), gereksiz String concat yerine `StringBuilder` reuse, ve gerçekten gerekiyorsa object pool (banking'de nadiren, genelde ilk iki yeter). Amaç per-request taze allocation'ı azaltmaktır.
 
-9. Documentation:
-   - 1 case study walkthrough (slow transfer → fixed)?
-   - Runbook: how to dump JFR on prod?
+</details>
 
-Her madde için PASS / FAIL / EKSIK işaretle.
-```
+**S8. Continuous profiling (Pyroscope/Parca) on-demand profiling'e göre ne kazandırır?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+On-demand profiling sadece incident anında, sen çektiğinde veri toplar; "dün de böyle miydi, hangi deploy bozdu?" sorularına cevap veremez. Continuous profiling her saniye örnek saklar, böylece zaman pencerelerini karşılaştırabilirsin: dünkü baseline vs bugün, deploy öncesi vs sonrası, A/B perf farkı.
+
+En büyük kazanç incident'i beklemeden sürekli görünürlük — regresyon canlıda oturmadan fark edilir. Bedeli storage + retention maliyetidir; banking'de tier'lanarak yönetilir (günlük detay, haftalık aggregate).
+
+</details>
 
 ---
 
 ## Tamamlama kriterleri
 
-- [ ] JFR continuous on
-- [ ] JMC ile JFR analiz pratiği
-- [ ] async-profiler CPU + alloc + lock + wall flame graph
-- [ ] Pyroscope/Parca continuous setup
-- [ ] Banking hot path BigDecimal allocation profile
-- [ ] Lock contention scenario reproduce + profile
-- [ ] Pre/post-fix differential profile (Pyroscope)
-- [ ] 1 production-like incident workflow walkthrough
-- [ ] Runbook: JFR dump on prod
-- [ ] 2+ integration test (allocation rate, no lock contention)
+- [ ] Metric ile profiling farkını ("what" vs "why") bir cümlede anlatabiliyorum
+- [ ] Sampling vs instrumentation farkını ve banking'in neden sampling seçtiğini biliyorum
+- [ ] JFR'ı inline ve `jcmd` attach ile başlatıp dump alma komutlarını yazabiliyorum
+- [ ] `default` vs `profile` settings farkını ve continuous kullanım kalıbını açıklayabiliyorum
+- [ ] async-profiler'ın dört modunu (cpu/alloc/lock/wall) ne zaman kullanacağımı biliyorum
+- [ ] Bir flame graph'a bakıp "genişlik = zaman" kuralıyla hotspot'u gösterebiliyorum
+- [ ] Wall-clock profiling'in banking I/O için neden kritik olduğunu anlatabiliyorum
+- [ ] "Slow transfer" incident'ini alert → trace → profile → fix → verify akışıyla çizebiliyorum
+- [ ] (Opsiyonel) "Pratik yapmak istersen" bölümündeki senaryoları uyguladım
 
 ---
 
-## Defter notları (10 madde)
+## Defter notları
 
-1. "Sampling vs instrumentation profiler banking pick + overhead: ____."
-2. "JFR continuous (default) + on-demand profile dump workflow: ____."
-3. "async-profiler 4 mode (cpu, alloc, lock, wall) banking kullanım: ____."
-4. "Flame graph okuma — genişlik = zaman, alt-üst stack: ____."
-5. "Wall-clock profile (I/O blocked görünür) banking sebebi: ____."
-6. "Continuous profiling (Pyroscope/Parca) baseline vs today diff: ____."
-7. "BigDecimal allocation banking hotspot + fix patterns (cache, valueOf): ____."
-8. "Lock contention reduce — granularity + optimistic locking: ____."
-9. "JVM tuning from profile (G1GC pause target, ZGC low-pause): ____."
+1. "Metrics vs profiling: ____ (what vs why, granularity farkı)."
+2. "Sampling vs instrumentation banking seçimi + overhead: ____."
+3. "JFR continuous (default) + on-demand dump workflow: ____."
+4. "JFR `default` vs `profile` settings ne zaman hangisi: ____."
+5. "async-profiler 4 mode (cpu, alloc, lock, wall) banking kullanımı: ____."
+6. "Flame graph okuma — genişlik = zaman, en geniş üst kutu: ____."
+7. "Wall-clock profile (I/O blocked görünür) banking sebebi: ____."
+8. "BigDecimal allocation hotspot + fix patterns (valueOf, reuse): ____."
+9. "Lock contention reduce — granularity + optimistic locking: ____."
 10. "Production incident workflow (alert → trace → profile → fix → verify): ____."
+
+```admonish success title="Bölüm Özeti"
+- Metric problemin varlığını, profiling nerede olduğunu söyler — biri alarmı çalar, diğeri suçluyu bulur; ikisi birlikte çalışır
+- Production'da her zaman sampling profiler (JFR, async-profiler, %1-3 overhead); instrumentation sadece dev/CI çünkü %5-50 overhead canlıyı boğar
+- JFR JDK built-in + low overhead: `default` settings continuous açık kalır, incident'te `jcmd JFR.dump` + JMC ile analiz
+- async-profiler dört mod verir; wall-clock banking için kritiktir çünkü CPU profile'ın kaçırdığı I/O blocked zamanı (DB, external API) gösterir
+- Flame graph tek kural: genişlik = zaman; üstteki en geniş kutu optimize edilecek yerdir
+- Incident'i "metric alert → trace → profile → root cause → fix → verify" akışıyla çöz; ölçmeden optimize etme, 30-60 sn altı sampling'e güvenme
+```
+
+---
+
+## Pratik yapmak istersen
+
+Kavramları elinle denemek istersen aşağıdaki iki blok hazır: profiling lab senaryoları JFR/async-profiler'ı gerçek bir Spring Boot app üzerinde çalıştırmanı sağlar, Claude-verify prompt'u ise profiling stack'ini banking-grade perspektiften denetletir. Her biri kendi başlığı altında; süre gerektiren adımlarda toplam ~3 saatlik bir pratik hedefle.
+
+<details>
+<summary>Profiling lab senaryoları (~3 saat)</summary>
+
+Aşağıdaki on senaryoyu sırayla uygula; her biri bir profiling aracının somut çıktısını görmeni sağlar. Tamamlanmış sayılman için her senaryonun sonunda elde edilen çıktıyı (flame graph HTML, JMC ekranı, Pyroscope timeline) yorumlayabiliyor olman yeterli.
+
+**1 — JFR continuous recording:** Spring Boot app'i `-XX:StartFlightRecording=settings=default,maxage=1h,filename=app.jfr` ile başlat. JMC ile aç, aspect'leri gez.
+
+**2 — Hot CPU method (JFR):** Banking app'e BigDecimal-heavy bir compute endpoint ekle. 60 sn JFR profile çek, JMC Method Profiling'de hot path'i identify et.
+
+**3 — async-profiler CPU flame graph:** Aynı senaryo. `./profiler.sh -e cpu -d 60 -f cpu.html <pid>`. Browser'da flame graph'ı aç ve JFR sonucuyla karşılaştır.
+
+**4 — Allocation profiling:** `-e alloc -d 60 -f alloc.html`. Banking BigDecimal allocation hotspot'unu bul (MB/s).
+
+**5 — Lock contention:** Multi-thread test senaryosu (synchronized block). `-e lock -d 60`. Contention point'i belirle.
+
+**6 — Wall-clock profile:** External API çağrısını 200ms delay ile mock'la. `-e wall -d 60`. CPU profile'da görünmeyen blocked time'ı wall-clock'ta gör.
+
+**7 — Pyroscope/Parca local:** Pyroscope'u docker ile ayağa kaldır. Banking app'e agent attach et, UI'da continuous profile timeline'ını izle.
+
+**8 — Diff profile:** Optimizasyon öncesi profil al. Fix uygula (cache result, static instance). Optimizasyon sonrası profil al, Pyroscope diff view ile karşılaştır.
+
+**9 — JFR + JMC GC analizi:** GC pause distribution'a bak, long pause event'lerini incele. G1GC'yi `-XX:MaxGCPauseMillis=200` ile tune et, farkı gözlemle.
+
+**10 — Production incident simülasyonu:** Slow endpoint senaryosu kur. Metric alert → trace exemplar → JFR dump → root cause → fix → verify akışını uçtan uca çalıştır.
+
+> İpucu: Profiling test'lerini otomatikleştirmek istersen async-profiler'ın Java API'sini (`AsyncProfiler.getInstance()`) kullanabilirsin — `profiler.start("alloc", 1_000_000)` ile 1ms sampling başlat, hot path'i çalıştır, `profiler.stop()` çıktısını parse edip BigDecimal allocation byte'larını bir threshold'a karşı assert et. Aynı yaklaşım lock contention için `start("lock", ...)` ile çalışır.
+
+</details>
+
+<details>
+<summary>Claude-verify prompt</summary>
+
+```
+Profiling stack'imi banking-grade kriterlere göre değerlendir. Eksikleri
+işaretle, kod yazma:
+
+1. Tooling:
+   - JFR continuous (default settings) açık mı?
+   - async-profiler mevcut mu?
+   - Continuous profiling (Pyroscope/Parca/Datadog) var mı?
+
+2. Profile tipleri:
+   - CPU profile alınıyor mu?
+   - Allocation profile?
+   - Lock contention profile?
+   - Wall-clock (banking I/O için kritik)?
+
+3. Banking analizi:
+   - Hot method identification yapıldı mı?
+   - Allocation rate (BigDecimal, String) tarandı mı?
+   - Lock contention (transfer service)?
+   - GC pause distribution?
+
+4. Workflow:
+   - Metric alert → trace → profile → root cause akışı var mı?
+   - Pre/post-fix differential profile?
+
+5. Production-safe:
+   - Sampling overhead < %3?
+   - JFR sürekli on (default settings)?
+   - Incident'te profile dump otomatik mi?
+
+6. Banking domain kontrolleri:
+   - BigDecimal allocation hotspot tarandı mı?
+   - Logging overhead (Logback, JSON serialize)?
+   - DB query hot path (Hibernate)?
+   - Kafka serialization hot path?
+
+7. JVM tuning:
+   - G1GC MaxGCPauseMillis set mi?
+   - Heap size + young gen ratio?
+   - GC log enabled?
+   - ZGC / Shenandoah low-pause için değerlendirildi mi?
+
+8. Anti-pattern:
+   - Instrumentation profiler prod'da YOK mu?
+   - Sampling < 30 sn YOK mu?
+   - PII profile leak koruması (S3 IAM + encryption)?
+   - Farklı load altında profile karşılaştırma YOK mu?
+   - Ölçmeden optimize etme YOK mu?
+
+9. Dokümantasyon:
+   - 1 case study walkthrough (slow transfer → fixed)?
+   - Runbook: prod'da JFR nasıl dump edilir?
+
+Her madde için PASS / FAIL / EKSIK işaretle, kanıt göster, kod yazma.
+```
+
+</details>
