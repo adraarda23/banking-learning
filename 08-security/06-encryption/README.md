@@ -1,12 +1,20 @@
 # Topic 8.6 — Encryption: At Rest, In Transit, Envelope, KMS
 
+```admonish info title="Bu bölümde"
+- Banking verisini nasıl sınıflandıracağın: TC No, PAN, CVV, şifre — hangisi encrypt, hangisi hash, hangisi tokenize
+- AES-GCM (AEAD) neden banking standardı, IV reuse'un neden ölümcül olduğu
+- Envelope encryption: DEK + KEK katmanı, KMS/Vault entegrasyonu, crypto-shredding
+- Column-level encryption (JPA AttributeConverter) ve şifreli kolonda arama sorunu (blind index)
+- Tokenization ile PCI scope azaltma, TLS/mTLS, ve 10 klasik encryption anti-pattern'i
+```
+
 ## Hedef
 
 Banking encryption pratiğini derinlemesine öğrenmek: column-level encryption (KVKK + PCI-DSS), envelope encryption (DEK + KEK), KMS integration (AWS KMS, HashiCorp Vault), tokenization, format-preserving encryption, TLS/mTLS, key rotation. Java/JCE/Bouncy Castle implementation.
 
 ## Süre
 
-Okuma: 2.5 saat • Mini task: 3 saat • Test: 1 saat • Toplam: ~6.5 saat
+Okuma: 2-2.5 saat • Kendini Sına: 45 dk • Pratik (opsiyonel): 3-4 saat • Toplam: ~2.5 saat (+ pratik)
 
 ## Önbilgi
 
@@ -20,7 +28,7 @@ Okuma: 2.5 saat • Mini task: 3 saat • Test: 1 saat • Toplam: ~6.5 saat
 
 ### 1. Encryption — neden banking için kritik
 
-Banking verisi sınıflandırması:
+Bir müşterinin TC kimlik numarası veritabanında düz metin mi duracak? Duruyorsa sızan tek bir backup dosyası ya da meraklı bir DBA doğrudan KVKK ihlali demektir. Doğru soru "her şeyi şifreleyeyim mi" değil, **hangi verinin nasıl korunacağı** — bu da veri sınıflandırmasıyla başlar.
 
 | Veri | Risk | Encryption gereği |
 |---|---|---|
@@ -33,6 +41,8 @@ Banking verisi sınıflandırması:
 | Transaction amount | Internal | TLS in transit |
 | Password | OWASP | BCrypt/Argon2 hash (not encrypt) |
 | Session token | OWASP | TLS only; opaque |
+
+Dikkat: şifre asla encrypt edilmez, **hash**'lenir — encrypt reversible'dır, hash değil. Regülatörün beklentileri de bu sınıflandırmanın üstüne oturur:
 
 **KVKK + BDDK requirements:**
 - Sensitive PII at rest **encrypted**
@@ -50,31 +60,19 @@ Banking verisi sınıflandırması:
 
 ### 2. Symmetric vs asymmetric
 
-**Symmetric (AES):**
-- Aynı key encrypt + decrypt
-- Hızlı (1-10 GB/s)
-- Banking için **column-level encryption**, **file encryption**
+Doğru algoritma seçimi "hangisi daha güvenli" değil, "işi nerede yapıyorsun" sorusuyla belirlenir; ikisinin hız/kullanım profili tamamen farklıdır.
 
-**Asymmetric (RSA, ECC):**
-- Public key encrypt → private key decrypt
-- Yavaş (~1 MB/s)
-- Banking için **TLS handshake**, **JWT signing**, **digital signature**, **key exchange**
+**Symmetric (AES):** Aynı key hem encrypt hem decrypt eder, çok hızlıdır (1-10 GB/s). Banking'de **column-level encryption** ve file encryption için kullanılır.
 
-**Hybrid (envelope):**
-- Symmetric ile data encrypt
-- Asymmetric ile symmetric key encrypt
-- En yaygın production pattern
+**Asymmetric (RSA, ECC):** Public key ile encrypt, private key ile decrypt; yavaştır (~1 MB/s). Banking'de **TLS handshake**, JWT signing, digital signature ve key exchange için kullanılır.
+
+**Hybrid (envelope):** Data'yı symmetric ile, symmetric key'i asymmetric ile şifreler. En yaygın production pattern'idir ve §5'in konusudur.
 
 ### 3. AES — banking standard
 
-**Block cipher** — 128 bit block.
+**AES** bir block cipher'dır (128 bit block) ve banking'in fiili standardıdır. Key boyutu üç seçenek sunar: AES-128 (legacy), AES-192, ve **AES-256** — banking'de önerilen budur.
 
-**Key size:**
-- AES-128 (legacy)
-- AES-192
-- AES-256 (banking standard) ← önerilir
-
-**Modes:**
+Asıl kritik karar mode seçimidir; yanlış mode, doğru key ile bile veriyi ele verir:
 
 | Mode | Banking |
 |---|---|
@@ -85,9 +83,48 @@ Banking verisi sınıflandırması:
 | **CCM** | ✓ AEAD alternative. |
 | **XTS** | Disk encryption (LUKS, FileVault). |
 
-**AES-GCM** banking için pick. AEAD = encryption + integrity (no separate HMAC needed).
+<mark>Banking'de encryption modu her zaman AEAD olmalı: GCM şifreleme ve bütünlüğü tek adımda verir, ayrı bir HMAC gerekmez.</mark>
 
-### 4. AES-GCM example (Java JCE)
+### 4. AES-GCM örneği (Java JCE)
+
+AES-GCM'i doğru kurmanın iki değişmez kuralı var: taze IV ve tag doğrulaması. Önce sabitler — 96-bit IV ve 128-bit tag GCM standardıdır:
+
+```java
+private static final int GCM_IV_LENGTH = 12;        // 96 bits — GCM standard
+private static final int GCM_TAG_LENGTH = 128;      // bits
+private static final SecureRandom RANDOM = new SecureRandom();
+```
+
+Encrypt tarafında her çağrıda `SecureRandom` ile taze IV üretilir; AAD (additional authenticated data) tenant/purpose gibi metadata'yı şifrelemeden bütünlük altına alır:
+
+```java
+byte[] iv = new byte[GCM_IV_LENGTH];
+RANDOM.nextBytes(iv);                            // her encrypt'te taze IV
+
+Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+SecretKeySpec keySpec = new SecretKeySpec(key, "AES");
+GCMParameterSpec gcmSpec = new GCMParameterSpec(GCM_TAG_LENGTH, iv);
+cipher.init(Cipher.ENCRYPT_MODE, keySpec, gcmSpec);
+
+if (aad != null) cipher.updateAAD(aad);          // authenticated but not encrypted
+byte[] ciphertext = cipher.doFinal(plaintext);
+```
+
+Decrypt tarafında `AEADBadTagException` yakalanır: bu istisna ya ciphertext'in kurcalandığını ya da yanlış key'i işaret eder — ikisi de reddedilmelidir:
+
+```java
+cipher.init(Cipher.DECRYPT_MODE, keySpec, gcmSpec);
+if (aad != null) cipher.updateAAD(aad);
+try {
+    return cipher.doFinal(data.ciphertext());
+} catch (AEADBadTagException e) {
+    // Integrity failure — tampering OR wrong key
+    throw new IntegrityException("GCM authentication tag mismatch", e);
+}
+```
+
+<details>
+<summary>Tam kod: AesGcmEncryption (~50 satır)</summary>
 
 ```java
 public class AesGcmEncryption {
@@ -142,50 +179,80 @@ public class AesGcmEncryption {
 public record EncryptedData(byte[] iv, byte[] ciphertext) {}
 ```
 
-**CRITICAL: IV reuse**
+</details>
 
-AES-GCM aynı key + aynı IV = **catastrophic failure**. Saldırgan ciphertext'leri XOR'layabilir.
+```admonish warning title="IV reuse — GCM'in ölümcül hatası"
+AES-GCM'de aynı key ile aynı IV asla iki kez kullanılmaz. Aynı olursa saldırgan iki ciphertext'i XOR'layarak keystream'i geri çıkarır ve authentication da çöker — bu catastrophic failure'dır. Her encrypt için `SecureRandom` ile taze 12-byte IV üret; IV gizli değildir, ciphertext ile birlikte saklanır ama mutlaka unique olmalıdır.
+```
 
 ```java
-// ❌ WRONG
-byte[] iv = "fixed_iv_12_".getBytes();   // Sabit IV
+// ❌ WRONG — sabit IV
+byte[] iv = "fixed_iv_12_".getBytes();
 
-// ✓ CORRECT
+// ✓ CORRECT — her encrypt'te taze IV
 byte[] iv = new byte[12];
 new SecureRandom().nextBytes(iv);
 ```
 
-Banking pratiği: Her encryption fresh IV. IV ciphertext ile birlikte stored (gizli değil, ama unique).
-
 ### 5. Envelope encryption — KMS pattern
 
-**Problem:** Bir master key tüm veriyi şifreliyor →
-- Key leak → tüm data açık
-- Key rotation → tüm veri yeniden encrypt (massive)
-- Application key yönetimi karmaşık
+Tek bir master key ile tüm veriyi şifrelemek üç problemi birden doğurur: key sızarsa tüm data açılır, key rotation tüm veriyi yeniden şifreleme (massive re-encrypt) demektir ve application key yönetimi karmaşıklaşır. **Envelope encryption** bu düğümü iki katmanlı key ile çözer.
 
-**Çözüm — Envelope:**
+**Data Encryption Key (DEK):** Random AES-256, her kayıt için ayrı üretilir. **Key Encryption Key (KEK):** Master key, KMS'de yaşar, nadiren rotate olur. Akış şöyle işler:
 
-```
-Data Encryption Key (DEK):  Random AES-256, per-record
-Key Encryption Key (KEK):   Master key, KMS'de, rarely rotates
-
-Encrypt flow:
-  1. Generate fresh DEK (random AES-256)
-  2. Encrypt data with DEK
-  3. Encrypt DEK with KEK (KMS)
-  4. Store: encrypted_data + encrypted_DEK
-
-Decrypt flow:
-  1. KMS decrypt(encrypted_DEK) → plain DEK
-  2. Decrypt data with DEK
-  3. Discard DEK (in-memory only)
+```mermaid
+flowchart LR
+    PT["Plaintext PII"] --> ENC["AES-GCM encrypt"]
+    DEK["Taze DEK AES-256"] --> ENC
+    ENC --> CT["Ciphertext"]
+    DEK --> WRAP["KMS ile DEK sifrele"]
+    KEK["KEK KMS icinde"] --> WRAP
+    WRAP --> EDEK["Encrypted DEK"]
+    CT --> DB["DB kaydi"]
+    EDEK --> DB
 ```
 
-**Avantajlar:**
-- Performance: KMS sadece DEK için çağrılır
-- Rotation: KEK rotate → re-encrypt sadece DEK'leri (kısa)
-- Crypto-shredding: KEK destroy = tüm data destroy
+Decrypt ters yönde: KMS `encrypted_DEK`'i çözer, DEK ile data açılır, DEK bellekten silinir. Bu tasarımın üç avantajı var — KMS sadece küçük DEK için çağrıldığından **performance** iyi, KEK rotate edilince yalnız kısa DEK'ler yeniden şifrelendiğinden **rotation** ucuz, KEK yok edilince tüm data okunamaz hale geldiğinden **crypto-shredding** bedavaya gelir.
+
+<mark>KEK'i şifrelediği DEK'lerle asla aynı yerde tutma: KEK KMS ya da Vault'ta yaşar, veriden fiziksel olarak ayrı durur.</mark>
+
+Encrypt method'unda sıra: taze DEK üret, veriyi DEK ile şifrele, DEK'i KEK ile (KMS) şifrele. `encryptionContext` AAD olarak tenant/purpose'u bağlar:
+
+```java
+// 1. Taze DEK üret
+byte[] dek = new byte[32];   // 256-bit
+random.nextBytes(dek);
+
+// 2. Veriyi DEK ile şifrele (AES-GCM)
+EncryptedData encrypted = AesGcmEncryption.encrypt(plaintext, dek, aad.getBytes(UTF_8));
+
+// 3. DEK'i KEK ile şifrele (KMS)
+EncryptResponse kmsResp = kmsClient.encrypt(EncryptRequest.builder()
+    .keyId(kekId)
+    .plaintext(SdkBytes.fromByteArray(dek))
+    .encryptionContext(Map.of("purpose", "banking-pii"))
+    .build());
+byte[] encryptedDek = kmsResp.ciphertextBlob().asByteArray();
+```
+
+Kritik detay `finally` bloğunda: DEK yalnızca in-memory yaşamalı ve iş bitince `Arrays.fill(dek, (byte) 0)` ile sıfırlanmalı — bellekte kalan plain DEK bir heap dump'ta sızabilir. Decrypt tarafı simetriktir:
+
+```java
+// 1. KMS ile DEK'i çöz
+DecryptResponse kmsResp = kmsClient.decrypt(DecryptRequest.builder()
+    .ciphertextBlob(SdkBytes.fromByteArray(record.encryptedDek()))
+    .keyId(record.kekId())
+    .encryptionContext(Map.of("purpose", "banking-pii"))
+    .build());
+byte[] dek = kmsResp.plaintext().asByteArray();
+
+// 2. Veriyi DEK ile çöz (finally'de dek sıfırlanır)
+EncryptedData encrypted = new EncryptedData(record.iv(), record.ciphertext());
+return AesGcmEncryption.decrypt(encrypted, dek, aad.getBytes(UTF_8));
+```
+
+<details>
+<summary>Tam kod: EnvelopeEncryptionService (~65 satır)</summary>
 
 ```java
 @Service
@@ -255,9 +322,9 @@ public record EncryptedRecord(
     String kekId) {}
 ```
 
-**Performance optimization — DEK caching:**
+</details>
 
-Aynı record'da multiple op? KMS round-trip için cache:
+Aynı record'da birden çok işlem varsa her seferinde KMS'e gitmek pahalıdır; DEK'i kısa süre cache'leyebilirsin:
 
 ```java
 @Service
@@ -279,9 +346,13 @@ public class DekCachingService {
 }
 ```
 
-**Trade-off:** Cache hit → fast. Cache miss → KMS call. Banking için TTL kısa (5-15 dk).
+```admonish tip title="DEK cache TTL'i kısa tut"
+Cache hit hızlıdır, cache miss KMS call'a düşer — ama plain DEK'i bellekte tutmak saldırı yüzeyini büyütür. Banking'de TTL kısa olmalı (5-15 dk): rotation ve crypto-shred etkisinin makul sürede yansıması, plain DEK'in pencerede kalmaması için.
+```
 
 ### 6. AWS KMS integration
+
+KMS'i Spring'e bağlamak bir `KmsClient` bean'i ve KEK ARN'inden ibarettir; region ve credentials provider explicit verilir:
 
 ```java
 @Configuration
@@ -302,7 +373,7 @@ public class KmsConfig {
 }
 ```
 
-**Generate Data Key (KMS native):**
+KMS'in `generateDataKey` çağrısı §5'teki manuel DEK üretimini tek adıma indirir: aynı response'ta hem plain DEK hem encrypted DEK döner. Plain DEK'i in-app encrypt için kullanır, encrypted DEK'i store edersin:
 
 ```java
 GenerateDataKeyResponse resp = kmsClient.generateDataKey(GenerateDataKeyRequest.builder()
@@ -315,9 +386,9 @@ byte[] plaintextDek = resp.plaintext().asByteArray();
 byte[] encryptedDek = resp.ciphertextBlob().asByteArray();
 ```
 
-Tek call: plain DEK + encrypted DEK döner. Sonra plain DEK'i in-app encrypt için, encrypted DEK'i store et.
-
 ### 7. HashiCorp Vault (alternatif KMS)
+
+AWS KMS cloud-only'dir; Türk bankaları on-prem zorunluluğu nedeniyle sıklıkla Vault'un transit engine'ini kullanır. Transit, "encryption as a service" sunar — key hiçbir zaman Vault'tan çıkmaz:
 
 ```hcl
 # Transit secret engine — encryption as service
@@ -327,6 +398,36 @@ vault write -f transit/keys/banking-pii \
   exportable=false \
   auto_rotate_period=8760h    # 1 year
 ```
+
+Java tarafında `VaultTemplate` ile encrypt: plaintext ve context base64'lenir, dönen ciphertext `vault:v1:...` formatındadır ve key versiyonunu içinde taşır:
+
+```java
+public String encrypt(String plaintext) {
+    Map<String, String> body = Map.of(
+        "plaintext", Base64.getEncoder().encodeToString(plaintext.getBytes(UTF_8)),
+        "context", Base64.getEncoder().encodeToString("banking-pii".getBytes(UTF_8))
+    );
+    VaultResponse response = vaultTemplate.write("transit/encrypt/banking-pii", body);
+    return (String) response.getData().get("ciphertext");   // "vault:v1:base64ciphertext..."
+}
+```
+
+Decrypt simetriktir; ciphertext'teki version bilgisi sayesinde eski key ile şifrelenmiş veri de rotation sonrası çözülebilir:
+
+```java
+public String decrypt(String ciphertext) {
+    Map<String, String> body = Map.of(
+        "ciphertext", ciphertext,
+        "context", Base64.getEncoder().encodeToString("banking-pii".getBytes(UTF_8))
+    );
+    VaultResponse response = vaultTemplate.write("transit/decrypt/banking-pii", body);
+    String base64Plain = (String) response.getData().get("plaintext");
+    return new String(Base64.getDecoder().decode(base64Plain), UTF_8);
+}
+```
+
+<details>
+<summary>Tam kod: VaultEncryptionService (~28 satır)</summary>
 
 ```java
 @Service
@@ -358,17 +459,69 @@ public class VaultEncryptionService {
 }
 ```
 
-Vault encryption-as-a-service:
-- Key Vault'tan çıkmaz
-- Auto-rotation
-- Audit log built-in
-- HA cluster
+</details>
 
-Banking trade-off: Vault on-prem mümkün, AWS KMS cloud only. Türk bankası **on-prem** sebebi ile Vault yaygın.
+Vault'un avantajları: key vault'tan çıkmaz, auto-rotation built-in, audit log dahili, HA cluster mümkün. Trade-off nettir — AWS KMS cloud only, Vault on-prem çalışabildiği için Türk bankasında **Vault** yaygındır.
 
 ### 8. Column-level encryption — JPA AttributeConverter
 
-PII field'lara otomatik encrypt:
+Encryption'ı her service method'unda elle yapmak sürdürülemez; asıl istediğin, PII field'larının uygulama katmanında **transparent** şekilde şifrelenmesi. JPA'nın `AttributeConverter`'ı tam bunu verir: yazarken şifreler, okurken çözer, entity kodu hiçbir şeyin farkında olmaz.
+
+```mermaid
+flowchart LR
+    subgraph Yazma
+        A["Entity save"] --> B["convertToDatabaseColumn"]
+        B --> C["Envelope encrypt"]
+        C --> D["Base64 ciphertext DB kolonu"]
+    end
+    subgraph Okuma
+        E["DB kolonu okundu"] --> F["convertToEntityAttribute"]
+        F --> G["Envelope decrypt"]
+        G --> H["Plaintext entity alani"]
+    end
+```
+
+Converter iki yön tanımlar: `convertToDatabaseColumn` envelope encrypt edip base64'ler, `convertToEntityAttribute` tersini yapar. Null güvenli olması şarttır:
+
+```java
+@Override
+public String convertToDatabaseColumn(String plaintext) {
+    if (plaintext == null) return null;
+    EncryptedRecord record = encryptionService.encrypt(plaintext.getBytes(UTF_8), tenant);
+    return Base64.getEncoder().encodeToString(serialize(record));
+}
+
+@Override
+public String convertToEntityAttribute(String dbValue) {
+    if (dbValue == null) return null;
+    EncryptedRecord record = deserialize(Base64.getDecoder().decode(dbValue));
+    return new String(encryptionService.decrypt(record, tenant), UTF_8);
+}
+```
+
+Entity tarafında sadece `@Convert` annotation'ı yeter; `tcKimlik`, `email`, `phone` şifreli, `name` düz kalır:
+
+```java
+@Entity
+public class Customer {
+    @Id
+    private UUID id;
+    
+    private String name;   // Plain
+    
+    @Convert(converter = EncryptedStringConverter.class)
+    @Column(name = "tc_kimlik_encrypted")
+    private String tcKimlik;
+    
+    @Convert(converter = EncryptedStringConverter.class)
+    @Column(name = "email_encrypted")
+    private String email;
+    // ...
+}
+```
+
+<details>
+<summary>Tam kod: EncryptedStringConverter + Customer (~53 satır)</summary>
 
 ```java
 @Converter
@@ -426,21 +579,22 @@ public class Customer {
 }
 ```
 
-DB row:
+</details>
+
+DB'de satır artık okunamaz — DBA `tc_kimlik` göremez, encryption application'da transparenttir:
+
 ```
 id          | name        | tc_kimlik_encrypted              | email_encrypted
 abc-123     | Ahmet       | base64(iv+ciphertext+enc_dek)    | base64(...)
 ```
 
-DBA `tc_kimlik` görmesin — encryption transparent application'da.
+Ama bir bedeli var: şifreli kolonda arama yapamazsın. `WHERE tc_kimlik = '12345678901'` çalışmaz, çünkü DB'deki değer her kayıtta farklı ciphertext'tir (GCM taze IV).
 
-**Searchable encryption challenge:**
-
-```sql
-SELECT * FROM customers WHERE tc_kimlik = '12345678901';
+```admonish warning title="Şifreli kolonda arama tuzağı"
+İki çözüm var, ikisinin de takası var. Deterministic encryption (aynı plaintext → aynı ciphertext) doğrudan aramayı mümkün kılar ama pattern leak riski taşır — aynı TC No'yu paylaşan kayıtlar görünür olur. Daha güvenlisi blind index: plaintext'in HMAC-SHA256'sını ayrı bir kolonda tutup lookup'ı onun üzerinden yapmak. Blind index arama sağlar ama sadece tam eşleşme (equality) destekler, LIKE/range sorgusu yapamazsın.
 ```
 
-DB'de encrypted column. Plain text aramaz! Çözüm: **deterministic encryption** (aynı plaintext → aynı ciphertext, but pattern leak risk) veya **blind index** (HMAC of plaintext, lookup).
+Blind index pratikte HMAC'i `@PrePersist`/`@PreUpdate` ile hesaplayıp searchable bir kolonda saklar:
 
 ```java
 @Entity
@@ -461,7 +615,8 @@ public class Customer {
 }
 ```
 
-Query:
+Sorgu artık plaintext'i değil, hash'i arar:
+
 ```java
 public Optional<Customer> findByTcKimlik(String tcKimlik) {
     String hash = hmac(tcKimlik);
@@ -471,18 +626,22 @@ public Optional<Customer> findByTcKimlik(String tcKimlik) {
 
 ### 9. Tokenization — PCI-DSS
 
-PAN (kart numarası) banking için **stored DEĞİL**. Yerine **token**.
+PAN (kart numarası) banking sistemlerinin en zehirli verisidir: PAN'e dokunan her servis PCI-DSS denetim kapsamına girer. Bu yüzden PAN **stored DEĞİL** — yerine geri döndürülemez bir **token** kullanılır, gerçek PAN sıkı korunan ayrı bir vault'ta yaşar.
 
+```mermaid
+flowchart LR
+    APP["Uygulama servisi"] -->|"PAN gonder"| TOK["Tokenization servisi"]
+    TOK -->|"token don"| APP
+    APP -.->|"sadece token saklar"| STORE["Uygulama DB"]
+    subgraph PCI Scope
+        TOK --> VAULT["Token vault"]
+        VAULT --> PAN["Gercek PAN"]
+    end
 ```
-PAN: 4532-1488-0343-6467
-↓ tokenize
-Token: tok_5f9a2b8c3d1e4f7g
 
-Token → PAN mapping vault'ta (vault = ayrı, sıkı korunmuş).
-PAN burst point sadece vault'a access olan service.
-```
+<mark>PAN'i encrypt etmek yerine tokenize et: token vault dışındaki her sistem PCI scope'un dışına çıkar.</mark>
 
-**Tokenization vs encryption:**
+Tokenization ile encryption'ı karıştırma; ikisi farklı problemleri çözer:
 
 | | Encryption | Tokenization |
 |---|---|---|
@@ -492,7 +651,7 @@ PAN burst point sadece vault'a access olan service.
 | Scope | Any data | Mostly PAN |
 | Compliance | PCI scope still | Reduces PCI scope |
 
-Banking: PCI scope **azaltmak** için tokenization. App PAN görmez, sadece token.
+Servis iki operasyon sunar: `tokenize` PAN'i alıp token döner, `detokenize` yalnız yetkili role için ters çevirir. Uygulama katmanı PAN'i hiç görmez, sadece token taşır:
 
 ```java
 @Service
@@ -514,28 +673,27 @@ public class CardTokenizationService {
     }
     
     private String generateToken() {
-        // tok_<16 random chars>
-        return "tok_" + RandomStringUtils.randomAlphanumeric(16);
+        return "tok_" + RandomStringUtils.randomAlphanumeric(16);   // tok_<16 random>
     }
 }
 ```
 
-Banking pratiği: Tokenization service **ayrı microservice**, **ayrı network zone**, **ayrı KMS key**.
+Banking pratiği: tokenization service **ayrı microservice**, **ayrı network zone** ve **ayrı KMS key** ile izole edilir — böylece PAN yüzeyi tek bir sıkı korunan noktaya daralır.
 
 ### 10. Format-Preserving Encryption (FPE)
+
+Bazı legacy card processor sistemleri girdi olarak 16 haneli PAN bekler; şifrelense bile çıktının 16 hane kalması gerekir. **FPE** tam bunu yapar — format korunur, sadece değer değişir:
 
 ```
 PAN: 4532-1488-0343-6467  →  FPE encrypt  →  9876-5432-1098-7654
    (16 digits)                              (still 16 digits)
 ```
 
-Card processor sistemler 16 digit PAN bekler — encrypt etse output 16 digit kalmalı. **FFX, FF1, FF3-1** modları (NIST 800-38G).
-
-Banking nadir kullanır (legacy uyumluluk), tokenization daha yaygın.
+NIST 800-38G'nin **FF1** ve **FF3-1** modları standarttır. Banking'de nadir kullanılır (çoğunlukla legacy uyumluluk için); modern tasarımda tokenization daha yaygındır.
 
 ### 11. TLS — in transit
 
-Banking için **TLS 1.2 minimum**, **TLS 1.3 preferred**.
+At-rest encryption veriyi diskte korur; in-transit encryption ise ağda korur. Banking için baseline **TLS 1.2 minimum**, **TLS 1.3 preferred**'dır:
 
 ```yaml
 # Spring Boot application.yml
@@ -556,7 +714,8 @@ server:
       - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
 ```
 
-**Banking TLS requirements:**
+Banking'de config yeterli değil; TLS sertlik listesi de tutturulmalıdır:
+
 - HSTS header (`Strict-Transport-Security`)
 - TLS 1.0 / 1.1 disabled (deprecated)
 - Weak ciphers disabled (RC4, 3DES, CBC mode)
@@ -567,6 +726,22 @@ server:
 
 ### 12. mTLS — service-to-service
 
+Normal TLS'te sadece client, server'ı doğrular. Servisler arası trafikte ise "karşı taraf gerçekten yetkili servis mi" sorusu kritiktir — **mTLS** iki tarafın da sertifika sunmasını zorunlu kılar:
+
+```mermaid
+sequenceDiagram
+    participant C as Client Servis
+    participant S as Server Servis
+    C->>S: ClientHello
+    S->>C: ServerHello ve server sertifikasi
+    S->>C: CertificateRequest
+    C->>S: Client sertifikasi
+    Note over C,S: Iki taraf da sertifikayi dogrular
+    C->>S: Sifreli kanal kuruldu
+```
+
+Server tarafında `client-auth: need` ile client cert zorunlu kılınır:
+
 ```yaml
 server:
   ssl:
@@ -575,7 +750,8 @@ server:
     trust-store-password: ${TRUSTSTORE_PASSWORD}
 ```
 
-Client side:
+Client tarafı kendi key material'ını ve trust store'unu yükler:
+
 ```java
 SSLContext sslContext = SSLContextBuilder.create()
     .loadKeyMaterial(clientKeyStore, keyPassword)
@@ -588,22 +764,15 @@ WebClient webClient = WebClient.builder()
     .build();
 ```
 
-Banking pratiği: **Service mesh (Istio, Linkerd)** otomatik mTLS. Cert rotation otomatik.
+Bu boilerplate'i elle yönetmek zahmetlidir; banking pratiğinde **service mesh (Istio, Linkerd)** mTLS'i ve cert rotation'ı otomatik yapar.
 
 ### 13. Key rotation
 
-**Why rotate:**
-- Crypto best practice (key compromise window azalt)
-- Regulatory requirement (yıllık min)
-- Personnel changes
+Bir key ne kadar uzun kullanılırsa, sızması durumunda açtığı pencere o kadar büyür. Key rotation bu pencereyi daraltmak, regülatör gereğini (yıllık min) karşılamak ve personel değişimlerini absorbe etmek için yapılır.
 
-**Rotation strategy:**
+<mark>Banking'de key rotation opsiyonel değildir: en az yıllık, otomatik schedule ile zorunludur.</mark>
 
-1. **Generate new key** (v2)
-2. **Use new key for new data**
-3. **Lazy re-encrypt** old data (background batch)
-4. **Old key kept** for decryption only
-5. **Audit complete** → destroy old key
+Rotation stratejisi kesintisiz olmalı: yeni key üretilir, yeni data yeni key'le şifrelenir, eski data arka planda lazy re-encrypt edilir, eski key yalnız decryption için tutulur ve audit tamamlanınca yok edilir:
 
 ```java
 @Service
@@ -622,15 +791,13 @@ public class KeyRotationService {
 }
 ```
 
-KMS bunu da abstract eder — KMS internal'da key version yönetir.
+Envelope pattern'inde re-encrypt sadece kısa DEK'lere dokunur, tüm veriye değil. KMS ve Vault bunu daha da soyutlar — key version'ı kendi içlerinde yönetirler.
 
 ### 14. Crypto-shredding
 
-GDPR right-to-be-forgotten, KVKK silinme hakkı:
+KVKK silinme hakkı (GDPR right-to-be-forgotten) naif yolla imkansıza yakındır: bir kullanıcının tüm verisini backup'lardan, log'lardan ve replica'lardan gerçekten silemezsin. **Crypto-shredding** problemi tersine çevirir — veriyi silmek yerine onu okunamaz yaparsın.
 
-Naive: User'ın tüm data'sını DB'den sil → backup'lar, log'lar, replica'lar?
-
-**Crypto-shredding:** User'a özel encryption key. **Key destroy = data unreadable.**
+Her kullanıcıya özel bir DEK kullanırsın; kullanıcı "beni sil" dediğinde DEK'i yok edersin. Backup'lar hâlâ orada durur ama artık decrypt edilemez:
 
 ```
 User A's data encrypted with DEK_A
@@ -639,69 +806,53 @@ User A "delete me" → destroy DEK_A
   Backup'lar hala var ama decrypt edilemez
 ```
 
-KVKK için powerful pattern.
+```admonish tip title="Crypto-shredding + envelope birlikte çalışır"
+Envelope encryption zaten per-record DEK üretiyorsa crypto-shredding neredeyse bedavaya gelir: KVKK silinme talebinde ilgili DEK'i (veya KEK'i) imha etmek, dağınık tüm kopyaları tek hamlede okunamaz kılar. Bu yüzden KVKK/GDPR kapsamındaki sistemlerde envelope + per-user key güçlü bir standart pattern'dir.
+```
 
 ### 15. Banking — encryption anti-pattern'leri
 
-**Anti-pattern 1: ECB mode**
+Mülakatta "bu kodda ne yanlış" sorusunun cephaneliği burasıdır. On klasik hatayı sırayla gör:
+
+**Anti-pattern 1: ECB mode** — Aynı plaintext aynı ciphertext'i üretir, pattern görünür olur. Her zaman GCM kullan.
 
 ```java
 Cipher.getInstance("AES/ECB/PKCS5Padding")   // ❌
 ```
 
-Same plaintext → same ciphertext. Pattern visible. **GCM kullan.**
+**Anti-pattern 2: IV reuse** — GCM'de same key + same IV catastrophic'tir. Her encrypt'te taze IV.
 
-**Anti-pattern 2: IV reuse**
-
-GCM same key + same IV = catastrophic. Her encrypt fresh IV.
-
-**Anti-pattern 3: Hardcoded key**
+**Anti-pattern 3: Hardcoded key** — Source code'daki key sızmış key demektir. KMS / Vault / env variable kullan.
 
 ```java
 private static final String KEY = "my-secret-key-12";   // ❌
 ```
 
-Source code'da key = leak. KMS / Vault / env variable.
+**Anti-pattern 4: Self-implemented crypto** — "Ben password ile XOR'larım" felakete davettir. Banking'de JCE / Bouncy Castle gibi battle-tested library şart.
 
-**Anti-pattern 4: Self-implemented crypto**
+**Anti-pattern 5: Encryption WITHOUT authentication** — CBC mode integrity vermez, padding oracle attack'a açıktır. AEAD (GCM) kullan.
 
-```java
-// "I'll just XOR with my password"   ❌
-```
-
-Banking için JCE / Bouncy Castle / battle-tested library.
-
-**Anti-pattern 5: Encryption WITHOUT authentication**
-
-CBC mode integrity yok. Padding oracle attack. **AEAD (GCM)** kullan.
-
-**Anti-pattern 6: Weak random**
+**Anti-pattern 6: Weak random** — `Random` predictable'dır; key/IV/token üretiminde `SecureRandom` kullan.
 
 ```java
 Random random = new Random();   // ❌ predictable
 ```
 
-**SecureRandom** kullan.
+**Anti-pattern 7: Key + ciphertext same place** — Tüm yumurtalar aynı sepette: key ve data aynı yerde. KMS ile ayır.
 
-**Anti-pattern 7: Key + ciphertext same place**
-
-Tehlikenin tüm yumurta sepeti = aynı yerde key + data. KMS ayır.
-
-**Anti-pattern 8: Algorithm string typo**
+**Anti-pattern 8: Algorithm string typo** — `"AES"` yazmak sessizce ECB'ye düşer. Her zaman explicit `"AES/GCM/NoPadding"` yaz.
 
 ```java
 Cipher.getInstance("AES")   // → defaults to ECB!
 ```
 
-Always explicit: `"AES/GCM/NoPadding"`.
+**Anti-pattern 9: Key rotation yok** — Banking yıllık rotation minimum ister; schedule'ı otomatikleştir (§13).
 
-**Anti-pattern 9: Key rotation yok**
+**Anti-pattern 10: PAN encryption (tokenization yerine)** — PAN'i encrypt edip key'i aynı sistemde tutmak PCI scope'u hâlâ büyük bırakır. Tokenization ile PCI scope'u izole et (§9).
 
-Banking yıllık rotation min. Schedule otomatik.
-
-**Anti-pattern 10: PAN encryption (tokenization yerine)**
-
-PAN encrypt + key in same system = PCI scope hala büyük. Tokenization ile PCI scope **isolation**.
+```admonish warning title="En sık iki üretim hatası"
+Uygulamada en çok bu ikisi ısırır: `Cipher.getInstance("AES")` yazıp farkında olmadan ECB'ye düşmek, ve IV'yi sabit tutup GCM'i çökertmek. Kod review'da algoritma string'ini ve IV üretimini her zaman kontrol et — ikisi de "çalışıyor gibi görünür" ama veriyi ele verir.
+```
 
 ---
 
@@ -719,51 +870,133 @@ PAN encrypt + key in same system = PCI scope hala büyük. Tokenization ile PCI 
 
 ---
 
-## Mini task'ler
+## Kendini Sına
 
-### Task 8.6.1 — AES-GCM encrypt/decrypt utility (45 dk)
+Aşağıdaki soruları önce **cevaba bakmadan** kendi cümlelerinle yanıtlamayı dene — hepsi TR bank mülakatlarında karşına çıkabilecek tarzda. Takıldığın soru olursa ilgili Kavramlar başlığına dön, sonra tekrar dene.
 
-`AesGcmEncryption.encrypt/decrypt` implement. Fresh IV per call. Test: tampered ciphertext → AEADBadTagException.
+**S1. Envelope encryption nedir, hangi üç problemi çözer? Tek master key ile şifrelemeye göre farkı ne?**
 
-### Task 8.6.2 — Envelope encryption service (60 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-DEK generate (SecureRandom), KEK encrypt simulate (local AES). EncryptedRecord serialize/deserialize.
+Envelope encryption iki katmanlı key kullanır: her kayıt için random bir DEK (Data Encryption Key) veriyi şifreler, DEK'i de KMS'te duran KEK (Key Encryption Key) şifreler. Store edilen şey encrypted_data + encrypted_DEK'tir.
 
-### Task 8.6.3 — AWS KMS integration (or LocalStack) (60 dk)
+Tek master key üç problem doğurur: key sızarsa tüm data açılır, rotation tüm veriyi yeniden şifrelemeyi gerektirir, key yönetimi karmaşıklaşır. Envelope bunları çözer — KMS sadece küçük DEK için çağrıldığından performans iyi, KEK rotate edilince yalnız DEK'ler yeniden şifrelendiğinden rotation ucuz, KEK yok edilince tüm data okunamaz olduğundan crypto-shredding bedavaya gelir.
 
-`kmsClient.generateDataKey` → DEK alma. Real envelope flow. (LocalStack için KMS mock OK.)
+</details>
 
-### Task 8.6.4 — JPA AttributeConverter encrypted columns (60 dk)
+**S2. AES-GCM'de aynı key ile aynı IV'yi iki kez kullanmak neden catastrophic failure'dır?**
 
-`@Convert` ile `tcKimlik`, `email`, `phone` otomatik encrypt. Test: DB'ye gir, raw value base64 ciphertext görmeli.
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 8.6.5 — Blind index (HMAC) searchable encryption (45 dk)
+GCM bir stream cipher gibi çalışır: key + IV'den bir keystream türetir ve plaintext'i onunla XOR'lar. Aynı key + aynı IV aynı keystream'i üretir; iki ciphertext'i XOR'larsan keystream düşer ve iki plaintext'in XOR'u açığa çıkar — oradan plaintext'ler geri çözülebilir. Dahası GCM'in authentication mekanizması da IV tekrarında çöker, yani integrity garantisi de kaybolur.
 
-`tcKimlikHash` field HMAC-SHA256. `findByTcKimlik` method hash üzerinden query.
+Çözüm: her encrypt için `SecureRandom` ile taze 12-byte (96-bit) IV üret. IV gizli olmak zorunda değil, ciphertext ile birlikte saklanır; tek şart benzersiz olmasıdır.
 
-### Task 8.6.6 — Tokenization service (45 dk)
+</details>
 
-CardTokenizationService. `tokenize(pan) → token`, `detokenize(token) → pan`. Role-based access (detokenize sadece payment-processor).
+**S3. Column-level encryption yaptın, `WHERE tc_kimlik = ?` sorgusu çalışmıyor. Neden, ve nasıl aranabilir hale getirirsin?**
 
-### Task 8.6.7 — TLS 1.3 + cipher suite (30 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-Spring Boot HTTPS config. SSLLabs benzeri test (`openssl s_client -connect host:8443 -tls1_3`).
+GCM her encrypt'te taze IV kullandığından aynı TC No her kayıtta farklı ciphertext üretir; DB'deki değer plaintext'e eşit olmadığı gibi kendi içinde de deterministik değildir, bu yüzden equality sorgusu tutmaz.
 
-### Task 8.6.8 — mTLS service-to-service (60 dk)
+İki çözüm var. Deterministic encryption (aynı plaintext → aynı ciphertext) doğrudan aramayı mümkün kılar ama pattern leak riski taşır — aynı değeri paylaşan satırlar görünür olur. Daha güvenlisi blind index: plaintext'in HMAC-SHA256'sını ayrı bir kolonda tutar, sorguyu hash üzerinden yaparsın. Blind index equality lookup verir ama LIKE/range desteklemez; HMAC secret'ı da KMS/Vault'ta korunmalıdır.
 
-İki Spring Boot service. Client cert mandatory. Wrong cert → 403.
+</details>
 
-### Task 8.6.9 — Key rotation manual (45 dk)
+**S4. PAN saklaman gerekiyor. Encryption mı tokenization mı seçersin, ve tokenization PCI scope'u neden azaltır?**
 
-Old KEK ile encrypt edilmiş 100 record. Yeni KEK ile re-encrypt. Audit log.
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 8.6.10 — HashiCorp Vault transit (60 dk)
+PAN için tokenization seçilir. Encryption yaparsan PAN'e ve key'e dokunan her servis PCI-DSS denetim kapsamında kalır; ciphertext hâlâ "cardholder data" sayılır ve key'i tutan sistem de scope içindedir. Tokenization ise gerçek PAN'i sıkı korunan ayrı bir vault'ta tutar, uygulamaya sadece geri döndürülemez bir token verir.
 
-Vault Docker. `transit` engine. `encrypt/decrypt` Spring VaultTemplate.
+Scope azalması buradan gelir: token vault dışındaki tüm servisler artık PAN görmediğinden PCI kapsamının dışına çıkar. PAN yüzeyi tek bir izole noktaya — ayrı microservice, ayrı network zone, ayrı KMS key — daralır. Detokenize işlemi role-based sıkı access control ile (ör. sadece payment-processor) korunur.
+
+</details>
+
+**S5. Key rotation neden zorunlu, ve mevcut şifreli veriyi bozmadan nasıl rotate edersin?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Rotation zorunludur çünkü bir key ne kadar uzun yaşarsa sızması durumunda açtığı pencere o kadar büyür; ayrıca KVKK/PCI regülasyonu yıllık minimum rotation ister ve personel değişimleri de key değişimini gerektirir.
+
+Kesintisiz strateji şöyle: yeni key (v2) üretilir, yeni data v2 ile şifrelenir, eski data arka planda batch ile lazy re-encrypt edilir, eski key yalnız decryption için tutulur, tüm veri taşınıp audit tamamlanınca eski key yok edilir. Envelope pattern bunu ucuzlatır — KEK rotate edilince tüm veri değil, yalnızca kısa DEK'ler yeniden şifrelenir. KMS ve Vault key version'ı kendi içinde yönettiğinden bu akışı büyük ölçüde soyutlar.
+
+</details>
+
+**S6. KVKK silinme hakkını, verinin backup ve replica'larda dağıldığı bir sistemde nasıl garanti edersin?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Naif "tüm satırları sil" yaklaşımı çalışmaz: backup'lar, log'lar ve replica'lardaki kopyaları gerçekten silmek pratikte imkansızdır. Çözüm crypto-shredding: her kullanıcının verisini ona özel bir DEK ile şifreler, silme talebinde o DEK'i (veya kapsayan KEK'i) imha edersin.
+
+Key yok olduğunda backup'lar fiziksel olarak yerinde kalsa bile içeriği artık decrypt edilemez, yani okunamaz — bu KVKK/GDPR açısından silme ile eşdeğer kabul edilir. Envelope encryption zaten per-record DEK ürettiğinden bu pattern neredeyse bedavaya gelir; bu yüzden KVKK kapsamındaki sistemlerde envelope + per-user key standart bir tercihtir.
+
+</details>
+
+**S7. Normal TLS ile mTLS arasındaki fark nedir, ve servisler arası trafikte neden mTLS istersin?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Normal TLS'te yalnız client server'ı doğrular: server sertifika sunar, client onu güvenilir CA'ya karşı kontrol eder. mTLS'te ise iki taraf da sertifika sunar — server client cert ister (`client-auth: need`), client de kendi key material'ını sunar, ikisi de karşısındakini doğrular.
+
+Servisler arası trafikte "karşı taraf gerçekten yetkili servis mi" sorusu kritiktir; ağa sızan bir aktör geçerli bir client cert olmadan bağlanamaz. Bu boilerplate'i elle yönetmek (cert dağıtımı, rotation) zahmetli olduğundan banking pratiğinde service mesh (Istio, Linkerd) mTLS'i ve cert rotation'ı otomatikleştirir.
+
+</details>
 
 ---
 
-## Test yazma rehberi
+## Tamamlama kriterleri
+
+- [ ] "Kendini Sına" bölümündeki tüm soruları cevaba bakmadan açıklayabiliyorum
+- [ ] Banking veri sınıflandırmasında hangi verinin encrypt / hash / tokenize edileceğini söyleyebilirim
+- [ ] AES-GCM'in neden AEAD standardı olduğunu ve IV reuse'un neden catastrophic olduğunu anlatabilirim
+- [ ] Envelope encryption'ı (DEK + KEK) tahtada çizip üç avantajını (performance, rotation, crypto-shred) sayabiliyorum
+- [ ] Column-level encryption'ı AttributeConverter ile kurar, şifreli kolonda arama için blind index'i açıklayabilirim
+- [ ] Tokenization vs encryption farkını ve tokenization'ın PCI scope'u neden azalttığını anlatabiliyorum
+- [ ] TLS ve mTLS farkını, key rotation ve crypto-shredding pattern'lerini açıklayabilirim
+- [ ] 10 encryption anti-pattern'inden en az yedisini örnekle söyleyebilirim
+- [ ] (Opsiyonel) "Pratik yapmak istersen" bölümündeki testleri yazdım ve Claude-verify prompt'uyla doğrulattım
+
+---
+
+## Defter notları
+
+1. "AES-256-GCM AEAD properties (encryption + integrity) banking sebebi: ____."
+2. "IV reuse catastrophic failure GCM: ____."
+3. "Envelope encryption DEK + KEK trade-off (performance, rotation, crypto-shred): ____."
+4. "AWS KMS generateDataKey + encryption context: ____."
+5. "JPA AttributeConverter column-level encryption transparent: ____."
+6. "Blind index (HMAC) deterministic encryption pattern leak trade-off: ____."
+7. "Tokenization vs encryption PCI scope reduction: ____."
+8. "TLS 1.3 + forward secrecy + HSTS banking baseline: ____."
+9. "mTLS service-to-service + service mesh (Istio/Linkerd): ____."
+10. "Crypto-shredding KVKK silinme hakkı pattern: ____."
+
+```admonish success title="Bölüm Özeti"
+- Encryption veri sınıflandırmasıyla başlar: PII column-level encrypt, PAN tokenize, şifre hash — hepsi at-rest korumasının farklı araçları
+- Banking standardı AES-256-GCM'dir çünkü AEAD şifreleme + bütünlüğü tek adımda verir; kural: her encrypt'te `SecureRandom` ile taze IV, asla reuse yok
+- Envelope encryption (per-record DEK + KMS'teki KEK) performansı, ucuz rotation'ı ve crypto-shredding'i tek pattern'de birleştirir — KEK veriden fiziksel olarak ayrı yaşar
+- Column-level encryption JPA AttributeConverter ile transparent'tır; şifreli kolonda arama blind index (HMAC) ister, deterministic encryption pattern leak riski taşır
+- PAN için encryption değil tokenization: token vault dışındaki her sistem PCI scope'un dışına çıkar
+- In transit için TLS 1.2+ (1.3 preferred) ve servisler arası mTLS; key rotation yıllık zorunlu, crypto-shredding KVKK silinme hakkını çözer
+```
+
+---
+
+## Pratik yapmak istersen
+
+Kavramları koda dökmek istersen aşağıdaki iki ek hazır: test yazma rehberi AES-GCM round-trip, tampering/AAD reddi, encrypted column ve blind index davranışları için örnek testler içerir; Claude-verify prompt'u ile yazdığın encryption kodunu banking-grade perspektiften denetletebilirsin.
+
+<details>
+<summary>Test yazma rehberi</summary>
 
 ```java
 @Test
@@ -862,12 +1095,16 @@ void tokenizationRoundTrip() {
 }
 ```
 
----
+> Tamamlama kriteri: AES-GCM round-trip + tampering + wrong-AAD reddi geçiyor, fresh IV her encrypt'te doğrulandı, encrypted column raw sorguda ciphertext dönüyor, blind index lookup ve tokenization round-trip yeşil. En az 8 integration test hedefle.
 
-## Claude-verify prompt
+</details>
+
+<details>
+<summary>Claude-verify prompt</summary>
 
 ```
-Encryption implementation'ımı banking-grade kriterlere göre değerlendir:
+Encryption implementation'ımı banking-grade kriterlere göre değerlendir.
+Eksikleri işaretle, kod yazma:
 
 1. Algoritma:
    - AES-256-GCM (banking standard)?
@@ -929,36 +1166,8 @@ Encryption implementation'ımı banking-grade kriterlere göre değerlendir:
     - IV reuse YOK?
     - PAN encryption yerine tokenization YOK?
     - Weak random YOK?
+
+Her madde için PASS / FAIL / EKSIK işaretle, kanıt göster, kod yazma.
 ```
 
----
-
-## Tamamlama kriterleri
-
-- [ ] AES-GCM utility + tampering test
-- [ ] Envelope encryption service (KMS or local KEK)
-- [ ] AWS KMS or Vault integration
-- [ ] JPA AttributeConverter (encrypted columns)
-- [ ] Blind index searchable encryption
-- [ ] Tokenization service (role-based)
-- [ ] TLS 1.3 + strong cipher config
-- [ ] mTLS service-to-service test
-- [ ] Key rotation batch
-- [ ] Crypto-shredding demo
-- [ ] 8+ integration test
-- [ ] Tampered ciphertext / wrong AAD reject
-
----
-
-## Defter notları (10 madde)
-
-1. "AES-256-GCM AEAD properties (encryption + integrity) banking sebebi: ____."
-2. "IV reuse catastrophic failure GCM: ____."
-3. "Envelope encryption DEK + KEK trade-off (performance, rotation, crypto-shred): ____."
-4. "AWS KMS generateDataKey + encryption context: ____."
-5. "JPA AttributeConverter column-level encryption transparent: ____."
-6. "Blind index (HMAC) deterministic encryption pattern leak trade-off: ____."
-7. "Tokenization vs encryption PCI scope reduction: ____."
-8. "TLS 1.3 + forward secrecy + HSTS banking baseline: ____."
-9. "mTLS service-to-service + service mesh (Istio/Linkerd): ____."
-10. "Crypto-shredding KVKK silinme hakkı pattern: ____."
+</details>

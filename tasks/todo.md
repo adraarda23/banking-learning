@@ -46,7 +46,8 @@
 - [x] Faz 4 (SQL & Oracle): 6 topic + mini proje, 29 diyagram, 44 kutu, 46 soru — commit 9b843ed
 - [x] Faz 5 (Spring Batch): 6 topic + mini proje, 29 diyagram, 40 kutu, 44 soru — commit 88ccbdc
 - [x] Faz 6 (Messaging/Kafka): 7 topic + mini proje, 33 diyagram, 48 kutu, 52 soru — commit 3692daf
-- [ ] Kalan: Faz 7-12 (6 faz)
+- [x] Faz 7 (Microservices): 7 topic + mini proje, 32 diyagram, 47 kutu, 56 soru — commit b66bb92
+- [ ] Kalan: Faz 8-12 (5 faz)
 - Not: mdbook src="." nedeniyle _book/.git kopyalanıyor (bloat, zararsız — build sonrası rm -rf _book/.git ile temizle)
 
 ## Review

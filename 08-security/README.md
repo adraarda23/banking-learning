@@ -1,4 +1,39 @@
+<div class="phase-cover-kicker">Sekizinci Bölüm</div>
+
 # Faz 8 — Security
+
+<div class="phase-cover-meta">
+<div><strong>Süre</strong> 3-4 hafta</div>
+<div><strong>Topic</strong> 7 konu + mini proje</div>
+<div><strong>Çıktı</strong> Regülasyona uygun güvenlik</div>
+<div><strong>Ön koşul</strong> Faz 1-7 tamamlandı</div>
+</div>
+
+```admonish info title="Bu fazda ne öğreneceksin?"
+Banking backend'inin güvenlik katmanını **regülasyona uygun** ve **OWASP defense-in-depth**
+prensipleriyle kuracaksın: Spring Security 6 filter chain, authentication (BCrypt/Argon2, brute-force),
+JWT, OAuth2/OIDC, Keycloak, encryption (at-rest/in-transit, column-level, KMS) ve OWASP Top 10.
+BDDK, KVKK ve PCI-DSS yükümlülükleri her kararın arka planında.
+```
+
+## Fazın haritası
+
+```mermaid
+flowchart TD
+    subgraph Temel["Hafta 1 — Spring Security Temeli"]
+        direction LR
+        A["8.1 Architecture"] --> B["8.2 Authentication"]
+    end
+    subgraph Token["Hafta 2 — Token ve Kimlik"]
+        direction LR
+        C["8.3 JWT"] --> D["8.4 OAuth2 & OIDC"] --> E["8.5 Keycloak"]
+    end
+    subgraph Savunma["Hafta 3-4 — Şifreleme ve Savunma"]
+        direction LR
+        F["8.6 Encryption"] --> G["8.7 OWASP Top 10"]
+    end
+    Temel --> Token --> Savunma --> MP(["Mini Proje: Keycloak + Encryption + Pentest + Faz Testi"])
+```
 
 ## Bu faz neyle ilgili?
 
@@ -164,8 +199,8 @@ Banking security **çok geniş** bir konu. Bu faz seni "junior'ın bilmesi gerek
 
 Faz boyunca bu kaynaklara döneceğiz.
 
-## Başlama
-
-→ Topic 1: [01-spring-security-architecture/](01-spring-security-architecture/index.md)
-
-İyi öğrenmeler. Bu fazda kod yazmak kadar **düşünmek** de önemli — bir güvenlik kararı verirken "saldırgan ne yapabilir?" sorusunu sürekli kendine sor.
+```admonish success title="Başla"
+İlk durak: [Topic 8.1 — Spring Security Architecture](01-spring-security-architecture/index.md).
+Bu fazda kod yazmak kadar **düşünmek** de önemli — bir güvenlik kararı verirken
+"saldırgan ne yapabilir?" sorusunu sürekli kendine sor.
+```

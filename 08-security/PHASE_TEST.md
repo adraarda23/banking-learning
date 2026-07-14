@@ -1,6 +1,10 @@
 # Faz 8 — PHASE TEST
 
-Faz 9'a geçmeden önce kendini sına.
+```admonish question title="Bu test ne işe yarar?"
+Faz 9'a geçmeden önce kendini sına. Bu bir sınav değil, **dürüstlük kontrolü**:
+işaretleyemediğin her madde, hangi topic'e geri döneceğini gösterir.
+Hepsine "evet" diyebiliyorsan hazırsın.
+```
 
 ## Pratik test
 
@@ -158,4 +162,8 @@ Phase 8 = **TR banking regulator + auditor expectation karşılayan baseline**.
 
 Mid+ developer banking güvenliğini bilmeden ilerleyemez. Senior'a giderken **security mindset** zorunlu. TR bank interview'lerinde **OWASP Top 10**, **encryption at rest**, **MFA flow**, **JWT pitfalls** sorulan top konular.
 
-Phase 8 → Phase 9 (Observability) doğal devam: audit log + metrics + tracing **integrated security observability**.
+```admonish success title="Sonraki durak: Faz 9"
+Phase 8 → Phase 9 (Observability) doğal devam: audit log + metrics + tracing bir araya gelip
+**entegre güvenlik gözlemlenebilirliği** oluşturur.
+→ [Faz 9 — Observability & Performance](../09-observability/index.md)
+```
