@@ -1,124 +1,154 @@
 # Topic 6.7 — Saga Pattern
 
+```admonish info title="Bu bölümde"
+- 2PC (Two-Phase Commit) neden modern banking için yasak: blocking, coordinator SPOF, performans, vendor lock-in
+- Saga pattern'in özü: distributed transaction'ı **local transaction** zincirine bölmek + fail'de **compensating action**
+- Orchestration (central coordinator, state machine) vs choreography (event-driven) seçimi ve banking karar matrisi
+- Compensating action tasarımı: idempotent, ters sıra, audit trail, semantic compensation
+- Cross-bank transfer saga'nın ucdan uca implementasyonu: state persistence, Kafka orchestrator, stuck saga recovery, TCC alternatifi
+```
+
 ## Hedef
 
-Distributed transaction problemini Saga pattern ile çözmek. 2PC'nin neden production banking için yetersiz olduğunu anlamak. Orchestration vs choreography seçimi, compensating action design, banking cross-bank transfer örneği, Spring State Machine ile orchestrator implementation.
+Distributed transaction problemini Saga pattern ile çözmek. 2PC'nin neden production banking için yetersiz olduğunu, orchestration vs choreography seçimini, compensating action tasarımını kavramak. Banking cross-bank transfer örneğini (Bank A debit → FX → Bank B credit) hem Spring State Machine hem Kafka orchestrator ile çizebilmek; stuck saga recovery ve async API pattern'ini banking standardıyla oturtmak.
 
 ## Süre
 
-Okuma: 2 saat • Mini task: 2 saat • Test: 1 saat • Toplam: ~5 saat
+Okuma: 2 saat • Kendini Sına: 45 dk • Pratik (opsiyonel): 4-5 saat • Toplam: ~3 saat (+ pratik)
 
 ## Önbilgi
 
-- Topic 6.1-6.6 bitti (Kafka, producer, consumer, Streams, Outbox)
-- Phase 2 (transactions) + Phase 4 (locking) — ACID kavramları
-- Phase 7'de microservice decomposition gelecek — burası temelini atar
+- Topic 6.1-6.6 bitti — Kafka, producer, consumer, Streams, Outbox biliyorsun
+- Phase 2 (transactions) + Phase 4 (locking) — ACID kavramları oturmuş
+- Idempotent consumer pattern (Topic 6.3) — compensation idempotency için temel
+- Phase 7'de microservice decomposition gelecek; burası o temelin distributed-transaction ayağı
 
 ---
 
 ## Kavramlar
 
-### 1. Distributed transaction problemi
+### 1. Distributed transaction problemi — atomicity nereye kayboldu
 
-**Senaryo:** Cross-bank transfer (TR Bank A → German Bank B).
-1. Bank A'da debit (TRY hesap)
-2. FX conversion
-3. Bank B'de credit (EUR hesap)
-4. SWIFT confirmation
-5. Audit log
+Tek DB'de `BEGIN; ... COMMIT` atomiktir; sıkıntı işi birden fazla servise böldüğün an başlar. Somut senaryo: **cross-bank transfer** (TR Bank A → German Bank B).
 
-Tek DB'de transaction: `BEGIN; ... COMMIT` — atomic. Kolay.
+Beş adım var, her biri farklı bir yerde yaşıyor:
 
-**Microservice'lerde:**
-- Bank A → kendi DB
-- FX service → kendi state
-- Bank B → uzak DB (başka kurum)
-- SWIFT → external network
-- Audit → kendi DB
+1. Bank A'da debit (TRY hesap, kendi DB)
+2. FX conversion (TCMB rate, kendi state)
+3. Bank B'de credit (EUR hesap, uzak DB — başka kurum)
+4. SWIFT confirmation (external network)
+5. Audit log (kendi DB)
 
-5 farklı transactional boundary. Atomicity nasıl?
+Tek DB'de bu beş adımı tek transaction'a sarabilirdin. Burada **beş farklı transactional boundary** var; ortak bir `COMMIT` yok. Adım 3 fail ederse adım 1 çoktan commit olmuş, para A'dan çıkmıştır. İşte çözmemiz gereken problem tam olarak bu: **atomicity'yi tek DB olmadan nasıl taklit ederiz?**
 
 ### 2. 2PC (Two-Phase Commit) — neden banking için yasak
 
+İlk akla gelen çözüm 2PC'dir: bir **coordinator** tüm participant'lara önce "hazır mısın?" diye sorar, hepsi evet derse "commit et" der. İki fazlı olduğu için 2PC.
+
 ```
 Phase 1 (Prepare):
-  Coordinator → Participant 1: "hazır mısın?"
-  Coordinator → Participant 2: "hazır mısın?"
-  Coordinator → Participant 3: "hazır mısın?"
-  Coordinator: hepsi "evet" derse → Phase 2'ye geç
+  Coordinator → Participant 1, 2, 3: "hazır mısın?"
+  Hepsi "evet" derse → Phase 2'ye geç
 
 Phase 2 (Commit):
   Coordinator → Hepsi: "COMMIT"
   Veya birinden "hayır" → Hepsi: "ROLLBACK"
 ```
 
-**XA distributed transaction** ile implement edilir.
+Pratikte **XA distributed transaction** ile implement edilir. Kağıt üzerinde atomicity sağlar ama banking için dört ölümcül sorunu vardır:
 
-**Sorunlar (banking için fatal):**
+1. **Blocking:** Phase 1'de tüm participant'lar kaynakları kilitler (DB row lock) ve Phase 2 gelene kadar bekler. Yavaş bir participant tüm sistemi tutar.
+2. **Coordinator SPOF:** Coordinator Phase 1 sonrası çökerse participant'lar *uncertain state*'te asılı kalır — manuel müdahale gerekir.
+3. **Performance + scalability:** Her participant'a network roundtrip; coordinator throughput bottleneck olur. 5 saniyelik transfer 30 saniyeye çıkar.
+4. **Vendor lock-in:** XA destekleyen DB + transaction manager şart; cloud-native değil.
 
-1. **Blocking:** Phase 1'de tüm participant'lar **kaynakları kilitler** (DB row lock). Phase 2 commit gelene kadar **bekler**.
+Sonuç net: <mark>2PC modern banking'de yasaktır, yeni sistemler Saga kullanır</mark>. Sadece eski legacy sistemlerde kalıntı olarak görülür.
 
-2. **Coordinator SPOF:** Coordinator Phase 1 sonrası **çöker**. Participant'lar **uncertain state**'te kalır. Manuel müdahale.
+### 3. Saga pattern — local transaction'lar zinciri
 
-3. **Performance:** Network roundtrip × N participant. Banking transfer'ı 5 saniye değil 30 saniye.
+2PC "hepsini birden kilitle" derken, Saga tersini yapar: hiç global lock tutma, işi **N ayrı local transaction**'a böl. **Saga**, bir distributed transaction'ı sırayla çalışan local transaction'lar dizisidir; bir adım fail ederse öncekiler **compensating action** ile geri alınır.
 
-4. **Vendor lock-in:** XA destekleyen DB + transaction manager şart. Cloud-native değil.
+Üç kural:
 
-5. **Scalability:** Coordinator throughput bottleneck.
-
-**Banking pratiği:** 2PC modern banking'de **YASAK**. Eski legacy sistemlerde var, yenileri Saga.
-
-### 3. Saga pattern — sequence of local transactions
-
-**Prensip:**
 - Distributed transaction'ı **N adıma böl**
-- Her adım **local transaction** (atomic, fast)
-- Bir adım fail → **compensating action** ile öncekileri **geri al**
+- Her adım **local transaction** — atomik ve hızlı, global lock yok
+- Bir adım fail → **compensating action** ile öncekileri ters sırada geri al
 
-**Banking — cross-bank transfer:**
-
-```
-Step 1: Bank A'da debit                         (local tx, ~50ms)
-  ↓ success
-Step 2: FX conversion (TCMB rate uygula)         (~10ms)
-  ↓ success
-Step 3: Bank B'de credit                         (~50ms via SWIFT)
-  ↓ success
-Step 4: Audit log                                (~10ms)
-  ↓ success
-Step 5: Notification                             (~20ms)
-
-= Total ~140ms, no blocking lock
-```
-
-**Failure senaryosu — Step 3 fail:**
+Cross-bank transfer'in happy path'i, her adım kendi local transaction'ı olarak:
 
 ```
-Step 1: Bank A'da debit                         ✓
-Step 2: FX conversion                            ✓
-Step 3: Bank B'de credit                         ✗ FAIL
+Step 1: Bank A'da debit                  (local tx, ~50ms)
+Step 2: FX conversion (TCMB rate)         (~10ms)
+Step 3: Bank B'de credit (SWIFT)          (~50ms)
+Step 4: Audit log                         (~10ms)
+Step 5: Notification                      (~20ms)
+= Total ~140ms, blocking lock yok
+```
+
+Adımlar birbirini tetikler; hiçbir aşamada beş kaynağı aynı anda kilitlemezsin.
+
+```mermaid
+sequenceDiagram
+    participant O as Orchestrator
+    participant A as Bank A
+    participant F as FX Service
+    participant B as Bank B
+    O->>A: debit iste
+    A-->>O: DebitedEvent
+    O->>F: convert iste
+    F-->>O: ConvertedEvent
+    O->>B: credit iste
+    B-->>O: CreditedEvent
+    Note over O: Saga COMPLETED
+```
+
+**Failure senaryosu — Step 3 (Bank B credit) fail:** Step 1 ve 2 çoktan commit oldu, geri sarmak için compensation gerekir.
+
+```
+Step 1: Bank A debit       ✓
+Step 2: FX conversion      ✓
+Step 3: Bank B credit      ✗ FAIL
   ↓ compensate
 Compensate Step 2: FX cancel (no-op or logged)
-Compensate Step 1: Bank A'ya geri credit (reverse debit)
+Compensate Step 1: Bank A'ya reverse credit
 ```
 
-Net effect: Sistem **eski state'e döndü**. Audit trail var (Step 1 + reversal).
+Net etki: sistem eski state'ine döndü. Ama dikkat — bu bir rollback *değil*: audit trail'de hem orijinal debit hem reversal görünür.
+
+```mermaid
+sequenceDiagram
+    participant O as Orchestrator
+    participant A as Bank A
+    participant F as FX Service
+    participant B as Bank B
+    O->>A: debit
+    A-->>O: ok
+    O->>F: convert
+    F-->>O: ok
+    O->>B: credit
+    B-->>O: CreditFailedEvent
+    Note over O: COMPENSATING başlar
+    O->>F: cancel conversion
+    O->>A: reverse debit
+    Note over O: COMPENSATED
+```
 
 ### 4. Orchestration — central coordinator
 
+Saga'yı koordine etmenin iki yolu var; birincisi **orchestration**: merkezi bir orchestrator her adımı sırayla çağırır, cevabı bekler, sonraki adıma karar verir. Akış tek yerde toplanır.
+
 ```
-[Saga Orchestrator] → Bank A: debit
-[Saga Orchestrator] ← debit OK
-[Saga Orchestrator] → FX: convert
-[Saga Orchestrator] ← FX rate
-[Saga Orchestrator] → Bank B: credit
-[Saga Orchestrator] ← Bank B FAIL
-[Saga Orchestrator] → FX: cancel
-[Saga Orchestrator] → Bank A: reverse debit
-[Saga Orchestrator] → Audit: log compensated
+[Orchestrator] → Bank A: debit
+[Orchestrator] ← debit OK
+[Orchestrator] → FX: convert
+[Orchestrator] ← FX rate
+[Orchestrator] → Bank B: credit
+[Orchestrator] ← Bank B FAIL
+[Orchestrator] → FX: cancel
+[Orchestrator] → Bank A: reverse debit
 ```
 
-**State machine** — her adım state, her transition action.
+Orchestrator aslında bir **state machine**'dir — her adım bir state, her transition bir action:
 
 ```
 STARTED → DEBITED → CONVERTED → CREDITED → COMPLETED
@@ -126,19 +156,83 @@ STARTED → DEBITED → CONVERTED → CREDITED → COMPLETED
                   COMPENSATING → COMPENSATED
 ```
 
-#### Avantajlar
+**Avantajlar:** flow tek yerde ve görünür (state machine'i UI'da izlersin, debug kolay); recovery basit (state DB'de, orchestrator crash → restart kaldığı yerden).
 
-- **Visibility:** State machine'i UI'da görür, debug kolay
-- **Recovery:** State DB'de, orchestrator crash → restart kaldığı yerden
-- **Centralized logic:** Saga flow tek yerde
-
-#### Dezavantajlar
-
-- **Coupling:** Orchestrator tüm service'leri bilmek zorunda
-- **SPOF:** Orchestrator down → saga durur (HA replica gerekli)
-- **Stateful:** State persistence gerekli
+**Dezavantajlar:** orchestrator tüm servisleri bilmek zorunda (coupling); orchestrator down → saga durur (HA replica gerekir); state persistence şart (stateful).
 
 ### 5. Spring State Machine ile orchestration
+
+Orchestration'ı elle if-else state kontrolüyle yazmak kırılgandır; Spring State Machine state'leri ve transition'ları deklaratif tanımlatır. Önce state ve event enum'ları:
+
+```java
+public enum TransferState {
+    STARTED, DEBITED, CONVERTED, CREDITED, COMPLETED,
+    COMPENSATING, COMPENSATED, FAILED
+}
+
+public enum TransferEvent {
+    DEBIT_OK, DEBIT_FAILED, CONVERT_OK, CONVERT_FAILED,
+    CREDIT_OK, CREDIT_FAILED, COMPLETE, FAIL, COMPENSATE_OK
+}
+```
+
+State config'de her state'e bir action bağlanır; happy path state'leri normal, `COMPENSATING` ayrı bir action, üç sonuç ise `end` state:
+
+```java
+states.withStates()
+    .initial(TransferState.STARTED)
+    .state(TransferState.DEBITED, debitedAction())
+    .state(TransferState.CONVERTED, convertedAction())
+    .state(TransferState.CREDITED, creditedAction())
+    .state(TransferState.COMPENSATING, compensateAction())
+    .end(TransferState.COMPLETED)
+    .end(TransferState.COMPENSATED)
+    .end(TransferState.FAILED);
+```
+
+Transition'lar happy path'i (`DEBIT_OK`, `CONVERT_OK`, ...) ve compensation yollarını (`CONVERT_FAILED`, `CREDIT_FAILED` → `COMPENSATING`) ayrı ayrı çizer. Örneğin CREDITED'a giden happy path ve compensation tetikleyicileri:
+
+```java
+transitions
+    .withExternal()
+        .source(TransferState.CONVERTED).target(TransferState.CREDITED).event(TransferEvent.CREDIT_OK)
+    .and().withExternal()
+        .source(TransferState.CREDITED).target(TransferState.COMPLETED).event(TransferEvent.COMPLETE)
+    // compensation
+    .and().withExternal()
+        .source(TransferState.CONVERTED).target(TransferState.COMPENSATING).event(TransferEvent.CREDIT_FAILED)
+    .and().withExternal()
+        .source(TransferState.COMPENSATING).target(TransferState.COMPENSATED).event(TransferEvent.COMPENSATE_OK);
+```
+
+İşin kalbi `compensateAction`: hangi state'te fail edildiyse ona göre geri alma adımlarını **ters sırada** tetikler. Bu switch, "son adımdan ilk adıma" mantığını kodlar:
+
+```java
+@Bean
+public Action<TransferState, TransferEvent> compensateAction() {
+    return context -> {
+        TransferContext ctx = context.getExtendedState().get("ctx", TransferContext.class);
+        switch (ctx.getCurrentState()) {
+            case CREDITED:   // en ileri: üçünü de geri al
+                bankBService.reverseCredit(ctx.getBankBTransactionId());
+                fxService.cancelConversion(ctx.getFxConversionId());
+                bankAService.reverseDebit(ctx.getBankATransactionId());
+                break;
+            case CONVERTED:  // FX + debit geri al
+                fxService.cancelConversion(ctx.getFxConversionId());
+                bankAService.reverseDebit(ctx.getBankATransactionId());
+                break;
+            case DEBITED:    // sadece debit geri al
+                bankAService.reverseDebit(ctx.getBankATransactionId());
+                break;
+        }
+        sagaStateRepo.markCompensated(ctx.getSagaId());
+    };
+}
+```
+
+<details>
+<summary>Tam kod: TransferSagaConfig state machine (~90 satır)</summary>
 
 ```java
 public enum TransferState {
@@ -157,7 +251,7 @@ public enum TransferEvent {
 @Configuration
 @EnableStateMachineFactory
 public class TransferSagaConfig extends StateMachineConfigurerAdapter<TransferState, TransferEvent> {
-    
+
     @Override
     public void configure(StateMachineStateConfigurer<TransferState, TransferEvent> states) throws Exception {
         states.withStates()
@@ -170,7 +264,7 @@ public class TransferSagaConfig extends StateMachineConfigurerAdapter<TransferSt
             .end(TransferState.COMPENSATED)
             .end(TransferState.FAILED);
     }
-    
+
     @Override
     public void configure(StateMachineTransitionConfigurer<TransferState, TransferEvent> transitions) throws Exception {
         transitions
@@ -183,7 +277,7 @@ public class TransferSagaConfig extends StateMachineConfigurerAdapter<TransferSt
                 .source(TransferState.CONVERTED).target(TransferState.CREDITED).event(TransferEvent.CREDIT_OK)
             .and().withExternal()
                 .source(TransferState.CREDITED).target(TransferState.COMPLETED).event(TransferEvent.COMPLETE)
-            
+
             // Compensation paths
             .and().withExternal()
                 .source(TransferState.STARTED).target(TransferState.FAILED).event(TransferEvent.DEBIT_FAILED)
@@ -194,7 +288,7 @@ public class TransferSagaConfig extends StateMachineConfigurerAdapter<TransferSt
             .and().withExternal()
                 .source(TransferState.COMPENSATING).target(TransferState.COMPENSATED).event(TransferEvent.COMPENSATE_OK);
     }
-    
+
     @Bean
     public Action<TransferState, TransferEvent> debitedAction() {
         return context -> {
@@ -204,16 +298,16 @@ public class TransferSagaConfig extends StateMachineConfigurerAdapter<TransferSt
             fxService.requestConversionAsync(ctx);
         };
     }
-    
+
     @Bean
     public Action<TransferState, TransferEvent> compensateAction() {
         return context -> {
             TransferContext ctx = context.getExtendedState().get("ctx", TransferContext.class);
-            
+
             // Determine compensation steps based on current state
             switch (ctx.getCurrentState()) {
                 case CREDITED:
-                    // Step 3 fail değil ama subsequent fail. Step 3 başarılı, geri al
+                    // Step 3 başarılı, subsequent fail. Geri al
                     bankBService.reverseCredit(ctx.getBankBTransactionId());
                     fxService.cancelConversion(ctx.getFxConversionId());
                     bankAService.reverseDebit(ctx.getBankATransactionId());
@@ -226,16 +320,31 @@ public class TransferSagaConfig extends StateMachineConfigurerAdapter<TransferSt
                     bankAService.reverseDebit(ctx.getBankATransactionId());
                     break;
             }
-            
+
             sagaStateRepo.markCompensated(ctx.getSagaId());
         };
     }
 }
 ```
 
-### 6. Saga state persistence
+</details>
 
-State machine state DB'de saklanmalı. Orchestrator crash → restart → state'ten kaldığı yerden.
+Bu state machine'i bir görsel olarak düşün — happy path yatay ilerler, herhangi bir fail dallanıp compensation koluna sapar:
+
+```mermaid
+flowchart LR
+    S["STARTED"] --> D["DEBITED"]
+    D --> C["CONVERTED"]
+    C --> CR["CREDITED"]
+    CR --> DONE["COMPLETED"]
+    D -->|"convert fail"| COMP["COMPENSATING"]
+    C -->|"credit fail"| COMP
+    COMP --> COMPD["COMPENSATED"]
+```
+
+### 6. Saga state persistence — neden DB zorunlu
+
+Orchestrator'ın en kritik özelliği: state'i kaybetmemesi. <mark>Saga state her zaman DB'de saklanmalı, asla in-memory değil</mark> — orchestrator crash olursa restart sonrası kaldığı yerden devam etmeli.
 
 ```sql
 CREATE TABLE saga_states (
@@ -247,109 +356,93 @@ CREATE TABLE saga_states (
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
     completed_at TIMESTAMPTZ,
-    
     CONSTRAINT chk_saga_state CHECK (current_state IN (
         'STARTED', 'DEBITED', 'CONVERTED', 'CREDITED', 'COMPLETED',
         'COMPENSATING', 'COMPENSATED', 'FAILED'
     ))
 );
 
-CREATE INDEX idx_saga_pending ON saga_states(current_state, updated_at) 
+CREATE INDEX idx_saga_pending ON saga_states(current_state, updated_at)
     WHERE current_state NOT IN ('COMPLETED', 'COMPENSATED', 'FAILED');
 
-CREATE INDEX idx_saga_stuck ON saga_states(updated_at) 
+CREATE INDEX idx_saga_stuck ON saga_states(updated_at)
     WHERE current_state NOT IN ('COMPLETED', 'COMPENSATED', 'FAILED');
 ```
 
-`stuck` index — recovery scheduler için (Section 9).
+`context` JSONB'de transfer parametreleri ve ara ID'ler (bankATransactionId, fxConversionId, ...) durur. `idx_saga_stuck` partial index ise Section 11'deki recovery scheduler için — sadece bitmemiş saga'ları hızlı tarar.
 
 ### 7. Choreography — event-driven
 
-Her servis event yayınlar, diğerleri dinler, kendi adımını yapar, event yayınlar.
+Orchestration'ın alternatifi **choreography**: merkezi koordinatör yoktur; her servis bir event yayınlar, ilgili servis onu dinler, kendi adımını yapar, kendi event'ini yayınlar. Koordinasyon event akışının kendisinden doğar.
 
 ```
-Bank A: TransferRequested al
-       → debit
-       → DebitedEvent yayınla (Kafka)
-
-FX:    DebitedEvent al
-       → convert
-       → ConvertedEvent yayınla
-
-Bank B: ConvertedEvent al
-       → credit
-       → CreditedEvent (success) veya CreditFailedEvent (fail) yayınla
-
-Bank A: CreditFailedEvent al
-       → reverseDebit
-       → DebitReversedEvent yayınla
+Bank A: TransferRequested al → debit → DebitedEvent yayınla (Kafka)
+FX:     DebitedEvent al       → convert → ConvertedEvent yayınla
+Bank B: ConvertedEvent al     → credit → CreditedEvent veya CreditFailedEvent
+Bank A: CreditFailedEvent al  → reverseDebit → DebitReversedEvent
 ```
 
-#### Avantajlar
+**Avantajlar:** orchestrator yok, servisler bağımsız (decoupling); linear scalability; coordinator olmadığı için SPOF yok.
 
-- **Decoupling:** Orchestrator yok, servisler bağımsız
-- **Scalability:** Linear
-- **No SPOF:** Coordinator yok
+**Dezavantajlar:** flow dağınık, event'leri trace etmek zor (visibility düşük); debugging için distributed tracing/observability şart; event bağımlılıkları büyüdükçe cyclic complexity artar.
 
-#### Dezavantajlar
-
-- **Visibility:** Flow dağınık (event'leri trace etmek zor)
-- **Debugging:** Tracing/observability şart
-- **Cyclic complexity:** Event'ler arası bağımlılık karmaşıklaşır
+```mermaid
+flowchart LR
+    subgraph Orchestration
+        ORC["Orchestrator"]
+        ORC --> OA["Bank A"]
+        ORC --> OF["FX"]
+        ORC --> OB["Bank B"]
+    end
+    subgraph Choreography
+        CA["Bank A"] -->|"event"| CF["FX"]
+        CF -->|"event"| CB["Bank B"]
+    end
+```
 
 ### 8. Orchestration vs Choreography — karar matrisi
 
+İkisi arasında seçim bir trade-off'tur; banking'de kriter genelde **visibility** ile **decoupling** arasındaki denge olur.
+
 | Kriter | Orchestration | Choreography |
 |---|---|---|
-| Flow visibility | Yüksek (state machine) | Düşük (dağınık event'ler) |
+| Flow visibility | Yüksek (state machine) | Düşük (dağınık event) |
 | Service coupling | Orchestrator central | Düşük |
-| Recovery | State machine'den | Event sourcing veya replay |
+| Recovery | State machine'den | Event sourcing / replay |
 | Debugging | Kolay | Distributed tracing şart |
 | SPOF | Orchestrator | Yok |
 | Scalability | Coordinator bottleneck | Linear |
-| Banking adoption | TR bankalarında daha yaygın | Modern startup'larda |
+| Banking adoption | TR bankalarında yaygın | Modern startup'larda |
 
-**Banking pratiği:**
-- **Mission-critical** cross-bank transfer → orchestration (visibility kritik)
-- **Internal events** (audit, notification) → choreography (decoupling)
+**Banking pratiği:** mission-critical cross-bank transfer → orchestration (visibility kritik). Internal event'ler (audit, notification) → choreography (decoupling). Gerçek sistemlerde ikisinin karışımı (mixed approach) yaygındır.
 
-Mixed approach yaygın.
+### 9. Compensating action — beş kural
 
-### 9. Compensating action — kurallar
+Saga'nın kalbi compensation'dır ve doğru tasarlamak sanıldığından incedir. Temel prensip: <mark>compensation her zaman ters sırada çalışır — son başarılı adımdan ilk adıma doğru</mark>. Beş kural bunu tamamlar.
 
-**Compensating action 5 kuralı:**
-
-#### 1. Idempotent
+**Kural 1 — Idempotent.** Network retry veya partial failure yüzünden compensation iki kez çağrılabilir; iki çağrı tek çağrıyla aynı sonucu vermeli, yoksa double credit olur.
 
 ```java
 public void reverseDebit(UUID transactionId) {
-    // İdempotent — 2 kez çağrılsa aynı sonuç
     if (reversedTxRepo.existsByOriginalTxId(transactionId)) {
         log.warn("Already reversed: {}", transactionId);
-        return;
+        return;   // idempotent guard
     }
-    
     BankATransaction original = bankATxRepo.findById(transactionId).orElseThrow();
     bankAService.credit(original.getAccountId(), original.getAmount());
     reversedTxRepo.save(new ReversedTransaction(transactionId, Instant.now()));
 }
 ```
 
-Network retry, partial failure → 2x compensate → state bozulmasın.
+**Kural 2 — Commutative (mümkünse).** Compensation sırası esnek olabilirse cleanup'ı paralelleştirebilirsin. Strict sıra şart değilse bunu kullan.
 
-#### 2. Commutative (mümkünse)
+**Kural 3 — Local atomic.** Her compensation kendi transaction'ında çalışır. Compensation'ın kendisi de fail edebilir — bu durumda gerekirse outer compensation / retry devreye girer.
 
-Compensation order esnek olmalı. Strict sıra şart değilse cleanup paralel olabilir.
-
-#### 3. Local atomic
-
-Her compensation kendi tx'inde. Compensation'ın kendisi fail edebilir → outer compensation gerekirse.
-
-#### 4. Audit trail
+**Kural 4 — Audit trail.** Compensation'ı asla "sil" gibi düşünme; bir compensation da regülatör için loglanacak bir olaydır.
 
 ```java
 public void reverseDebit(UUID transactionId) {
-    // ...
+    // ... reversal logic
     auditService.log(AuditEvent.builder()
         .action("DEBIT_REVERSED")
         .resourceId(transactionId)
@@ -358,34 +451,93 @@ public void reverseDebit(UUID transactionId) {
 }
 ```
 
-Compensation'ı sil **etme**. Audit için kayıt.
+**Kural 5 — Semantic compensation.** Bazen "geri alma" fiziksel olarak mümkün değildir. Gönderilen bir SMS'i geri alamazsın — bunun yerine yeni bir adımla telafi edersin: ikinci bir SMS at ("Önceki bildirim geçersiz, transfer iptal edildi"). Buna semantic compensation denir; banking'de sıkça gerekir.
 
-#### 5. Semantic compensation
+### 10. Banking örnek — Cross-bank Transfer Saga (Kafka orchestrator)
 
-Bazen "geri alma" tam mümkün değil. **Semantic compensation**: yeni adım at, eski'yi telafi et.
+Şimdi Section 4-9'daki her şeyi Kafka tabanlı bir orchestrator'da birleştirelim. Orchestrator entry point (`initiate`) saga state'i STARTED olarak yazar ve ilk adımı (Bank A debit) tetikler:
 
-Banking örnek: SMS gönderildi. SMS'i "geri al" mümkün değil. **Compensation:** ikinci SMS gönder — "Önceki SMS hatalıydı, transfer iptal edildi."
+```java
+public UUID initiate(CrossBankTransferRequest req) {
+    UUID sagaId = UUID.randomUUID();
+    TransferContext context = TransferContext.builder()
+        .sagaId(sagaId).transferRequest(req).build();
 
-### 10. Banking örnek — Cross-bank Transfer Saga
+    SagaState state = SagaState.builder()
+        .sagaId(sagaId).sagaType("CROSS_BANK_TRANSFER")
+        .currentState("STARTED").context(serializer.toJson(context))
+        .createdAt(Instant.now()).updatedAt(Instant.now()).build();
+    sagaRepo.save(state);
+
+    kafka.send("bank-a.debit-requested", sagaId.toString(),
+        new DebitRequest(sagaId, req.getFromAccount(), req.getAmount()));
+    return sagaId;
+}
+```
+
+Her adım bir `@KafkaListener`. Happy path listener'ları aynı kalıbı izler: state'i DB'de ilerlet, sonraki adımı yayınla. Örnek — debit tamamlandı, FX conversion tetikle:
+
+```java
+@KafkaListener(topics = "bank-a.debit-completed", groupId = "saga-orchestrator")
+@Transactional
+public void onDebitCompleted(DebitCompletedEvent event, Acknowledgment ack) {
+    SagaState state = sagaRepo.findById(event.getSagaId()).orElseThrow();
+    TransferContext ctx = serializer.fromJson(state.getContext());
+    ctx.setBankATransactionId(event.getTransactionId());
+    state.setContext(serializer.toJson(ctx));
+    state.setCurrentState("DEBITED");
+    sagaRepo.save(state);
+
+    kafka.send("fx.convert-requested", event.getSagaId().toString(),
+        new ConvertRequest(event.getSagaId(), ctx.getTransferRequest().getCurrency(),
+                          "EUR", ctx.getTransferRequest().getAmount()));
+    ack.acknowledge();
+}
+```
+
+Compensation'ın kilit noktası credit fail listener'ıdır: state COMPENSATING'e geçer, sonra Step 2 (FX cancel) ve Step 1 (reverse debit) **ters sırada** yayınlanır:
+
+```java
+@KafkaListener(topics = "bank-b.credit-failed", groupId = "saga-orchestrator")
+@Transactional
+public void onCreditFailed(CreditFailedEvent event, Acknowledgment ack) {
+    SagaState state = sagaRepo.findById(event.getSagaId()).orElseThrow();
+    TransferContext ctx = serializer.fromJson(state.getContext());
+    state.setCurrentState("COMPENSATING");
+    sagaRepo.save(state);
+    log.warn("Credit failed, compensating: saga={}, reason={}", event.getSagaId(), event.getReason());
+
+    kafka.send("fx.cancel-requested", event.getSagaId().toString(),
+        new CancelConversionRequest(event.getSagaId(), ctx.getFxConversionId()));
+    kafka.send("bank-a.reverse-debit-requested", event.getSagaId().toString(),
+        new ReverseDebitRequest(event.getSagaId(), ctx.getBankATransactionId()));
+    ack.acknowledge();
+}
+```
+
+Compensation tamamlanınca saga COMPENSATED olur ve müşteri bilgilendirilir. Debit'in en baştan fail ettiği durumda ise compensation yok — geri alacak bir şey yoktur, saga doğrudan FAILED'e geçer.
+
+<details>
+<summary>Tam kod: CrossBankTransferSaga (~175 satır)</summary>
 
 ```java
 @Service
 @Slf4j
 public class CrossBankTransferSaga {
-    
+
     private final KafkaTemplate<String, Object> kafka;
     private final SagaStateRepository sagaRepo;
     private final TransferContextSerializer serializer;
-    
+
     // Entry point — orchestrator init
     public UUID initiate(CrossBankTransferRequest req) {
         UUID sagaId = UUID.randomUUID();
-        
+
         TransferContext context = TransferContext.builder()
             .sagaId(sagaId)
             .transferRequest(req)
             .build();
-        
+
         SagaState state = SagaState.builder()
             .sagaId(sagaId)
             .sagaType("CROSS_BANK_TRANSFER")
@@ -395,37 +547,37 @@ public class CrossBankTransferSaga {
             .updatedAt(Instant.now())
             .build();
         sagaRepo.save(state);
-        
+
         // Step 1: Bank A debit
         kafka.send("bank-a.debit-requested", sagaId.toString(),
             new DebitRequest(sagaId, req.getFromAccount(), req.getAmount()));
-        
+
         log.info("Saga initiated: id={}, from={}, to={}, amount={}",
             sagaId, req.getFromAccount(), req.getToAccount(), req.getAmount());
-        
+
         return sagaId;
     }
-    
+
     @KafkaListener(topics = "bank-a.debit-completed", groupId = "saga-orchestrator")
     @Transactional
     public void onDebitCompleted(DebitCompletedEvent event, Acknowledgment ack) {
         SagaState state = sagaRepo.findById(event.getSagaId()).orElseThrow();
         TransferContext ctx = serializer.fromJson(state.getContext());
-        
+
         ctx.setBankATransactionId(event.getTransactionId());
         state.setContext(serializer.toJson(ctx));
         state.setCurrentState("DEBITED");
         state.setUpdatedAt(Instant.now());
         sagaRepo.save(state);
-        
+
         // Step 2: FX conversion
         kafka.send("fx.convert-requested", event.getSagaId().toString(),
-            new ConvertRequest(event.getSagaId(), ctx.getTransferRequest().getCurrency(), 
+            new ConvertRequest(event.getSagaId(), ctx.getTransferRequest().getCurrency(),
                               "EUR", ctx.getTransferRequest().getAmount()));
-        
+
         ack.acknowledge();
     }
-    
+
     @KafkaListener(topics = "bank-a.debit-failed", groupId = "saga-orchestrator")
     @Transactional
     public void onDebitFailed(DebitFailedEvent event, Acknowledgment ack) {
@@ -434,101 +586,101 @@ public class CrossBankTransferSaga {
         state.setUpdatedAt(Instant.now());
         state.setCompletedAt(Instant.now());
         sagaRepo.save(state);
-        
+
         // No compensation — Step 1 zaten failed, geri alacak bir şey yok
-        
+
         // Müşteri bilgilendir
         notifyCustomer(event.getSagaId(), "DEBIT_FAILED", event.getReason());
-        
+
         ack.acknowledge();
     }
-    
+
     @KafkaListener(topics = "fx.convert-completed", groupId = "saga-orchestrator")
     @Transactional
     public void onConvertCompleted(ConvertCompletedEvent event, Acknowledgment ack) {
         SagaState state = sagaRepo.findById(event.getSagaId()).orElseThrow();
         TransferContext ctx = serializer.fromJson(state.getContext());
-        
+
         ctx.setFxConversionId(event.getConversionId());
         ctx.setConvertedAmount(event.getConvertedAmount());
         state.setContext(serializer.toJson(ctx));
         state.setCurrentState("CONVERTED");
         state.setUpdatedAt(Instant.now());
         sagaRepo.save(state);
-        
+
         // Step 3: Bank B credit
         kafka.send("bank-b.credit-requested", event.getSagaId().toString(),
-            new CreditRequest(event.getSagaId(), ctx.getTransferRequest().getToAccount(), 
+            new CreditRequest(event.getSagaId(), ctx.getTransferRequest().getToAccount(),
                             event.getConvertedAmount(), "EUR"));
-        
+
         ack.acknowledge();
     }
-    
+
     @KafkaListener(topics = "fx.convert-failed", groupId = "saga-orchestrator")
     @Transactional
     public void onConvertFailed(ConvertFailedEvent event, Acknowledgment ack) {
         SagaState state = sagaRepo.findById(event.getSagaId()).orElseThrow();
         TransferContext ctx = serializer.fromJson(state.getContext());
-        
+
         state.setCurrentState("COMPENSATING");
         state.setUpdatedAt(Instant.now());
         sagaRepo.save(state);
-        
+
         // Compensate Step 1
         kafka.send("bank-a.reverse-debit-requested", event.getSagaId().toString(),
             new ReverseDebitRequest(event.getSagaId(), ctx.getBankATransactionId()));
-        
+
         ack.acknowledge();
     }
-    
+
     @KafkaListener(topics = "bank-b.credit-completed", groupId = "saga-orchestrator")
     @Transactional
     public void onCreditCompleted(CreditCompletedEvent event, Acknowledgment ack) {
         SagaState state = sagaRepo.findById(event.getSagaId()).orElseThrow();
         TransferContext ctx = serializer.fromJson(state.getContext());
-        
+
         ctx.setBankBTransactionId(event.getTransactionId());
         state.setContext(serializer.toJson(ctx));
         state.setCurrentState("COMPLETED");
         state.setUpdatedAt(Instant.now());
         state.setCompletedAt(Instant.now());
         sagaRepo.save(state);
-        
+
         // Async: audit + notification (no need to wait)
         kafka.send("audit.log-requested", event.getSagaId().toString(),
             new AuditLogRequest("CROSS_BANK_TRANSFER_COMPLETED", ctx));
-        
+
         kafka.send("notification.send-requested", event.getSagaId().toString(),
-            new NotificationRequest(ctx.getTransferRequest().getCustomerId(), 
+            new NotificationRequest(ctx.getTransferRequest().getCustomerId(),
                                    "Transfer completed", ctx));
-        
+
         log.info("Saga completed: id={}", event.getSagaId());
         ack.acknowledge();
     }
-    
+
     @KafkaListener(topics = "bank-b.credit-failed", groupId = "saga-orchestrator")
     @Transactional
     public void onCreditFailed(CreditFailedEvent event, Acknowledgment ack) {
         SagaState state = sagaRepo.findById(event.getSagaId()).orElseThrow();
         TransferContext ctx = serializer.fromJson(state.getContext());
-        
+
         state.setCurrentState("COMPENSATING");
         state.setUpdatedAt(Instant.now());
         sagaRepo.save(state);
-        
+
         log.warn("Credit failed, starting compensation: saga={}, reason={}",
             event.getSagaId(), event.getReason());
-        
-        // Compensate: Step 2 + Step 1
+
+        // Compensate: Step 2 + Step 1 (reverse order)
         kafka.send("fx.cancel-requested", event.getSagaId().toString(),
             new CancelConversionRequest(event.getSagaId(), ctx.getFxConversionId()));
-        
+
         kafka.send("bank-a.reverse-debit-requested", event.getSagaId().toString(),
             new ReverseDebitRequest(event.getSagaId(), ctx.getBankATransactionId()));
-        
+
         ack.acknowledge();
     }
-    
+
     @KafkaListener(topics = "bank-a.reverse-debit-completed", groupId = "saga-orchestrator")
     @Transactional
     public void onReverseDebitCompleted(ReverseDebitCompletedEvent event, Acknowledgment ack) {
@@ -537,42 +689,40 @@ public class CrossBankTransferSaga {
         state.setUpdatedAt(Instant.now());
         state.setCompletedAt(Instant.now());
         sagaRepo.save(state);
-        
+
         notifyCustomer(event.getSagaId(), "COMPENSATED", "Transfer iptal edildi, paranız iade edildi.");
-        
+
         log.info("Saga compensated: id={}", event.getSagaId());
         ack.acknowledge();
     }
 }
 ```
 
+</details>
+
 ### 11. Timeout handling — stuck saga recovery
 
-Bir step bekleniyor ama event gelmiyor → timeout.
+Bir adım bekleniyor ama event hiç gelmiyorsa (servis çöktü, mesaj kayboldu) saga sonsuza kadar asılı kalır. Bu yüzden bitmemiş saga'ları periyodik tarayan bir scheduler şarttır. Detection basit: belli süredir güncellenmemiş, terminal olmayan state'teki saga'ları bul.
 
 ```java
 @Scheduled(fixedDelay = 60000)   // her dakika
 @SchedulerLock(name = "stuckSagaCheck")
 public void checkStuckSagas() {
-    Duration timeout = Duration.ofMinutes(5);
-    Instant cutoff = Instant.now().minus(timeout);
-    
+    Instant cutoff = Instant.now().minus(Duration.ofMinutes(5));
     List<SagaState> stuck = sagaRepo.findStuck(cutoff);
-    
+
     for (SagaState saga : stuck) {
-        log.warn("Stuck saga: id={}, state={}, age={}min", 
-            saga.getSagaId(), saga.getCurrentState(),
-            Duration.between(saga.getUpdatedAt(), Instant.now()).toMinutes());
-        
-        // Trigger compensation
+        log.warn("Stuck saga: id={}, state={}", saga.getSagaId(), saga.getCurrentState());
         triggerCompensation(saga);
     }
 }
+```
 
+Trigger tarafı state machine'in `compensateAction`'ıyla aynı mantığı taşır — hangi state'te takıldıysa ona göre ters sıralı compensation event'leri yayınlar ve ops'a alarm verir:
+
+```java
 private void triggerCompensation(SagaState saga) {
     TransferContext ctx = serializer.fromJson(saga.getContext());
-    
-    // Force compensation event
     switch (saga.getCurrentState()) {
         case "DEBITED":
             kafka.send("bank-a.reverse-debit-requested", saga.getSagaId().toString(),
@@ -588,131 +738,65 @@ private void triggerCompensation(SagaState saga) {
             kafka.send("bank-a.reverse-debit-requested", ...);
             break;
     }
-    
     saga.setCurrentState("COMPENSATING");
     saga.setUpdatedAt(Instant.now());
     sagaRepo.save(saga);
-    
     alerts.notifyOps("Stuck saga compensation triggered: " + saga.getSagaId());
 }
 ```
 
-Banking pratiği: Stuck timeout 5-15 dakika. SLA'nına göre ayarla.
+Banking pratiği: stuck timeout 5-15 dakika arası, SLA'na göre ayarla.
 
 ### 12. TCC (Try-Confirm-Cancel) — alternatif pattern
 
-3-phase:
-1. **Try:** Kaynak reserve et (hold)
-2. **Confirm:** Reserved'ı finalize
-3. **Cancel:** Reserved'ı release
+Saga "önce yap, gerekirse geri al" der; TCC ise "önce rezerve et, sonra kesinleştir ya da bırak" der. Üç faz vardır:
+
+1. **Try:** kaynağı reserve et (hold)
+2. **Confirm:** reserved'ı finalize et
+3. **Cancel:** reserved'ı release et
 
 ```java
-// Try
-String holdId = accountService.holdBalance(fromId, amount);
+String holdId = accountService.holdBalance(fromId, amount);   // Try
 
-// Confirm (saga step OK)
-accountService.confirmHold(holdId);
-
-// Cancel (saga step FAIL)
-accountService.releaseHold(holdId);
+accountService.confirmHold(holdId);   // Confirm (step OK)
+accountService.releaseHold(holdId);   // Cancel (step FAIL)
 ```
 
-Banking örnek — kart authorization:
+Banking'in klasik TCC örneği kart authorization'dır: authorization = kartta amount hold (Try), capture = held → actual debit (Confirm), void = held → release (Cancel).
 
-```
-Authorization (Try): Kartta amount hold
-Capture (Confirm): Held → actual debit
-Void (Cancel): Held → release
-```
-
-TCC sıkı consistency. Saga'dan **daha rigid**, ama daha karmaşık.
-
-Banking adoption: Booking/reservation pattern (otel, uçak) → TCC. Banking transfer → Saga.
+TCC daha sıkı consistency verir çünkü kaynak baştan rezerve edilir; ama Saga'dan daha rigid ve daha karmaşıktır. Adoption pratiği: booking/reservation (otel, uçak) → TCC; banking transfer → Saga.
 
 ### 13. Saga monitoring + observability
 
-Banking için saga'nın **görünür** olması kritik.
+Banking için saga'nın görünür olması bir lüks değil, zorunluluktur — para hareketini izleyemezsen debug edemezsin. Transition ve duration metric'leri Micrometer ile toplanır:
 
 ```java
-@Component
-public class SagaMetrics {
-    
-    private final MeterRegistry registry;
-    
-    public void recordTransition(String sagaType, String fromState, String toState) {
-        registry.counter("saga.transition",
-            "type", sagaType,
-            "from", fromState,
-            "to", toState).increment();
-    }
-    
-    public void recordDuration(String sagaType, String finalState, Duration duration) {
-        registry.timer("saga.duration",
-            "type", sagaType,
-            "outcome", finalState).record(duration);
-    }
+public void recordTransition(String sagaType, String fromState, String toState) {
+    registry.counter("saga.transition", "type", sagaType,
+        "from", fromState, "to", toState).increment();
+}
+
+public void recordDuration(String sagaType, String finalState, Duration duration) {
+    registry.timer("saga.duration", "type", sagaType,
+        "outcome", finalState).record(duration);
 }
 ```
 
-Grafana dashboard:
-- Saga success rate
-- Saga p99 duration
-- State distribution (kaç saga her state'te)
-- Stuck saga count
-
-OpenTelemetry trace ile end-to-end visibility (Phase 7 + 9).
+Grafana dashboard'da izlenecekler: saga success rate, saga p99 duration, state distribution (her state'te kaç saga), stuck saga count. Ucdan uca izlenebilirlik için OpenTelemetry trace eklenir (Phase 7 + 9).
 
 ### 14. Banking anti-pattern'leri
 
-**Anti-pattern 1: 2PC kullanmak**
+Mülakatta "bu tasarımda ne yanlış?" sorusunun cephaneliği burası. Yedi klasik:
 
-```java
-@Transactional("xaTransactionManager")   // ❌ XA distributed tx
-public void transfer() {
-    bankAService.debit(...);   // XA participant
-    bankBService.credit(...);   // XA participant
-}
-```
+**Anti-pattern 1: 2PC kullanmak.** `@Transactional("xaTransactionManager")` ile Bank A debit + Bank B credit'i tek XA transaction'a sarmak. Blocking, SPOF, performans katili — banking için yasak, Saga kullan.
 
-Blocking, SPOF, performans katil. Banking için **YASAK**. Saga kullan.
+**Anti-pattern 2: Saga state in-memory.** `Map<UUID, SagaState>` gibi bir ConcurrentHashMap'te tutmak. App restart → saga kayıp. DB-persistent şart.
 
-**Anti-pattern 2: Saga state in-memory**
+**Anti-pattern 3: Compensation idempotent değil.** Guard'sız `reverseDebit` → duplicate compensation → double credit → state bozulur.
 
-```java
-private Map<UUID, SagaState> states = new ConcurrentHashMap<>();   // ❌
-```
+**Anti-pattern 4: Saga timeout yok.** Bir adım takılınca saga sonsuza kadar PENDING kalır. Stuck monitoring + auto-compensation şart.
 
-App restart → saga kayıp. DB-persistent şart.
-
-**Anti-pattern 3: Compensation idempotent değil**
-
-```java
-public void reverseDebit(UUID txId) {
-    BankATransaction tx = bankATxRepo.findById(txId);
-    bankAService.credit(tx.getAccount(), tx.getAmount());   // duplicate compensation → double credit
-}
-```
-
-Duplicate compensation → state bozulur. Idempotent şart.
-
-**Anti-pattern 4: Saga timeout yok**
-
-Bir step takıldı → saga sonsuza kadar PENDING. Stuck monitoring + auto-compensation.
-
-**Anti-pattern 5: Saga'yı sync HTTP yapmak**
-
-```java
-public Transfer execute(...) {
-    bankAService.debit(...);   // 1 saniye blocking call
-    fxService.convert(...);    // 1 saniye
-    bankBService.credit(...);  // 1 saniye
-    auditService.log(...);     // 500ms
-    notifService.send(...);    // 1 saniye
-    return transfer;           // 4.5+ saniye sync — kullanıcı bekliyor
-}
-```
-
-User ekranda 5 saniye bekler, timeout riski. Saga **async** olmalı. HTTP endpoint:
+**Anti-pattern 5: Saga'yı sync HTTP yapmak.** Debit + FX + credit + audit + notification'ı ardışık blocking call olarak çalıştırmak = kullanıcı ekranda 5+ saniye bekler, timeout riski. Saga async olmalı:
 
 ```java
 @PostMapping("/cross-bank-transfers")
@@ -729,17 +813,23 @@ public SagaStatusResponse getStatus(@PathVariable UUID id) {
 }
 ```
 
-Async pattern + status polling. Banking standard.
+202 Accepted + status polling — banking standardı.
 
-**Anti-pattern 6: Compensation order yanlış**
+**Anti-pattern 6: Compensation order yanlış.** Step 3 fail'de önce Step 1 sonra Step 2'yi geri almak. Doğrusu ters sıra: son başarılı adımdan ilk adıma (önce FX cancel, sonra reverse debit).
 
-Step 3 fail → compensate Step 1, sonra Step 2.
+**Anti-pattern 7: Saga event'lerini non-idempotent handle etmek.** Event 2 kez gelirse handler duplicate işlem yapar. Idempotent consumer pattern (Topic 6.3) uygula.
 
-**Yanlış sıra.** Step 2 (FX) önce iptal, sonra Step 1 (debit). Reverse order: son'dan ilk'e doğru.
+```admonish warning title="2PC'yi Saga sanma"
+Cross-bank transfer'da Bank A ve Bank B genelde *farklı kurumlar*dır — ortak bir XA coordinator zaten kuramazsın. 2PC teknik olarak imkansız değilse bile blocking lock + coordinator SPOF banking SLA'sını öldürür. "Distributed transaction" kelimesini duyduğun an refleksin 2PC değil Saga olmalı.
+```
 
-**Anti-pattern 7: Saga event'leri non-idempotent topic'e**
+```admonish tip title="Compensation her zaman ters sırada"
+Reverse debit'i FX cancel'dan önce yaparsan, FX kaydı hâlâ "aktif" görünürken parayı iade etmiş olursun — audit trail'de tutarsızlık. Kural sabit: en son başarılı adımdan başla, ilk adıma doğru geri sar. State machine'de bunu `switch(currentState)` ile kodlarsın.
+```
 
-Event 2 kez geldi → handler duplicate işlem. Idempotent consumer pattern (Topic 6.3).
+```admonish warning title="In-memory saga = production'da kayıp para"
+Saga state'ini bellekte tutan bir orchestrator, deploy veya crash anında yarım kalmış tüm transfer'leri unutur — ne complete eder ne compensate eder. Para "arada" asılı kalır. `saga_states` tablosu + stuck saga scheduler bu senaryonun tek gerçek çözümüdür.
+```
 
 ---
 
@@ -753,132 +843,203 @@ Event 2 kez geldi → handler duplicate işlem. Idempotent consumer pattern (Top
 
 ---
 
-## Mini task'ler
+## Kendini Sına
 
-### Task 6.7.1 — Saga state DB schema (15 dk)
+Aşağıdaki soruları önce **cevaba bakmadan** kendi cümlelerinle yanıtlamayı dene — hepsi TR bank mülakatlarında karşına çıkabilecek tarzda. Takıldığında ilgili Kavramlar başlığına dön, sonra tekrar dene.
 
-`saga_states` migration. Yukarıdaki schema.
+**S1. 2PC (Two-Phase Commit) neden modern banking'de tercih edilmez? En az üç sebep say.**
 
-### Task 6.7.2 — Cross-bank transfer orchestrator (90 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-`CrossBankTransferSaga` class'ı:
-- `initiate()` entry point
-- 6 @KafkaListener (debit OK, debit fail, convert OK, convert fail, credit OK, credit fail)
-- Compensation listener'lar
-- State machine geçişleri
+2PC atomicity'yi sağlar ama bedeli banking için ölümcüldür. Bir: blocking — Phase 1'de tüm participant'lar kaynakları (DB row lock) kilitler ve Phase 2 gelene kadar bekler, en yavaş participant tüm sistemi tutar. İki: coordinator SPOF — coordinator Phase 1 sonrası çökerse participant'lar uncertain state'te asılı kalır ve manuel müdahale gerekir. Üç: performans ve scalability — her participant'a network roundtrip, coordinator throughput bottleneck olur. Dört: vendor lock-in — XA destekleyen DB + transaction manager şart, cloud-native değil.
 
-Test happy path:
-1. `initiate()` çağır
-2. `bank-a.debit-completed` event simulate et
-3. `fx.convert-completed` event simulate et
-4. `bank-b.credit-completed` event simulate et
-5. SagaState COMPLETED olmalı
+Ek olarak cross-bank transfer'da Bank A ve Bank B farklı kurumlardır; ortak bir XA coordinator kurmak zaten pratik değildir. Bu yüzden modern banking 2PC yerine Saga kullanır.
 
-### Task 6.7.3 — Compensation flow (60 dk)
+</details>
 
-Test compensation:
-1. `initiate()`
-2. `bank-a.debit-completed` ✓
-3. `bank-b.credit-failed` ✗
-4. Beklenenler:
-   - `fx.cancel-requested` event yayınlandı
-   - `bank-a.reverse-debit-requested` event yayınlandı
-   - SagaState COMPENSATING → COMPENSATED
+**S2. Saga pattern nedir? 2PC'den temel farkı ne?**
 
-### Task 6.7.4 — Stuck saga recovery (45 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-5 dakika eski PENDING saga → recovery scheduler trigger compensation. Test: saga'yı eski timestamp ile DB'ye koy, scheduler çalıştır, COMPENSATING'e geçtiğini doğrula.
+Saga, bir distributed transaction'ı sırayla çalışan **local transaction'lar** dizisine böler. Her adım atomik ve hızlıdır, kendi DB'sinde commit olur; global bir lock veya coordinator yoktur. Bir adım fail ederse önceki adımlar **compensating action** ile ters sırada geri alınır.
 
-### Task 6.7.5 — TCC pattern denemesi (60 dk)
+2PC'den farkı temeldir: 2PC "hepsini birden kilitle, sonra hepsini birden commit et" der (pessimistic, blocking). Saga ise "her adımı ayrı ayrı commit et, sorun çıkarsa geri al" der (optimistic, non-blocking). Saga tam atomicity garanti etmez — arada başkaları ara state'i görebilir — ama banking için gereken eventual consistency + audit trail'i çok daha ölçeklenebilir şekilde sağlar.
 
-`account.holdBalance(amount)` → holdId. `confirmHold(holdId)` veya `releaseHold(holdId)`. Saga step → TCC try → confirm/cancel.
+</details>
 
-### Task 6.7.6 — Spring State Machine ile (60 dk)
+**S3. Orchestration ile choreography arasındaki fark nedir? Hangi banking senaryosunda hangisini seçersin?**
 
-Yukarıdaki state machine config'i ile orchestrator. Event'leri state machine'e gönder, transition'ları action'lar tetikle.
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 6.7.7 — Saga monitoring + Grafana (30 dk)
+Orchestration'da merkezi bir orchestrator (genelde bir state machine) her adımı sırayla çağırır ve akışı tek yerden yönetir. Choreography'de merkez yoktur; her servis event yayınlar, ilgili servis dinler ve kendi adımını yapıp yeni event yayınlar — koordinasyon event akışından doğar.
 
-`SagaMetrics` ile transition + duration metric'leri. Grafana panel: success rate, p99 duration, stuck count.
+Trade-off: orchestration yüksek visibility ve kolay recovery verir ama orchestrator coupling + SPOF getirir. Choreography düşük coupling ve linear scalability verir ama flow dağınık olduğu için debugging distributed tracing ister. Banking pratiği: mission-critical cross-bank transfer → orchestration (visibility kritik); internal event'ler (audit, notification) → choreography (decoupling). Genelde ikisinin karışımı kullanılır.
+
+</details>
+
+**S4. Compensating action nedir? Beş kuralını say, özellikle idempotency neden şart?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Compensating action, başarılı bir saga adımının etkisini geri alan işlemdir — reverse debit, cancel conversion gibi. Bir rollback değildir: orijinal işlem ve reversal ikisi de audit trail'de kalır.
+
+Beş kural: (1) idempotent — network retry veya partial failure yüzünden iki kez çağrılabilir, guard yoksa double credit olur; (2) commutative — mümkünse sıra esnek olsun, cleanup paralelleşebilsin; (3) local atomic — her compensation kendi transaction'ında; (4) audit trail — compensation da loglanır, silinmez; (5) semantic compensation — geri alınamayan işlemler (gönderilen SMS) için yeni bir telafi adımı at. Idempotency şart çünkü Kafka retry / at-least-once delivery yüzünden aynı compensation event'i tekrar gelebilir; guard'sız her tekrar hesaba fazladan credit yazar.
+
+</details>
+
+**S5. Compensation neden ters sırada (son adımdan ilk adıma) yapılmalı?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Çünkü adımlar birbirine bağımlıdır ve geri alma bu bağımlılığı ters yönde takip etmeli. Cross-bank transfer'da sıra debit → convert → credit. Step 3 (credit) fail ederse, önce Step 2'yi (FX conversion cancel), sonra Step 1'i (reverse debit) geri alırsın.
+
+Ters yapıp önce reverse debit çekersen, FX kaydı hâlâ "aktif" görünürken parayı iade etmiş olursun — audit trail'de tutarsızlık ve reconciliation ekibine kabus. State machine'de bu mantık `switch(currentState)` ile kodlanır: CREDITED'te üçünü, CONVERTED'te ikisini, DEBITED'te sadece debit'i geri al. Aynı ters-sıra mantığı stuck saga recovery'de de kullanılır.
+
+</details>
+
+**S6. Saga state neden in-memory değil DB-persistent olmalı? Stuck saga nasıl handle edilir?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Orchestrator bir deploy, restart veya crash yaşadığında yarım kalmış tüm saga'ları hatırlamalı — aksi halde transfer "arada" asılı kalır, ne complete olur ne compensate. In-memory `Map` bunu kaybeder; state her transition'da `saga_states` tablosuna yazılırsa restart sonrası kaldığı yerden devam edilir.
+
+Stuck saga (adım bekleniyor ama event gelmiyor) için periyodik bir scheduler kullanılır: belli süredir (banking'de tipik 5-15 dk) güncellenmemiş, terminal olmayan state'teki saga'ları partial index ile bulur, mevcut state'e göre ters sıralı compensation event'lerini tetikler ve ops'a alarm verir. Böylece hiçbir transfer sonsuza kadar PENDING kalmaz.
+
+</details>
+
+**S7. TCC (Try-Confirm-Cancel) ile Saga arasındaki fark nedir? Banking'de hangisi nerede kullanılır?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Saga "önce işlemi yap, gerekirse compensating action ile geri al" der. TCC ise üç fazlıdır: önce kaynağı **reserve** et (Try / hold), sonra ya **finalize** et (Confirm) ya da **release** et (Cancel). Fark: TCC kaynağı baştan rezerve ettiği için daha sıkı consistency verir ama daha rigid ve karmaşıktır; Saga daha esnek ama ara state'te tutarsızlık pencereleri olabilir.
+
+Banking adoption: kart authorization klasik bir TCC'dir — authorization = amount hold (Try), capture = actual debit (Confirm), void = release (Cancel). Genel olarak booking/reservation senaryoları (otel, uçak koltuğu) TCC'ye yatkındır. Cross-bank transfer gibi "yap ve gerekirse geri al" akışları ise Saga ile modellenir.
+
+</details>
+
+**S8. Cross-bank transfer'ı sync HTTP ile yapmak neden anti-pattern? Doğru API tasarımı nedir?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Sync HTTP'de debit + FX + credit + audit + notification ardışık blocking call olur; her biri saniyeler sürebildiğinden kullanıcı ekranda 5+ saniye bekler, HTTP timeout ve kötü deneyim riski doğar. Ayrıca uzun süre açık kalan bağlantı ve state, hata anında belirsizlik yaratır.
+
+Doğru tasarım async'tir: `POST /cross-bank-transfers` saga'yı `initiate()` eder ve hemen **202 Accepted** + saga ID + status URL döner. Müşteri veya UI `GET /sagas/{id}` ile durumu poll eder (STARTED, DEBITED, ..., COMPLETED / COMPENSATED). Saga arka planda Kafka event'leriyle ilerler. Bu 202 + status polling kalıbı banking'de standarttır; ek olarak saga event'leri idempotent consumer ile handle edilmeli ki duplicate delivery çift işlem yapmasın.
+
+</details>
 
 ---
 
-## Test yazma rehberi
+## Tamamlama kriterleri
+
+- [ ] 2PC'nin banking için neden yasak olduğunu (blocking, SPOF, performans, vendor lock-in) 2 dakikada anlatabiliyorum
+- [ ] Saga'nın "local transaction zinciri + compensation" özünü ve 2PC'den farkını açıklayabiliyorum
+- [ ] Orchestration vs choreography karar matrisini ve banking'de hangisinin nerede kullanıldığını biliyorum
+- [ ] Compensating action'ın beş kuralını sayabiliyorum, idempotency ve ters sıranın neden şart olduğunu açıklayabiliyorum
+- [ ] Cross-bank transfer saga'yı state machine (STARTED → ... → COMPLETED / COMPENSATED) olarak tahtada çizebiliyorum
+- [ ] Saga state persistence'in neden DB-backed zorunlu olduğunu ve stuck saga recovery'nin nasıl çalıştığını anlatabiliyorum
+- [ ] TCC vs Saga farkını ve banking adoption'ını (kart authorization vs transfer) biliyorum
+- [ ] Async 202 Accepted + status polling pattern'ini ve sync HTTP saga anti-pattern'ini açıklayabiliyorum
+- [ ] (Opsiyonel) "Pratik yapmak istersen" bölümündeki testleri yazdım ve Claude-verify prompt'uyla doğrulattım
+
+---
+
+## Defter notları
+
+1. "2PC banking için yetersiz olmasının 4 sebebi: ____."
+2. "Saga vs 2PC temel farkı (blocking vs non-blocking, local tx): ____."
+3. "Orchestration vs choreography karar kriterleri: ____."
+4. "Compensating action 5 kuralı (idempotent, commutative, local atomic, audit, semantic): ____."
+5. "Compensation neden ters sırada — son adımdan ilk adıma: ____."
+6. "Semantic compensation banking örneği (SMS geri alınamaz): ____."
+7. "Saga state persistence neden DB-backed zorunlu: ____."
+8. "Stuck saga timeout banking SLA için (5-15 dk) + recovery scheduler: ____."
+9. "TCC vs Saga banking adoption (kart authorization vs transfer): ____."
+10. "Async HTTP 202 + status polling pattern banking için: ____."
+
+```admonish success title="Bölüm Özeti"
+- 2PC modern banking'de yasak: blocking lock, coordinator SPOF, performans/scalability, vendor lock-in — "distributed transaction" deyince refleks Saga olmalı
+- Saga = distributed transaction'ı local transaction zincirine bölmek; her adım kendi DB'sinde commit, fail'de compensating action ile ters sıra geri alma
+- Orchestration (central state machine, yüksek visibility) vs choreography (event-driven, düşük coupling); banking'de mission-critical → orchestration, internal event → choreography
+- Compensating action beş kural: idempotent, commutative, local atomic, audit trail, semantic compensation — ve her zaman ters sırada
+- Saga state DB-persistent olmalı (crash-safe), stuck saga scheduler bitmemiş saga'ları 5-15 dk sonra otomatik compensate eder
+- Saga async çalışır: HTTP 202 Accepted + status polling, idempotent consumer; sync HTTP saga ve in-memory state production'da para kaybettirir
+```
+
+---
+
+## Pratik yapmak istersen
+
+Kavramları koda dökmek istersen aşağıdaki iki ek hazır: test yazma rehberi happy path, compensation, stuck saga recovery ve idempotent compensation için örnek testler içerir; Claude-verify prompt'u ile yazdığın saga kodunu banking-grade perspektiften denetletebilirsin.
+
+<details>
+<summary>Test yazma rehberi</summary>
 
 ### Test 6.7.1 — Happy path
+
+`initiate()` çağır, sonra Bank A / FX / Bank B success event'lerini sırayla simulate et, her adımda state'in ilerlediğini ve sonunda COMPLETED olduğunu doğrula.
 
 ```java
 @SpringBootTest
 @Testcontainers
 class CrossBankTransferSagaIT {
-    
+
     @Container @ServiceConnection static PostgreSQLContainer<?> postgres = ...;
     @Container static KafkaContainer kafka = ...;
-    
+
     @Autowired CrossBankTransferSaga saga;
     @Autowired SagaStateRepository sagaRepo;
     @Autowired KafkaTemplate<String, Object> template;
-    
+
     @Test
-    void shouldCompleteSuccessfulSaga() throws Exception {
-        CrossBankTransferRequest req = createValidRequest();
-        UUID sagaId = saga.initiate(req);
-        
-        // Simulate Bank A debit success
+    void shouldCompleteSuccessfulSaga() {
+        UUID sagaId = saga.initiate(createValidRequest());
+
         template.send("bank-a.debit-completed", sagaId.toString(),
             new DebitCompletedEvent(sagaId, UUID.randomUUID()));
-        
-        await().atMost(5, SECONDS).untilAsserted(() -> {
-            SagaState state = sagaRepo.findById(sagaId).orElseThrow();
-            assertThat(state.getCurrentState()).isEqualTo("DEBITED");
-        });
-        
-        // Simulate FX convert success
+        await().atMost(5, SECONDS).untilAsserted(() ->
+            assertThat(sagaRepo.findById(sagaId).orElseThrow().getCurrentState()).isEqualTo("DEBITED"));
+
         template.send("fx.convert-completed", sagaId.toString(),
             new ConvertCompletedEvent(sagaId, UUID.randomUUID(), new BigDecimal("250.00")));
-        
-        await().atMost(5, SECONDS).untilAsserted(() -> {
-            SagaState state = sagaRepo.findById(sagaId).orElseThrow();
-            assertThat(state.getCurrentState()).isEqualTo("CONVERTED");
-        });
-        
-        // Simulate Bank B credit success
+        await().atMost(5, SECONDS).untilAsserted(() ->
+            assertThat(sagaRepo.findById(sagaId).orElseThrow().getCurrentState()).isEqualTo("CONVERTED"));
+
         template.send("bank-b.credit-completed", sagaId.toString(),
             new CreditCompletedEvent(sagaId, UUID.randomUUID()));
-        
-        await().atMost(5, SECONDS).untilAsserted(() -> {
-            SagaState state = sagaRepo.findById(sagaId).orElseThrow();
-            assertThat(state.getCurrentState()).isEqualTo("COMPLETED");
-        });
+        await().atMost(5, SECONDS).untilAsserted(() ->
+            assertThat(sagaRepo.findById(sagaId).orElseThrow().getCurrentState()).isEqualTo("COMPLETED"));
     }
 }
 ```
 
 ### Test 6.7.2 — Compensation
 
+Debit + Convert success, sonra credit fail → COMPENSATING; reverse-debit completed → COMPENSATED.
+
 ```java
 @Test
-void shouldCompensateOnCreditFailure() throws Exception {
+void shouldCompensateOnCreditFailure() {
     UUID sagaId = saga.initiate(createValidRequest());
-    
-    // Debit + Convert success
     template.send("bank-a.debit-completed", sagaId.toString(), new DebitCompletedEvent(...));
     template.send("fx.convert-completed", sagaId.toString(), new ConvertCompletedEvent(...));
-    
     await().atMost(5, SECONDS).untilAsserted(() ->
         assertThat(sagaRepo.findById(sagaId).orElseThrow().getCurrentState()).isEqualTo("CONVERTED"));
-    
-    // Credit fail
+
     template.send("bank-b.credit-failed", sagaId.toString(),
         new CreditFailedEvent(sagaId, "Insufficient funds at Bank B"));
-    
     await().atMost(5, SECONDS).untilAsserted(() ->
         assertThat(sagaRepo.findById(sagaId).orElseThrow().getCurrentState()).isEqualTo("COMPENSATING"));
-    
-    // Compensation completes
+
     template.send("bank-a.reverse-debit-completed", sagaId.toString(),
         new ReverseDebitCompletedEvent(sagaId));
-    
     await().atMost(5, SECONDS).untilAsserted(() -> {
         SagaState state = sagaRepo.findById(sagaId).orElseThrow();
         assertThat(state.getCurrentState()).isEqualTo("COMPENSATED");
@@ -888,6 +1049,8 @@ void shouldCompensateOnCreditFailure() throws Exception {
 ```
 
 ### Test 6.7.3 — Stuck saga recovery
+
+Eski timestamp'li DEBITED bir saga'yı DB'ye koy, scheduler'ı çalıştır, COMPENSATING'e geçtiğini doğrula.
 
 ```java
 @Test
@@ -899,38 +1062,39 @@ void stuckSagaShouldTriggerCompensation() {
         .updatedAt(Instant.now().minus(10, ChronoUnit.MINUTES))   // 10 dk eski
         .build();
     sagaRepo.save(stuck);
-    
+
     stuckSagaScheduler.checkStuckSagas();
-    
-    await().atMost(5, SECONDS).untilAsserted(() -> {
-        SagaState updated = sagaRepo.findById(stuck.getSagaId()).orElseThrow();
-        assertThat(updated.getCurrentState()).isEqualTo("COMPENSATING");
-    });
+
+    await().atMost(5, SECONDS).untilAsserted(() ->
+        assertThat(sagaRepo.findById(stuck.getSagaId()).orElseThrow().getCurrentState())
+            .isEqualTo("COMPENSATING"));
 }
 ```
 
 ### Test 6.7.4 — Idempotent compensation
 
+Aynı `reverseDebit`'i iki kez çağır, bakiyenin sadece bir kez tersine döndüğünü doğrula (double credit olmamalı).
+
 ```java
 @Test
 void duplicateCompensationShouldNotDoubleReverse() {
     UUID txId = setupDebitedTransaction();
-    
+
     bankAService.reverseDebit(txId);
     bankAService.reverseDebit(txId);   // duplicate call
-    
-    // Account balance sadece bir kez reversed
+
     BigDecimal finalBalance = accountRepo.getBalance(testAccountId);
     assertThat(finalBalance).isEqualByComparingTo(initialBalance);   // not 2x
 }
 ```
 
----
+</details>
 
-## Claude-verify prompt
+<details>
+<summary>Claude-verify prompt</summary>
 
 ```
-Saga pattern kodumu banking-grade kriterlere göre değerlendir:
+Saga pattern kodumu banking-grade kriterlere göre değerlendir. Eksikleri işaretle, kod yazma:
 
 1. 2PC kullanılmamış mı?
    - XA transaction manager YOK?
@@ -981,35 +1145,7 @@ Saga pattern kodumu banking-grade kriterlere göre değerlendir:
     - Sync HTTP saga?
     - 2PC kullanılmış?
 
-Her madde için PASS / FAIL / EKSIK işaretle.
+Her madde için PASS / FAIL / EKSIK işaretle, kanıt göster, kod yazma.
 ```
 
----
-
-## Tamamlama kriterleri
-
-- [ ] saga_states tablosu migration
-- [ ] CrossBankTransferSaga orchestrator (6 listener)
-- [ ] Happy path test geçiyor
-- [ ] Compensation path test geçiyor
-- [ ] Stuck saga recovery scheduler
-- [ ] Idempotent compensation actions
-- [ ] Async API (202 Accepted + status polling)
-- [ ] SagaMetrics + Grafana
-- [ ] TCC pattern denemesi yapıldı
-- [ ] Spring State Machine örneği
-
----
-
-## Defter notları (10 madde)
-
-1. "2PC banking için yetersiz olmasının 5 sebebi: ____."
-2. "Saga vs 2PC karar matrisi: ____."
-3. "Orchestration vs choreography karar kriterleri: ____."
-4. "Compensating action 5 kuralı (idempotent, audit, vb.): ____."
-5. "Semantic compensation banking örneği (SMS): ____."
-6. "Cross-bank transfer saga state machine: ____."
-7. "Saga state persistence neden DB-backed zorunlu: ____."
-8. "Stuck saga timeout banking SLA için: ____."
-9. "TCC vs Saga banking adoption (booking vs transfer): ____."
-10. "Async HTTP 202 + status polling pattern banking için: ____."
+</details>

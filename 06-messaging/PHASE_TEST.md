@@ -1,6 +1,10 @@
 # Faz 6 — PHASE TEST
 
-Faz 7'ye geçmeden önce kendini sına.
+```admonish question title="Bu test ne işe yarar?"
+Faz 7'ye geçmeden önce kendini sına. Bu bir sınav değil, **dürüstlük kontrolü**:
+işaretleyemediğin her madde, hangi topic'e geri döneceğini gösterir.
+Hepsine "evet" diyebiliyorsan hazırsın.
+```
 
 ## Pratik test
 
@@ -135,4 +139,8 @@ TR bankaları 2020+:
 
 Phase 6 → modern banking core competency. CV'nde "Apache Kafka, Spring Kafka, Kafka Streams, Outbox pattern, Saga pattern" yazılı olunca mid-level mülakatları için **güçlü** profil.
 
-Phase 7 (Microservices) bunun üstüne — monolit'ten 4 servise bölme, API Gateway, Resilience4j, distributed tracing. Phase 6 sağlam ise Phase 7 doğal evrim.
+```admonish success title="Sonraki durak: Faz 7"
+Phase 7 (Microservices) bunun üstüne kurulur — monolit'ten 4 servise bölme, API Gateway,
+Resilience4j, distributed tracing. Phase 6 sağlam ise Phase 7 doğal evrim.
+→ [Faz 7 — Microservices](../07-microservices/index.md)
+```

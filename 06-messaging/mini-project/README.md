@@ -1,30 +1,103 @@
 # Phase 6 Mini-Project — Event-Driven Banking Platform
 
+```admonish info title="Bu projede"
+- `core-banking`'i **event-driven architecture**'a evrilirken transfer event'ini **outbox pattern** ile publish ediyor, dual-write veri kaybını ortadan kaldırıyorsun
+- 3 paralel consumer (notification, audit, fraud) yazıp **idempotent consumer** + DLT + retry ile production-grade hale getiriyorsun
+- **Kafka Streams** ile real-time fraud detection kuruyorsun: 5+ tx/dk → CRITICAL alert
+- Cross-bank **Saga** orchestrator'ını async API + compensation + stuck recovery ile inşa ediyorsun
+- 5 kasten kırma senaryosu (dual-write, consumer crash, publisher race, exactly-once, compensation) üretip düzeltiyor, 15+ integration test ile kanıtlıyorsun
+```
+
 ## Hedef
 
-`core-banking`'i **event-driven architecture'a** evrilmeye. Kafka cluster lokal kur. Transfer event publish + 3 paralel consumer (notification, audit, fraud). Outbox pattern dual-write çözümü. Kafka Streams ile real-time fraud detection. Cross-bank Saga orchestrator. Tüm bunlar **production-grade**:
-- acks=all + idempotence + transactional
-- exactly_once_v2
-- DLT + retry pattern
-- Idempotent consumer + processed_events
-- ShedLock multi-instance safe outbox publisher
-- Async API + status polling
+Phase 6'nın 7 topic'inde Kafka internals, outbox, consumer pattern'leri, Kafka Streams ve Saga çalıştın. Bu projede hepsini tek serviste birleştirip `core-banking`'i event-driven bir platforma taşıyorsun. Yeni teori yok, **synthesis** var — bir adımda takılırsan ilgili topic'e dön, oku, düzelt.
 
-Sonunda elinde: TR bank backend ekibinin Kafka tarafında **kullanabileceği** referans implementation.
+Sonunda elinde production-grade bir referans implementation olacak: acks=all + idempotence + transactional producer, `exactly_once_v2`, DLT + retry, idempotent consumer (`processed_events`), ShedLock ile multi-instance-safe outbox publisher, async API + status polling.
 
-## Süre
-
-8-12 gün (günde 2-3 saat).
-
-## Önbilgi
-
-Phase 6'nın 7 topic'i bitti. Transfer/account domain Phase 1-5'ten hazır. Outbox pattern (Topic 6.6), Saga (Topic 6.7) detaylı bildiğin için.
+```admonish tip title="Süre ve önbilgi"
+8-12 gün ayır (günde 2-3 saat). Başlamadan önce: Phase 6'nın 7 topic'i (6.1-6.7) bitmiş, defter notların yazılmış olmalı. Transfer/account domain Phase 1-5'ten hazır; outbox pattern (Topic 6.6) ve Saga (Topic 6.7) detaylı bildiğin konular. Buradaki işin çoğu **birleştirme** + 5 kasten kırma reprodüksiyonu.
+```
 
 ---
 
-## Görev 1 — Kafka stack docker-compose (yarım gün)
+## Mimari
 
-### 1.1 KRaft Kafka (no ZooKeeper)
+Tek bir DB transaction'ı outbox'a yazar; publisher outbox'ı Kafka'ya taşır; üç bağımsız consumer aynı event akışını paralel tüketir. Producer ile consumer'lar arasındaki tek bağ Kafka topic'idir — servisler birbirini tanımaz.
+
+```mermaid
+flowchart LR
+    TS["TransferService"] --> OB["outbox_events tablosu"]
+    OB --> PUB["OutboxPublisher"]
+    PUB --> K["Kafka topics"]
+    K --> NC["Notification consumer"]
+    K --> AC["Audit consumer"]
+    K --> FC["Fraud consumer"]
+    FC --> AL["banking.fraud.alerts"]
+```
+
+---
+
+## Acceptance criteria (bitirme şartları)
+
+Başlamadan bir kez oku, bitince tek tek işaretle.
+
+- [ ] Kafka KRaft stack docker-compose ile çalışıyor, healthcheck passing
+- [ ] Schema Registry + Kafka UI erişilebilir
+- [ ] Transfer endpoint → outbox 3 event → Kafka publish chain
+- [ ] 3 consumer service (notification, audit, fraud) mesajları işliyor
+- [ ] Idempotent consumer pattern (`processed_events`) — duplicate skip
+- [ ] DLT setup ile error recovery + ops alert
+- [ ] Kafka Streams ile real-time fraud detection (5+ tx/dk)
+- [ ] Cross-bank Saga orchestration (4 step + compensation)
+- [ ] Outbox pattern ile dual-write çözümü
+- [ ] Multi-instance OutboxPublisher (SKIP LOCKED, no duplicates)
+- [ ] `exactly_once_v2` aktif
+- [ ] 5 kasten kırma reprodüksiyonu + fix
+- [ ] 15+ integration test passing
+- [ ] Async API + status polling (cross-bank)
+- [ ] Stuck saga recovery scheduler
+
+---
+
+## Adım adım build plan
+
+Sekiz görev var: ilk dördü event pipeline'ını kurar, son dördü distributed transaction ve doğrulamayı sağlar.
+
+```mermaid
+flowchart LR
+    subgraph Pipeline["Event pipeline"]
+        direction LR
+        G1["Gorev 1<br/>Kafka stack"] --> G2["Gorev 2<br/>Publisher ve outbox"] --> G3["Gorev 3<br/>3 consumer"] --> G4["Gorev 4<br/>DLT setup"]
+    end
+    subgraph Ileri["Saga ve dogrulama"]
+        direction LR
+        G5["Gorev 5<br/>Cross-bank saga"] --> G6["Gorev 6<br/>Schema Registry"] --> G7["Gorev 7<br/>Kasten kirma"] --> G8["Gorev 8<br/>Integration test"]
+    end
+    G4 --> G5
+```
+
+### Görev 1 — Kafka stack docker-compose (yarım gün)
+
+**Ne yapacaksın:** KRaft mode Kafka + Schema Registry + Kafka UI'ı compose ile ayağa kaldırıp 7 topic yaratacaksın. **Neden:** Tüm event backbone bunun üstünde çalışacak; ZooKeeper'sız KRaft modern ve tek-node lokal için en sade kurulum.
+
+Compose'un kalbi Kafka broker'ının KRaft env bloğu — broker ve controller rolünü aynı node üstlenir, auto topic creation kapalı (topic'leri bilerek yaratacaksın):
+
+```yaml
+kafka:
+  image: confluentinc/cp-kafka:7.5.0
+  environment:
+    KAFKA_NODE_ID: 1
+    KAFKA_PROCESS_ROLES: 'broker,controller'
+    KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:9093'
+    KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    CLUSTER_ID: 'banking-cluster-001'
+```
+
+Schema Registry (`8081`) ve Kafka UI (`8090`) servisleri broker'a bağlanır. Tam compose aşağıda.
+
+<details>
+<summary>Tam kod: docker-compose.kafka.yml (~54 satır)</summary>
 
 ```yaml
 # docker-compose.kafka.yml
@@ -54,7 +127,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-  
+
   schema-registry:
     image: confluentinc/cp-schema-registry:7.5.0
     container_name: banking-schema-registry
@@ -67,7 +140,7 @@ services:
       SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
     ports:
       - "8081:8081"
-  
+
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: banking-kafka-ui
@@ -81,48 +154,48 @@ services:
       - "8090:8080"
 ```
 
-### 1.2 Topics yarat
+</details>
+
+Stack ayağa kalkınca 4 banking topic'i (10 partition) + 3 DLT topic'i yaratıyorsun:
 
 ```bash
-docker compose -f docker-compose.kafka.yml up -d
+docker compose -f docker-compose.kafka.yml up -d && sleep 30
 
-# Wait healthy
-sleep 30
-
-# Banking topics
 for topic in banking.transfers banking.audit banking.notifications banking.fraud.alerts; do
     docker exec banking-kafka kafka-topics --bootstrap-server localhost:9092 \
         --create --topic $topic --partitions 10 --replication-factor 1 \
         --config min.insync.replicas=1
 done
 
-# DLT topics
 for topic in banking.transfers.DLT banking.audit.DLT banking.notifications.DLT; do
     docker exec banking-kafka kafka-topics --bootstrap-server localhost:9092 \
         --create --topic $topic --partitions 3 --replication-factor 1
 done
-
-# Verify
-docker exec banking-kafka kafka-topics --bootstrap-server localhost:9092 --list
 ```
 
-Kafka UI: `http://localhost:8090` — topic'leri gör.
+Kontrol noktası: `kafka-topics --list` 7 topic gösteriyor, healthcheck yeşil, Kafka UI (`http://localhost:8090`) topic'leri listeliyor.
 
-### Deliverables
+### Görev 2 — TransferEventPublisher + Outbox (1.5 gün)
 
-- [ ] Kafka KRaft mode docker-compose
-- [ ] Schema Registry container
-- [ ] Kafka UI (provectuslabs)
-- [ ] 7 topic yaratıldı
-- [ ] Healthcheck passing
+**Ne yapacaksın:** `TransferService`'i outbox tablosuna 3 event yazacak şekilde refactor edip polling'li `OutboxPublisher`'ı ekleyeceksin. **Neden:** DB'ye yaz + Kafka'ya gönder ayrı iki işlemdir (**dual-write**); biri başarılı olup diğeri başarısız olursa veri tutarsızlaşır. **Outbox pattern** bu iki yazmayı tek DB transaction'ına indirger.
 
----
+Akış şu: transfer ve outbox event'leri tek transaction'da commit olur, publisher outbox'ı ayrı süreçte Kafka'ya taşır.
 
-## Görev 2 — TransferEventPublisher + Outbox (1.5 gün)
+```mermaid
+flowchart LR
+    T["Transfer istegi"] --> TX["Tek DB transaction"]
+    TX --> W1["accounts guncelle"]
+    TX --> W2["outbox_events insert PENDING"]
+    W2 --> P["Publisher polling SKIP LOCKED"]
+    P --> KP["Kafka publish"]
+    KP --> M["outbox status PUBLISHED"]
+```
 
-### 2.1 Outbox migration
+```admonish warning title="Dual-write neden veri kaybettirir"
+`transferRepo.save()` sonra `kafkaTemplate.send()` çağırırsan, save commit olup send öncesi Kafka düşerse: transfer DB'de var, event Kafka'da yok. Notification/audit/fraud hiç tetiklenmez. Bu senaryoyu Görev 7.1'de bilerek reproduce edeceksin.
+```
 
-`V_outbox_events.sql` (Topic 6.6):
+Önce outbox migration'ı — `status` üstünde partial index polling'i hızlandırır:
 
 ```sql
 CREATE TABLE outbox_events (
@@ -136,31 +209,45 @@ CREATE TABLE outbox_events (
     published_at    TIMESTAMP WITH TIME ZONE,
     failure_count   INT DEFAULT 0,
     last_error      TEXT,
-    
     CONSTRAINT chk_outbox_status CHECK (status IN ('PENDING', 'PUBLISHED', 'FAILED'))
 );
 
 CREATE INDEX idx_outbox_pending ON outbox_events(status, created_at) WHERE status = 'PENDING';
 ```
 
-### 2.2 TransferService refactor
+`TransferService`'in kritik bloğu: domain değişikliği ile 3 outbox event'i <mark>aynı `@Transactional` içinde</mark> yazılır — atomicity DB transaction'ından gelir, ekstra koordinasyona gerek yoktur.
+
+```java
+Transfer transfer = transferRepo.save(new Transfer(req, userId));
+
+// Outbox events — aynı transaction
+outboxEventService.publish("Transfer", transfer.getId().toString(),
+    "TransferCompleted", new TransferCompletedEvent(transfer));
+outboxEventService.publish("Audit", transfer.getId().toString(),
+    "AuditLog", new AuditLogEvent("TRANSFER_EXECUTED", userId, transfer.getId()));
+outboxEventService.publish("Notification", transfer.getToAccountId().toString(),
+    "NotificationRequest", new NotificationRequest(transfer));
+```
+
+<details>
+<summary>Tam kod: TransferService.execute (~38 satır)</summary>
 
 ```java
 @Service
 @Slf4j
 public class TransferService {
-    
+
     private final AccountRepository accountRepo;
     private final TransferRepository transferRepo;
     private final OutboxEventService outboxEventService;
-    
+
     @Transactional
     public Transfer execute(TransferRequest req, UUID userId) {
         // Idempotency check
         if (transferRepo.existsByIdempotencyKey(req.idempotencyKey())) {
             return transferRepo.findByIdempotencyKey(req.idempotencyKey()).orElseThrow();
         }
-        
+
         // Domain
         Account from = accountRepo.findByIdAndLock(req.fromAccountId()).orElseThrow();
         Account to = accountRepo.findByIdAndLock(req.toAccountId()).orElseThrow();
@@ -168,50 +255,59 @@ public class TransferService {
         to.deposit(req.amount(), req.currency());
         accountRepo.save(from);
         accountRepo.save(to);
-        
+
         Transfer transfer = transferRepo.save(new Transfer(req, userId));
-        
+
         // Outbox events — same transaction
         outboxEventService.publish("Transfer", transfer.getId().toString(),
             "TransferCompleted", new TransferCompletedEvent(transfer));
-        
         outboxEventService.publish("Audit", transfer.getId().toString(),
             "AuditLog", new AuditLogEvent("TRANSFER_EXECUTED", userId, transfer.getId()));
-        
         outboxEventService.publish("Notification", transfer.getToAccountId().toString(),
             "NotificationRequest", new NotificationRequest(transfer));
-        
+
         return transfer;
     }
 }
 ```
 
-### 2.3 OutboxPublisher
+</details>
 
-Topic 6.6'da detaylı kod. Polling + ShedLock + FOR UPDATE SKIP LOCKED.
+`OutboxPublisher` (Topic 6.6'da detaylı kod) PENDING satırları poll eder; multi-instance güvenliği için **ShedLock** ile scheduler'ı tek instance'a kilitler, satır seçiminde `FOR UPDATE SKIP LOCKED` kullanır. Başarılı publish sonrası satır `PUBLISHED` olur.
 
-### Deliverables
+Kontrol noktası: rollback test (transfer fail → outbox 0 event) ve happy path (transfer success → outbox 3 event PENDING → publisher → 3 event PUBLISHED) geçiyor.
 
-- [ ] Outbox migration uygulandı
-- [ ] TransferService 3 outbox event same TX
-- [ ] OutboxPublisher polling + ShedLock
-- [ ] Rollback test: transfer fail → outbox 0 event
-- [ ] Happy path test: transfer success → outbox 3 event PENDING → publisher publish PUBLISHED
+### Görev 3 — 3 Consumer Service (2 gün)
 
----
+**Ne yapacaksın:** Notification, audit ve fraud consumer'larını yazacaksın; ilk ikisi idempotent, üçüncüsü Kafka Streams tabanlı. **Neden:** Aynı event akışını bağımsız üç servis paralel tüketir — biri yavaşlarsa diğerleri etkilenmez. Ama <mark>Kafka at-least-once teslim eder: aynı mesaj tekrar gelebilir</mark>, bu yüzden yan etkiyi tekilleştirmek zorundasın.
 
-## Görev 3 — 3 Consumer Service (2 gün)
+```admonish tip title="Idempotent consumer anahtarı"
+**Outbox event ID'si consumer tarafında idempotency key'dir.** Her consumer group işlediği event ID'yi `processed_events`'e yazar; aynı ID ikinci kez gelirse işlemeden `ack` eder. Böylece SMS iki kez gitmez, audit iki kez yazılmaz. Offset commit `MANUAL_IMMEDIATE` olmalı ki ack kontrolü sende kalsın.
+```
 
-### 3.1 NotificationConsumer
+`NotificationConsumer`'ın kritik bloğu: önce `processed_events` kontrolü, sonra yan etki, sonra kayıt + ack. `X-Trace-Id` header'ı MDC'ye taşınır ki tüm consumer log'ları korelasyona girsin:
+
+```java
+if (processedRepo.existsByEventIdAndConsumerGroup(eventId, "notification-service")) {
+    ack.acknowledge();
+    return;
+}
+notificationService.sendTransferNotification(event);
+processedRepo.save(new ProcessedEvent(eventId, "notification-service"));
+ack.acknowledge();
+```
+
+<details>
+<summary>Tam kod: NotificationConsumer (~37 satır)</summary>
 
 ```java
 @Component
 @Slf4j
 public class NotificationConsumer {
-    
+
     private final NotificationService notificationService;
     private final ProcessedEventRepository processedRepo;
-    
+
     @KafkaListener(
         topics = "banking.transfer.transfer-completed",
         groupId = "notification-service",
@@ -226,15 +322,15 @@ public class NotificationConsumer {
         MDC.put("traceId", traceId);
         try {
             UUID eventId = event.getId();
-            
+
             if (processedRepo.existsByEventIdAndConsumerGroup(eventId, "notification-service")) {
                 ack.acknowledge();
                 return;
             }
-            
+
             notificationService.sendTransferNotification(event);
             processedRepo.save(new ProcessedEvent(eventId, "notification-service"));
-            
+
             ack.acknowledge();
         } finally {
             MDC.clear();
@@ -243,241 +339,144 @@ public class NotificationConsumer {
 }
 ```
 
-### 3.2 AuditConsumer
+</details>
+
+`AuditConsumer` aynı iskeleti daha sade uygular — event ID kontrolü + kayıt + ack:
 
 ```java
-@Component
-public class AuditConsumer {
-    
-    @KafkaListener(topics = "banking.audit.audit-log", groupId = "audit-service")
-    @Transactional
-    public void consume(@Payload AuditLogEvent event, Acknowledgment ack) {
-        if (auditRepo.existsByEventId(event.getId())) {
-            ack.acknowledge();
-            return;
-        }
-        
-        auditRepo.save(AuditRecord.from(event));
+@KafkaListener(topics = "banking.audit.audit-log", groupId = "audit-service")
+@Transactional
+public void consume(@Payload AuditLogEvent event, Acknowledgment ack) {
+    if (auditRepo.existsByEventId(event.getId())) {
         ack.acknowledge();
+        return;
     }
+    auditRepo.save(AuditRecord.from(event));
+    ack.acknowledge();
 }
 ```
 
-### 3.3 FraudConsumer (Kafka Streams)
+`FraudConsumer` **Kafka Streams** ile (Topic 6.5). Transfer stream'ini account'a göre key'ler, 1 dakikalık window'da sayar; eşiği aşan account'a CRITICAL alert üretir. Topology:
 
-Topic 6.5'teki fraud pipeline. Real-time alert generation.
+```mermaid
+flowchart LR
+    S["banking.transfers stream"] --> KB["Key by account"]
+    KB --> WIN["1 dk window"]
+    WIN --> CNT["Count per account"]
+    CNT --> TH{"5+ tx mi"}
+    TH -- "evet" --> AL["Fraud alert CRITICAL"]
+    TH -- "hayir" --> OK["Devam"]
+```
 
-### Deliverables
+Kontrol noktası: aynı event iki kez gönderilince notification/audit tek kez işleniyor; 1 dakikada 5+ transfer yapan account için `banking.fraud.alerts`'e CRITICAL alert düşüyor; `X-Trace-Id` consumer log'larında görünüyor.
 
-- [ ] 3 consumer service
-- [ ] Idempotent consumer pattern (processed_events)
-- [ ] Header propagation (X-Trace-Id → MDC)
-- [ ] DefaultErrorHandler + DLT
-- [ ] Fraud detection: 5+ tx/dk → CRITICAL alert
+### Görev 4 — DLT setup (yarım gün)
 
----
+**Ne yapacaksın:** `DefaultErrorHandler` + Dead Letter Topic + DLT monitor consumer kuracaksın. **Neden:** Zehirli bir mesaj (deserialize edilemeyen, sürekli fail eden) main partition'ı sonsuza kadar tıkar. **DLT** başarısız mesajı yan kanala alır, ana akış devam eder, ops ekibi haberdar olur.
 
-## Görev 4 — DLT setup (yarım gün)
-
-DefaultErrorHandler + DLT consumer + alert (Topic 6.4).
+`DltMonitor` üç DLT topic'ini dinler, kaydı saklar ve alert atar:
 
 ```java
-@Component
-public class DltMonitor {
-    
-    @KafkaListener(topics = {"banking.transfers.DLT", "banking.audit.DLT", "banking.notifications.DLT"})
-    public void onDlt(ConsumerRecord<String, String> record) {
-        log.error("DLT message: topic={}, value={}", record.topic(), record.value());
-        
-        dlqRepo.save(new DeadLetterRecord(record.topic(), record.value()));
-        notifier.alertOps("DLT: " + record.topic());
-    }
+@KafkaListener(topics = {"banking.transfers.DLT", "banking.audit.DLT", "banking.notifications.DLT"})
+public void onDlt(ConsumerRecord<String, String> record) {
+    log.error("DLT message: topic={}, value={}", record.topic(), record.value());
+    dlqRepo.save(new DeadLetterRecord(record.topic(), record.value()));
+    notifier.alertOps("DLT: " + record.topic());
 }
 ```
 
-### Deliverables
+Kontrol noktası: invalid event gönder → 3 retry → DLT'ye route → `DltMonitor` kaydeder → ops alert tetiklenir.
 
-- [ ] 3 DLT topic
-- [ ] DltMonitor consumer
-- [ ] Failure simulation: invalid event → 3 retry → DLT → alert
+### Görev 5 — Cross-bank Saga (2 gün)
 
----
+**Ne yapacaksın:** Cross-bank transfer için persistent state'li bir **Saga** orchestrator'ı, async API ve compensation flow ile yazacaksın. **Neden:** Farklı bankalar arası transferde tek DB transaction'ı yok; 2PC banking'de kabul edilmez (kilitler, kırılganlık). Saga her adımı ayrı local transaction yapar, hata olursa **compensation** ile geri sarar.
 
-## Görev 5 — Cross-bank Saga (2 gün)
+```admonish warning title="Saga state persistent olmalı"
+**In-memory saga state banking'de yasaktır** — instance restart olunca yürüyen tüm saga'lar kaybolur. State `saga_states` tablosunda tutulur; her Kafka listener state'i ilerletir, stuck saga recovery scheduler timeout'a düşen saga'ları yakalar.
+```
 
-Topic 6.7'de detaylı kod. Full implementation:
-- SagaStateRepository
-- CrossBankTransferSaga orchestrator
-- 6 Kafka listener
-- Compensation flow
-- Stuck saga recovery scheduler
-- Async API (202 Accepted + GET status)
+API async: `POST` hemen `202 Accepted` + status URL döner, işlem arkada yürür; client status'u polling'le öğrenir. Bu banking UX'inde eventual consistency'nin doğru sunumudur.
 
 ```java
-@RestController
-@RequestMapping("/v1/cross-bank-transfers")
-public class CrossBankTransferController {
-    
-    @Autowired CrossBankTransferSaga saga;
-    @Autowired SagaStateRepository sagaRepo;
-    
-    @PostMapping
-    public ResponseEntity<SagaCreatedResponse> initiate(
-            @Valid @RequestBody CrossBankTransferRequest req) {
-        UUID sagaId = saga.initiate(req);
-        return ResponseEntity.accepted()
-            .body(new SagaCreatedResponse(sagaId, "/v1/sagas/" + sagaId));
-    }
-    
-    @GetMapping("/{sagaId}/status")
-    public SagaStatusResponse getStatus(@PathVariable UUID sagaId) {
-        SagaState state = sagaRepo.findById(sagaId).orElseThrow();
-        return new SagaStatusResponse(state.getCurrentState(), state.getUpdatedAt());
-    }
+@PostMapping
+public ResponseEntity<SagaCreatedResponse> initiate(
+        @Valid @RequestBody CrossBankTransferRequest req) {
+    UUID sagaId = saga.initiate(req);
+    return ResponseEntity.accepted()
+        .body(new SagaCreatedResponse(sagaId, "/v1/sagas/" + sagaId));
+}
+
+@GetMapping("/{sagaId}/status")
+public SagaStatusResponse getStatus(@PathVariable UUID sagaId) {
+    SagaState state = sagaRepo.findById(sagaId).orElseThrow();
+    return new SagaStatusResponse(state.getCurrentState(), state.getUpdatedAt());
 }
 ```
 
-### Deliverables
+Full implementation (Topic 6.7'de detaylı): `SagaStateRepository`, `CrossBankTransferSaga` orchestrator, 6 Kafka listener (4 step + compensation), stuck saga recovery scheduler (5 dk timeout), mock external bank servisleri (Bank A, Bank B, FX, Audit, Notification).
 
-- [ ] saga_states migration
-- [ ] CrossBankTransferSaga orchestrator
-- [ ] 6 step + compensation
-- [ ] Mock external bank servisleri (Bank A, Bank B, FX, Audit, Notification)
-- [ ] Stuck saga scheduler (5 min timeout)
-- [ ] Async API + status polling
-- [ ] Happy path + compensation test
+Kontrol noktası: `saga_states` migration uygulandı; happy path (4 step tamamlanır, status COMPLETED) ve compensation path (bir step fail → önceki step'ler geri sarılır) testleri geçiyor; stuck saga scheduler timeout'a düşen saga'yı yakalıyor.
 
----
+### Görev 6 — Schema Registry + Avro (1 gün, opsiyonel ileri)
 
-## Görev 6 — Schema Registry + Avro (1 gün, opsiyonel ileri)
-
-Avro schema'lar tanımla, `xjc` ile Java class generate, JSON → Avro migration.
+**Ne yapacaksın:** 4 event için Avro schema tanımlayıp Schema Registry'e register eder, producer/consumer'ı Avro serializer'a taşırsın. **Neden:** JSON'da schema garantisi yok — bozuk bir field production'da consumer'ı kırar. Avro + Schema Registry schema evolution'ı (backward-compatible field ekleme) compile-time garanti eder.
 
 ```bash
 mvn avro:schema
 ```
 
-### Deliverables (opsiyonel)
+Kontrol noktası (opsiyonel): 4 Avro schema (TransferCompleted, AuditLog, NotificationRequest, FraudAlert) register edildi; producer + consumer Avro serializer kullanıyor; backward-compatible field ekleme testi geçiyor.
 
-- [ ] 4 Avro schema (TransferCompleted, AuditLog, NotificationRequest, FraudAlert)
-- [ ] Schema Registry'e register
-- [ ] Producer + Consumer Avro serializer
-- [ ] Schema evolution test (backward compatible field add)
+### Görev 7 — Kasten kırma görevleri (1 gün)
 
----
+**Ne yapacaksın:** 5 patolojik senaryoyu önce bug'lı yazıp reproduce edecek, sonra pattern ile düzelteceksin. **Neden:** Banking'de deneyim = bug'la dans. Production'da göreceğin veri kaybı ve mükerrer işlemleri burada kontrollü ortamda üretip teşhis edersen, "neden bu pattern şart" sorusuna kanıtla cevap verirsin. Her biri için **defterine** before/after notu düş.
 
-## Görev 7 — Kasten kırma görevleri (1 gün)
+**7.1 — Dual-write reproduction:** Önce outbox olmadan `transferRepo.save()` + `kafkaTemplate.send()` yaz. Kafka'yı durdur → transfer DB'de var, event Kafka'da yok. Veri kaybı reproduce oldu. Outbox ekle → fix.
 
-### 7.1 Dual-write reproduction (outbox YOK)
+**7.2 — Consumer crash mid-processing:** Consumer event'i aldı, %50 işledi, crash. Offset commit yok → restart'ta yeniden işler. Idempotency olmadan SMS 2 kez gider. `processed_events` ekle → fix.
 
-İlk önce **outbox olmadan** dual-write yap:
+**7.3 — Exactly-once test:** `producer.send` sonrası network glitch retry → consumer 2 mesaj alır. `processing.guarantee=exactly_once_v2` ekle → consumer tek mesaj görür. <mark>`exactly_once_v2` transactional producer + read_committed consumer + idempotent consumer üçlüsüdür.</mark>
 
-```java
-@Transactional
-public void transferWithoutOutbox(req) {
-    transferRepo.save(...);
-    kafkaTemplate.send("banking.transfers", event);   // dual-write
-}
-```
+**7.4 — Outbox publisher race:** 3 publisher instance, `findByStatus(PENDING)` lock'suz → üçü aynı event'i alır → Kafka'ya 3 kez gönderir. <mark>`FOR UPDATE SKIP LOCKED` her event'in tek instance'a düşmesini garanti eder</mark> → fix sonrası her event bir kez publish edilir.
 
-Kafka stop → transfer DB'de var, event Kafka'da YOK. **Veri kaybı reproduce**.
+**7.5 — Saga compensation idempotency:** `reverseDebit` check'siz → network retry → compensation 2 kez → double credit. `reversedTxRepo` check ekle → idempotent compensation.
 
-Sonra outbox ekle → fix.
+Kontrol noktası: 5 reprodüksiyon + fix tamamlandı; her birinin before/after notu defterinde; her biri için "banking'de neden bu pattern şart" tek cümleyle yazılı.
 
-### 7.2 Consumer crash mid-processing
+### Görev 8 — Integration test suite (1 gün)
 
-Consumer event aldı, process'i %50 yaptı, crash. Offset commit YOK → restart'ta yeniden process.
+**Ne yapacaksın:** `@SpringBootTest` + `@Testcontainers` (KafkaContainer + PostgreSQLContainer) ile 15+ integration test yazacaksın. **Neden:** Event-driven akış mock'la doğrulanamaz — gerçek Kafka + gerçek Postgres olmadan idempotency, DLT routing ve saga davranışı kanıtlanmaz.
 
-Idempotency olmadan → side effect 2 kez (SMS 2 kez gönder).
+<details>
+<summary>Test senaryoları (15+ test)</summary>
 
-processed_events ekle → fix.
+- `TransferService` outbox test (Görev 2)
+- `OutboxPublisher` publish test (Görev 2)
+- `NotificationConsumer` idempotency test (Görev 3)
+- `AuditConsumer` test
+- `FraudConsumer` Kafka Streams `TopologyTestDriver` test
+- DLT routing test (Görev 4)
+- `CrossBankSaga` happy path test
+- `CrossBankSaga` compensation test
+- End-to-end: HTTP transfer → outbox → 3 consumer → side effects
+- 5 kasten kırma senaryosunun (Görev 7) reprodüksiyon + fix testleri
 
-### 7.3 Exactly-once test
+</details>
 
-```java
-// Without exactly_once_v2
-producer.send(event);
-// Network glitch, retry
-// Consumer 2 mesaj alır
-```
-
-`processing.guarantee=exactly_once_v2` ekle → consumer tek mesaj.
-
-### 7.4 Outbox publisher race
-
-3 publisher instance, FOR UPDATE SKIP LOCKED **olmadan**:
-
-```java
-List<OutboxEvent> pending = outboxRepo.findByStatus(PENDING);   // ❌ no lock
-```
-
-3 publisher aynı event'i alır → Kafka'ya 3 kez gönderir.
-
-SKIP LOCKED ile fix → her event bir kez.
-
-### 7.5 Saga compensation idempotency
-
-```java
-public void reverseDebit(UUID txId) {
-    // ❌ no check
-    accountService.credit(txId, amount);
-}
-```
-
-Network retry → compensation 2 kez → double credit.
-
-`reversedTxRepo` check ekle → idempotent.
-
-### Deliverables
-
-- [ ] 5 kasten kırma reproduction + fix
-- [ ] Her birinin **defterimde** before/after notu
-- [ ] Banking için "neden bu pattern şart" anlatımı
+Kontrol noktası: `mvn verify` 15+ test'i geçiyor, end-to-end test HTTP transfer'den 3 consumer'ın side effect'ine kadar tüm zinciri doğruluyor.
 
 ---
 
-## Görev 8 — Integration test suite (1 gün)
+## Pratik desteği
 
-`@SpringBootTest + @Testcontainers + KafkaContainer + PostgreSQLContainer`:
+Projeyi bitirdim dediğin an, aşağıdaki prompt'la Claude'a kapsamlı bir audit yaptır — kör noktalarını böyle yakalarsın.
 
-- TransferService outbox test (Görev 2)
-- OutboxPublisher publish test (Görev 2)
-- NotificationConsumer idempotency test (Görev 3)
-- AuditConsumer test
-- FraudConsumer Kafka Streams TopologyTestDriver test
-- DLT routing test
-- CrossBankSaga happy path test
-- CrossBankSaga compensation test
-- End-to-end test: HTTP transfer → outbox → 3 consumer → side effects
-
-Toplam 15+ integration test.
-
----
-
-## Acceptance criteria
-
-- [ ] Kafka KRaft stack docker-compose ile çalışıyor
-- [ ] Schema Registry + Kafka UI accessible
-- [ ] Transfer endpoint → outbox 3 event → Kafka publish chain
-- [ ] 3 consumer service (notification, audit, fraud) mesajları işliyor
-- [ ] Idempotent consumer pattern (processed_events) — duplicate skip
-- [ ] DLT setup ile error recovery + ops alert
-- [ ] Kafka Streams ile real-time fraud detection (5+ tx/dk)
-- [ ] Cross-bank Saga orchestration (4 step + compensation)
-- [ ] Outbox pattern dual-write çözüm
-- [ ] Multi-instance OutboxPublisher (SKIP LOCKED no duplicates)
-- [ ] exactly_once_v2 active
-- [ ] 5 kasten kırma reproduction + fix
-- [ ] 15+ integration test passing
-- [ ] Async API + status polling cross-bank
-- [ ] Stuck saga recovery scheduler
-
----
-
-## Claude-verify prompt
+<details>
+<summary>Claude-verify prompt (mini-project bütünü için)</summary>
 
 ```
-Event-driven banking project'imi banking-grade kriterlere göre değerlendir:
+Event-driven banking project'imi banking-grade kriterlere göre değerlendir.
+Her madde için PASS / FAIL / EKSIK işaretle, kanıt göster (file path veya code reference):
 
 1. Kafka setup:
    - KRaft mode (no ZooKeeper)?
@@ -540,9 +539,13 @@ Event-driven banking project'imi banking-grade kriterlere göre değerlendir:
 Her madde için PASS / FAIL / EKSIK işaretle, kanıt göster (file path veya code reference).
 ```
 
+</details>
+
 ---
 
 ## Defter notları (20 madde)
+
+Her maddenin boşluğunu kendi deneyiminle doldur — bunlar mülakatta sorulacak sorular.
 
 1. "Dual-write probleminin 3 patolojik senaryosu — canlı reproduce ettim: ____."
 2. "Outbox pattern atomicity DB transaction'ından gelir — açıklama: ____."
@@ -564,3 +567,14 @@ Her madde için PASS / FAIL / EKSIK işaretle, kanıt göster (file path veya co
 18. "Outbox event ID = consumer idempotency key — pattern detayı: ____."
 19. "Eventual consistency UX (transfer immediate, notification delayed) — kullanıcı feedback'i: ____."
 20. "TR bank batch (Phase 5) + event-driven (Phase 6) hybrid mimari: ____."
+
+---
+
+```admonish success title="Proje Tamamlama Kriterleri"
+- Kafka KRaft stack docker-compose ile çalışıyor, Schema Registry + Kafka UI erişilebilir, 7 topic yaratıldı
+- Transfer endpoint → outbox 3 event (same TX) → OutboxPublisher (ShedLock + SKIP LOCKED) → Kafka publish chain çalışıyor
+- 3 consumer (notification, audit, fraud) mesajları işliyor; idempotent consumer pattern duplicate'i skip ediyor; DLT + ops alert kurulu
+- Kafka Streams real-time fraud detection (5+ tx/dk → CRITICAL) ve cross-bank Saga (4 step + compensation + async API + stuck recovery) çalışıyor
+- `exactly_once_v2` aktif; 5 kasten kırma reprodüksiyonu (dual-write, consumer crash, publisher race, exactly-once, compensation) + fix dokümante
+- `mvn verify` 15+ integration test'i geçiyor; end-to-end HTTP → outbox → Kafka → consumer testi yeşil
+```

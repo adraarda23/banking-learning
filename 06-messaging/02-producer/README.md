@@ -1,12 +1,20 @@
 # Topic 6.2 — Kafka Producer Design
 
+```admonish info title="Bu bölümde"
+- `acks=0/1/all` durability farkı ve banking'in neden yalnızca `acks=all` + `min.insync.replicas=2` + `replication.factor=3` kullandığı
+- `enable.idempotence`: broker'ın `(PID, sequence)` ile duplicate'i nasıl drop ettiği ve retry'ı neden güvenli yaptığı
+- Transactional producer + `read_committed` consumer ile multi-topic atomic publish ve **exactly-once** semantics
+- Batching, compression ve partition key stratejisi — throughput tuning ve per-key ordering
+- Banking dayanıklılık kalıbı: async callback + outbox fallback, Avro + Schema Registry, error handling matrix ve anti-pattern'ler
+```
+
 ## Hedef
 
-Kafka producer'ı banking-grade seviyede konfigüre etmek. `acks`, `enable.idempotence`, transactional producer, batch tuning, compression, partition key stratejisi, error handling. Banking event publishing (TransferCompleted, FraudDetected, AccountStatusChanged) için **veri kaybı olmayan** producer setup'ı yapabilmek.
+Kafka producer'ı banking-grade seviyede konfigüre etmek. `acks`, `enable.idempotence`, transactional producer, batch tuning, compression, partition key stratejisi ve error handling. Banking event publishing (TransferCompleted, FraudDetected, AccountStatusChanged) için **veri kaybı olmayan** bir producer setup'ı yapabilmek.
 
 ## Süre
 
-Okuma: 2 saat • Mini task: 2 saat • Test: 1 saat • Toplam: ~5 saat
+Okuma: 2 saat • Kendini Sına: 45 dk • Pratik (opsiyonel): 3-4 saat • Toplam: ~2.5 saat (+ pratik)
 
 ## Önbilgi
 
@@ -20,29 +28,46 @@ Okuma: 2 saat • Mini task: 2 saat • Test: 1 saat • Toplam: ~5 saat
 
 ### 1. Producer'ın iç çalışması
 
-KafkaProducer mesajı 4 aşamada gönderir:
+Bir transfer event'ini `send` ettin ama consumer görmüyor — nerede takıldı? Cevabı bilmek için producer'ın pipeline'ını görmen gerekir. KafkaProducer bir mesajı dört aşamada broker'a taşır:
 
-```
-1. Serializer        → byte[] (Avro/JSON/Protobuf)
-2. Partitioner       → partition number (hash(key) % partitions veya custom)
-3. RecordAccumulator → batch (memory buffer)
-4. Sender thread     → network'e batch gönder
+```mermaid
+flowchart LR
+    A["send record"] --> B["Serializer"]
+    B --> C["Partitioner"]
+    C --> D["RecordAccumulator"]
+    D --> E["Sender thread"]
+    E --> F["Broker"]
 ```
 
-**Asenkronluk:** `producer.send(record)` **immediately** döner — accumulator'a koyar. Sender thread asenkron olarak broker'a iletir.
+**Serializer** value'yu `byte[]`'e çevirir (Avro/JSON/Protobuf), **partitioner** partition numarasını hesaplar (`hash(key) % partitions`), **RecordAccumulator** batch'i memory buffer'da biriktirir, **Sender thread** batch'i asenkron olarak network'e gönderir.
+
+Kritik nokta asenkronluk: `producer.send(record)` **hemen** döner — sadece accumulator'a koyar, henüz ack almadı.
 
 ```java
 Future<RecordMetadata> future = producer.send(record);
-// future henüz ack almadı, kuyruga konmuş olabilir
+// future henüz ack almadı, mesaj kuyruğa konmuş olabilir
 ```
 
-Banking impact: `send` döndü diye "yazıldı" denemez. Callback veya `get()` ile ack bekle.
+**Tuzak:** `send` döndü diye "yazıldı" diyemezsin. Ack'i callback veya `get()` ile beklemeden durability yoktur.
 
 ### 2. `acks` — durability vs latency
 
-Producer broker'dan **kaç onay** beklesin?
+Bir transfer event'i yayınlanıp kaybolursa müşteri parası buharlaşmaz ama audit/notification zinciri kopar — regülatör bunu affetmez. Bu yüzden ilk karar: producer broker'dan **kaç onay** beklesin? Üç seçenek durability ile latency arasında farklı yerlerde durur:
 
-#### `acks=0` — fire-and-forget
+```mermaid
+sequenceDiagram
+    participant P as Producer
+    participant L as Leader
+    participant R as ISR Replica
+    P->>L: send record
+    Note over P,L: acks=0 hemen döner, onay beklemez
+    L-->>P: acks=1 leader yazınca döner
+    L->>R: replicate
+    R-->>L: replica ack
+    L-->>P: acks=all tüm ISR yazınca döner
+```
+
+**`acks=0` — fire-and-forget:** Producer broker'ın ack'ini beklemez. En yüksek throughput, en yüksek veri kaybı riski.
 
 ```yaml
 spring:
@@ -51,35 +76,14 @@ spring:
       acks: 0
 ```
 
-Producer broker'ın ack'ini **beklemez**. En yüksek throughput, **en yüksek veri kaybı riski**.
+**`acks=1` — leader ack:** Leader yazdığını ack eder, ama replica'lara kopyalanmadan önce. Leader fail olur, replica henüz almamışsa → mesaj kaybolur. Regulatory durability için yetersiz.
 
-**Banking'de YASAK.** Audit, transaction, notification event'leri kaybolamaz.
+**`acks=all` (veya `-1`) — full ISR ack:** Leader + **tüm in-sync replica'lar (ISR)** yazdı dediğinde ack. En güvenli seçenek. Yanında iki topic config şart:
 
-#### `acks=1` — leader ack
-
-```yaml
-acks: 1
-```
-
-Leader broker yazıldığını ack eder. Replica'lara kopyalanmadan önce.
-
-**Tehlike:** Leader fail olur, replica henüz almamış → mesaj kayıp.
-
-**Banking'de yetersiz.** Regulatory için durability şart.
-
-#### `acks=all` (veya `-1`) — full ISR ack
-
-```yaml
-acks: all
-```
-
-Leader + **all in-sync replicas (ISR)** yazdı dediğinde ack. En güvenli.
-
-Beraberinde:
-- `min.insync.replicas=2` (topic config) — en az 2 replica ISR'da olmalı, yoksa producer fail
+- `min.insync.replicas=2` — en az 2 replica ISR'da olmalı, yoksa producer fail eder
 - `replication.factor=3` — tipik banking setup (1 leader + 2 replica)
 
-**Banking standard:**
+<mark>Banking event'leri veri kaybını tolere edemez; production standardı her zaman acks=all + min.insync.replicas=2 + replication.factor=3'tür.</mark>
 
 ```yaml
 spring:
@@ -90,7 +94,7 @@ spring:
         min.insync.replicas: 2
 ```
 
-Topic create:
+Topic'i bu garantiyle oluştur:
 
 ```bash
 kafka-topics --bootstrap-server kafka:9092 \
@@ -99,11 +103,15 @@ kafka-topics --bootstrap-server kafka:9092 \
   --config min.insync.replicas=2
 ```
 
+```admonish warning title="acks=0 ve acks=1 banking'de yasak"
+`acks=0` audit/transaction/notification event'lerini sessizce düşürebilir. `acks=1` ise leader fail senaryosunda kayıp verir. İkisi de banking için kabul edilemez — tek doğru değer `acks=all`.
+```
+
 ### 3. `enable.idempotence` — retry'a karşı duplicate koruması
 
-**Senaryo:** `acks=all`, broker yazdı, ack producer'a dönerken network glitch. Producer "ack gelmedi" deyip retry → broker'a **2. kez yazılır**.
+`acks=all` durability'yi çözdü ama yeni bir problem doğuyor. Senaryo: broker yazdı, ack producer'a dönerken network glitch oldu. Producer "ack gelmedi" deyip retry eder → broker'a **ikinci kez** yazılır. Aynı transfer için iki notification demek.
 
-**Çözüm:** Idempotent producer.
+Çözüm idempotent producer:
 
 ```yaml
 spring:
@@ -114,45 +122,54 @@ spring:
         enable.idempotence: true
 ```
 
-**Nasıl çalışır:**
+Nasıl çalıştığını bir duplicate senaryosunda izleyelim:
+
+```mermaid
+sequenceDiagram
+    participant P as Producer
+    participant B as Broker
+    P->>B: batch PID 7 seq 42
+    B->>B: yaz ve seq 42 kaydet
+    B--xP: ack kayboldu
+    Note over P: ack gelmedi, retry
+    P->>B: batch PID 7 seq 42 tekrar
+    B->>B: seq 42 zaten var, drop
+    B-->>P: ack
+```
+
+Mekanizma üç adımda işler:
 
 1. Producer her batch'e `Producer ID (PID)` + `sequence number` ekler
 2. Broker per-partition `(PID, sequence)` tracking yapar
-3. Aynı `(PID, sequence)` ikinci kez gelirse → broker **drop** eder
+3. Aynı `(PID, sequence)` ikinci kez gelirse broker **drop** eder
 
-Garanti: Per-partition **exactly-once-write** (per producer session).
+Garanti: per-partition **exactly-once-write** (per producer session). `enable.idempotence=true` aktivasyonu şu ayarları zorunlu kılar:
 
-**Kurallar (`enable.idempotence=true` aktivasyonu):**
 - `acks=all` (otomatik set olur)
-- `retries >= 0` (default Integer.MAX_VALUE)
+- `retries >= 0` (default `Integer.MAX_VALUE`)
 - `max.in.flight.requests.per.connection <= 5`
 
-**Banking standardı:** Her zaman `enable.idempotence=true`. Network glitch real, duplicate notification = customer noise.
+<mark>Banking'de enable.idempotence her zaman açıktır; network glitch gerçektir ve duplicate event, duplicate müşteri notification'ı demektir.</mark>
 
 ### 4. `max.in.flight.requests.per.connection` — ordering vs throughput
 
-Producer bir broker connection'ında **kaç paralel request** uçurabilir.
+Producer bir broker connection'ında **kaç paralel request** uçurabilir? Default 5. Bu ayar masum görünür ama idempotence kapalıyken sıralama bozar.
 
 ```yaml
 max.in.flight.requests.per.connection: 5   # default
 ```
 
-**Tuzak:** `enable.idempotence=false` + `max.in.flight > 1` + `retries > 0` → **out-of-order delivery**.
+**Tuzak:** `enable.idempotence=false` + `max.in.flight > 1` + `retries > 0` → **out-of-order delivery**. M1 ve M2'yi paralel gönderdin, M1 fail edip retry olunca broker'a sıra `M2, M1` olarak düşer.
 
-Senaryo:
+Çözüm yine idempotence: broker sequence number ile mesajları yeniden sıralar, `max.in.flight=5` olsa bile ordering korunur.
+
+```admonish tip title="Ordering + throughput birlikte"
+`enable.idempotence=true` sayesinde `max.in.flight=5` bırakabilirsin: hem yüksek throughput hem per-partition ordering. Account event'lerinin sırası (`Opened` → `Deposited` → `Closed`) banking'de önemlidir; idempotence bu garantiyi throughput'tan feragat etmeden verir.
 ```
-M1 gönder, M2 gönder (parallel)
-M1 fail, retry
-Broker'a sıra: M2, M1, M1
-```
-
-**`enable.idempotence=true` ile fix.** Broker sequence number ile sıralar.
-
-Banking impact: Account event'lerinin sırası önemli (`Opened` → `Deposited` → `Closed`). Idempotence + max.in.flight=5 → hem ordering hem throughput.
 
 ### 5. Batching — throughput optimization
 
-Producer mesajları batch'leyerek gönderir. Batch'ler **per-partition** memory buffer'da birikir.
+Her mesajı tek tek göndermek network'ü boğar. Producer mesajları **per-partition** memory buffer'da batch'ler:
 
 ```yaml
 spring:
@@ -163,7 +180,7 @@ spring:
       buffer-memory: 33554432  # 32MB total accumulator
 ```
 
-**Trade-off:**
+Trade-off latency ile throughput arasındadır:
 
 | Config | Throughput | Latency |
 |---|---|---|
@@ -171,12 +188,14 @@ spring:
 | `batch-size=16384`, `linger-ms=10` | Orta | +10ms |
 | `batch-size=65536`, `linger-ms=50` | Yüksek | +50ms |
 
-**Banking pratiği:**
+Banking pratiğinde seçim event tipine göre yapılır:
 
 - **Low-volume critical events** (TransferCompleted): `batch-size=16384`, `linger-ms=0-5`
 - **High-volume analytics events** (CustomerActivity): `batch-size=65536`, `linger-ms=20-50`
 
 ### 6. Compression
+
+Batch'i sıkıştırmak network ve disk tasarrufu sağlar; küçük bir CPU maliyeti karşılığında büyük kazanç. Compression batch-level çalışır:
 
 ```yaml
 spring:
@@ -184,8 +203,6 @@ spring:
     producer:
       compression-type: lz4   # snappy, gzip, zstd alternatives
 ```
-
-Compression batch-level. CPU cost vs network/disk save.
 
 | Codec | CPU | Ratio | Banking |
 |---|---|---|---|
@@ -195,11 +212,13 @@ Compression batch-level. CPU cost vs network/disk save.
 | `gzip` | Yüksek | 4-5x | High-volume analytics |
 | `zstd` | Orta | 4-6x | Modern, banking trend |
 
-**Banking JSON payloads %50-70 kompres edilir.** Always enable.
+```admonish tip title="Compression her zaman açık olsun"
+Banking JSON payload'ları %50-70 sıkışır. `lz4` düşük CPU ile 2-3x kazanç verir, `zstd` modern setup'larda 4-6x. `none` bırakmak için sebep yok.
+```
 
 ### 7. Transactional producer — multi-event atomicity
 
-Birden fazla event birden gönderiliyor — ya hepsi yazılsın ya hiçbiri.
+Bir transfer üç event üretir: `banking.transfers`, `banking.audit`, `banking.notifications`. Bunlardan biri yazılıp diğeri yazılmazsa audit tutarsız kalır. İhtiyaç: ya hepsi yazılsın ya hiçbiri. Transactional producer tam bunu verir.
 
 ```java
 Properties props = new Properties();
@@ -210,14 +229,14 @@ props.put("transactional.id", "transfer-producer-1");   // UNIQUE per producer i
 
 try (KafkaProducer<String, String> producer = new KafkaProducer<>(props)) {
     producer.initTransactions();
-    
+
     try {
         producer.beginTransaction();
-        
+
         producer.send(new ProducerRecord<>("banking.transfers", transferId, transferEvent));
         producer.send(new ProducerRecord<>("banking.audit", transferId, auditEvent));
         producer.send(new ProducerRecord<>("banking.notifications", recipientId, notificationEvent));
-        
+
         producer.commitTransaction();
     } catch (Exception e) {
         producer.abortTransaction();
@@ -226,9 +245,20 @@ try (KafkaProducer<String, String> producer = new KafkaProducer<>(props)) {
 }
 ```
 
-**Garanti:** Üç event ya **hepsi commit** ya **hiçbiri** consumer'a görünmez.
+Akış commit/abort dallanmasıyla ilerler:
 
-Consumer side:
+```mermaid
+flowchart LR
+    A["initTransactions"] --> B["beginTransaction"]
+    B --> C["send transfers"]
+    C --> D["send audit"]
+    D --> E["send notifications"]
+    E --> F{"hata var mı"}
+    F -->|"hayır"| G["commitTransaction"]
+    F -->|"evet"| H["abortTransaction"]
+```
+
+Garanti: üç event ya **hepsi commit** olur ya **hiçbiri** consumer'a görünmez. Ama bu garanti consumer tarafının da doğru ayarlanmasına bağlı:
 
 ```yaml
 spring:
@@ -237,34 +267,42 @@ spring:
       isolation-level: read_committed
 ```
 
-`read_committed` consumer sadece commit edilmiş transaction event'leri görür.
+`read_committed` consumer sadece commit edilmiş transaction event'lerini görür — abort edilmiş veya yarım kalan mesajlar filtrelenir.
+
+**Exactly-once semantics** tam olarak buradan doğar: idempotent producer per-partition duplicate'i engeller (**exactly-once-write**), transactional producer bunu multi-partition atomicity'ye taşır, `read_committed` consumer da yarım transaction'ları görmez. Üçü birlikte **end-to-end exactly-once** verir.
 
 #### Spring Kafka transactional
+
+Spring'de aynı garantiyi iki bean ile kurarsın — bir transactional producer factory ve bir transaction manager:
 
 ```java
 @Configuration
 public class KafkaTransactionalConfig {
-    
+
     @Bean
     public ProducerFactory<String, Object> transactionalProducerFactory(KafkaProperties props) {
-        DefaultKafkaProducerFactory<String, Object> factory = 
+        DefaultKafkaProducerFactory<String, Object> factory =
             new DefaultKafkaProducerFactory<>(props.buildProducerProperties());
         factory.setTransactionIdPrefix("tx-transfer-");
         return factory;
     }
-    
+
     @Bean
     public KafkaTransactionManager<String, Object> kafkaTransactionManager(
             ProducerFactory<String, Object> producerFactory) {
         return new KafkaTransactionManager<>(producerFactory);
     }
 }
+```
 
+Sonra `@Transactional("kafkaTransactionManager")` ile method'un tüm send'leri tek transaction'a girer:
+
+```java
 @Service
 public class TransferEventPublisher {
-    
+
     @Autowired KafkaTemplate<String, Object> template;
-    
+
     @Transactional("kafkaTransactionManager")
     public void publishMultiple(Transfer transfer, AuditEvent audit, NotificationEvent notif) {
         template.send("banking.transfers", transfer.getId(), transfer);
@@ -274,31 +312,25 @@ public class TransferEventPublisher {
 }
 ```
 
-**DB + Kafka kombine transactional** mümkün değil (different resources). **Outbox pattern** (Topic 6.6) ile çözeriz.
+**Tuzak:** DB + Kafka'yı **tek** transaction'a koyamazsın (farklı resource'lar). Dual-write problemini **Outbox pattern** (Topic 6.6) ile çözeriz.
 
 ### 8. Send modes
 
-#### Fire-and-forget
+Event'i gönderdikten sonra hataları nasıl öğreneceğin, latency ile visibility arasındaki bir seçim. Üç mod var.
+
+**Fire-and-forget** — future ignore edilir, hata feedback'i yok. Sadece durability gerekmeyen event'ler için (heartbeat, debug log). Banking'de nadiren.
 
 ```java
 template.send(record);
-// future ignored, hata feedback yok
 ```
 
-**Sadece** fire-and-forget OK ise: durability gerekli olmayan event'ler (heartbeat, debug log).
-
-**Banking için NADİREN.** Audit/transfer kaybı kabul edilemez.
-
-#### Synchronous
+**Synchronous** — ack gelene kadar bloklar; yavaş ama hata anında görünür.
 
 ```java
 RecordMetadata metadata = template.send(record).get();
-// blocks until ack — yavaş ama hata visibility
 ```
 
-Banking pratiği: **Critical operation** (transfer event)'in immediate kontrolü için sync kullanılabilir. Ama hot path'te yavaş.
-
-#### Async with callback
+**Async with callback** — hot path bloklanmaz, hata callback'te yakalanır. Banking standardı budur:
 
 ```java
 CompletableFuture<SendResult<String, Object>> future = template.send(record);
@@ -306,8 +338,7 @@ CompletableFuture<SendResult<String, Object>> future = template.send(record);
 future.whenComplete((result, ex) -> {
     if (ex != null) {
         log.error("Failed to publish event: {}", record, ex);
-        // Outbox fallback'e yaz, alert
-        outboxFallback.save(record);
+        outboxFallback.save(record);   // eventual delivery garantisi
         meterRegistry.counter("kafka.send.failure").increment();
     } else {
         log.debug("Published: partition={}, offset={}",
@@ -318,52 +349,50 @@ future.whenComplete((result, ex) -> {
 });
 ```
 
-**Banking standard:** Async + callback. Hot path bloklamaz, hata yakalanır.
+<mark>Banking hot path'i Kafka publish'i sync .get() ile bloklamaz; standart async + callback + outbox fallback'tir.</mark>
+
+```admonish warning title="Sync .get() hot path'te tehlikeli"
+API endpoint'inde `template.send(...).get()` çağırırsan, API latency'si doğrudan Kafka publish latency'sine bağlanır. Broker yavaşladığında tüm HTTP request'lerin yavaşlar. Critical bir transfer için nadiren sync kabul edilebilir, ama genel kural async'tir.
+```
 
 ### 9. Partition key seçimi
+
+Aynı hesabın event'leri yanlış sırada consume edilirse `Closed`, `Deposited`'dan önce görünebilir — hesap mantığı bozulur. Partition key bu sıralamayı belirler.
 
 ```java
 template.send("banking.transfers", accountId.toString(), event);
 ```
 
-Partition key = mesajın **partition'ını belirler** (default partitioner: `hash(key) % partitions`).
-
-**Faydası — per-key ordering:**
-
-Aynı `accountId` ile gönderilen tüm event'ler **aynı partition**'a gider. Consumer sıralı tüketir.
+Partition key mesajın partition'ını belirler (default partitioner: `hash(key) % partitions`). Faydası **per-key ordering**: aynı `accountId` ile gönderilen tüm event'ler aynı partition'a gider, consumer sıralı tüketir.
 
 ```
 Partition 0: Acc-A.Opened → Acc-A.Deposited → Acc-A.Withdrawn
 Partition 5: Acc-B.Opened → Acc-B.Deposited → Acc-B.Closed
 ```
 
-`accountId=A` event'lerinin sırası **garanti**. `accountId=B` ile sırası **garanti değil** (farklı partition).
+`accountId=A` event'lerinin sırası garanti; farklı partition'daki `accountId=B` ile arasında sıra garantisi yok. Banking'de doğru key seçimi:
 
-**Banking örneği — doğru key:**
-
-- **TransferCompleted:** key = `fromAccountId` (account perspective)
+- **TransferCompleted:** key = `fromAccountId`
 - **CardTransaction:** key = `cardId`
 - **CustomerActivity:** key = `customerId`
 - **FraudAlert:** key = `accountId`
 
-**Anti-pattern: key = random UUID veya timestamp**
-
-Her event farklı partition'a → ordering yok. Banking event'leri yanlış sırada consume edilebilir.
+<mark>Partition key mutlaka entity ID olmalı — accountId, cardId, customerId — asla random UUID veya timestamp değil, yoksa her event farklı partition'a düşer ve ordering kaybolur.</mark>
 
 #### Custom partitioner
 
-Bazı senaryolarda hash partition yetmez:
+Bazı senaryolarda hash partitioning yetmez — örneğin premium müşterilere dedicated partition ayırmak istersin:
 
 ```java
 public class TenantPartitioner implements Partitioner {
-    
+
     @Override
-    public int partition(String topic, Object key, byte[] keyBytes, 
+    public int partition(String topic, Object key, byte[] keyBytes,
                          Object value, byte[] valueBytes, Cluster cluster) {
         TransferEvent event = (TransferEvent) value;
         String tenant = event.getTenant();
-        
-        // Premium müşteriler için dedicated partition 0-2 (priority)
+
+        // Premium müşteriler için dedicated partition 0-2
         if (event.isPremium()) {
             return Math.abs(tenant.hashCode()) % 3;
         }
@@ -373,19 +402,13 @@ public class TenantPartitioner implements Partitioner {
 }
 ```
 
-Banking: Multi-tenant — tenant başına partition isolation.
+Banking use case: multi-tenant sistemlerde tenant başına partition isolation.
 
 ### 10. Schema Registry + Avro/Protobuf — banking-grade
 
-JSON serialization OK ama:
-- Schema evolution yok
-- Payload büyük
-- Type-safe değil
+JSON serialization çalışır ama üç problemi var: schema evolution yok, payload büyük, type-safe değil. Bir field'ı rename edersen consumer deploy sonrası sessizce kırılır.
 
-**Avro / Protobuf:**
-- Generated Java classes (compile-time type safety)
-- Schema Registry (Confluent veya Apicurio)
-- Backward/forward compatibility check
+**Avro / Protobuf** çözümü: generated Java class'lar (compile-time type safety), Schema Registry (Confluent veya Apicurio) ve backward/forward compatibility check.
 
 ```yaml
 spring:
@@ -396,7 +419,7 @@ spring:
       schema.registry.url: http://schema-registry:8081
 ```
 
-`TransferCompleted.avsc`:
+Schema'yı `.avsc` olarak tanımlarsın — dikkat: `amount` bir `decimal` logical type, banking money handling için doğru tip:
 
 ```json
 {
@@ -414,7 +437,7 @@ spring:
 }
 ```
 
-Maven plugin Java class generate:
+Maven plugin `.avsc`'den Java class üretir:
 
 ```xml
 <plugin>
@@ -433,6 +456,8 @@ Maven plugin Java class generate:
 </plugin>
 ```
 
+Generated class type-safe builder ile kullanılır:
+
 ```java
 TransferCompleted event = TransferCompleted.newBuilder()
     .setTransferId(transferId.toString())
@@ -446,21 +471,51 @@ TransferCompleted event = TransferCompleted.newBuilder()
 template.send("banking.transfers", fromId.toString(), event);
 ```
 
-**Banking adoption:** Modern banking projects → Avro. Eski JSON-based migration trend.
+Banking adoption: modern projeler Avro'ya geçiyor; eski JSON-based sistemler migration trend'inde.
 
 ### 11. Banking örnek — full producer setup
+
+Tüm katmanları bir araya getiren üretim seviyesi bir publisher nasıl görünür? İskeleti kur — Avro-typed template, metrics registry ve outbox repository enjekte edilir:
 
 ```java
 @Component
 @Slf4j
 public class TransferEventPublisher {
-    
+
     private static final String TOPIC = "banking.transfers";
-    
+
     private final KafkaTemplate<String, TransferCompleted> template;
     private final MeterRegistry registry;
     private final OutboxRepository outboxRepo;
-    
+    // constructor injection...
+```
+
+`publish` method'unun kalbi: partition key olarak `fromAccountId` seçilir, async gönderilir:
+
+```java
+    public CompletableFuture<SendResult<String, TransferCompleted>> publish(TransferCompleted event) {
+        String partitionKey = event.getFromAccountId();
+
+        CompletableFuture<SendResult<String, TransferCompleted>> future =
+            template.send(TOPIC, partitionKey, event);
+```
+
+Callback iki dallı: hata olursa outbox'a düşer (guaranteed eventual delivery) ve failure metric artar; başarıda success + latency metric'leri yazılır. Tam listing katlanmış duruyor:
+
+<details>
+<summary>Tam kod: TransferEventPublisher (~55 satır)</summary>
+
+```java
+@Component
+@Slf4j
+public class TransferEventPublisher {
+
+    private static final String TOPIC = "banking.transfers";
+
+    private final KafkaTemplate<String, TransferCompleted> template;
+    private final MeterRegistry registry;
+    private final OutboxRepository outboxRepo;
+
     public TransferEventPublisher(
             KafkaTemplate<String, TransferCompleted> template,
             MeterRegistry registry,
@@ -469,19 +524,19 @@ public class TransferEventPublisher {
         this.registry = registry;
         this.outboxRepo = outboxRepo;
     }
-    
+
     public CompletableFuture<SendResult<String, TransferCompleted>> publish(TransferCompleted event) {
         String partitionKey = event.getFromAccountId();
-        
+
         log.debug("Publishing transfer event: id={}, key={}", event.getTransferId(), partitionKey);
-        
-        CompletableFuture<SendResult<String, TransferCompleted>> future = 
+
+        CompletableFuture<SendResult<String, TransferCompleted>> future =
             template.send(TOPIC, partitionKey, event);
-        
+
         future.whenComplete((result, ex) -> {
             if (ex != null) {
                 log.error("Failed to publish transfer event: id={}", event.getTransferId(), ex);
-                
+
                 // Outbox fallback — guaranteed eventual delivery
                 outboxRepo.save(new OutboxEvent(
                     event.getTransferId(),
@@ -490,26 +545,28 @@ public class TransferEventPublisher {
                     serializeAvro(event),
                     OutboxStatus.PENDING
                 ));
-                
+
                 registry.counter("kafka.publish.failure", "topic", TOPIC).increment();
             } else {
                 log.debug("Published successfully: id={}, partition={}, offset={}",
                     event.getTransferId(),
                     result.getRecordMetadata().partition(),
                     result.getRecordMetadata().offset());
-                
+
                 registry.counter("kafka.publish.success", "topic", TOPIC).increment();
                 registry.summary("kafka.publish.latency", "topic", TOPIC)
                     .record(System.currentTimeMillis() - event.getOccurredAt());
             }
         });
-        
+
         return future;
     }
 }
 ```
 
-Production config:
+</details>
+
+Production config bu bölümdeki tüm kararları tek yerde toplar — `acks=all`, idempotence, batch/linger tuning, lz4 compression ve Schema Registry:
 
 ```yaml
 spring:
@@ -534,16 +591,18 @@ spring:
 
 ### 12. Error handling matrix
 
+Publish fail edince ne yapacağın exception tipine bağlıdır — hepsini aynı şekilde ele alırsan ya event kaybedersin ya sonsuz retry'a girersin:
+
 | Exception | Anlamı | Strateji |
 |---|---|---|
 | `RetriableException` | Geçici (network, leader change) | Auto-retry (producer içinde) |
 | `TimeoutException` | `delivery.timeout.ms` aşıldı | Outbox fallback |
-| `RecordTooLargeException` | Mesaj `max.request.size`'tan büyük | Sızdırma — DLQ |
+| `RecordTooLargeException` | Mesaj `max.request.size`'tan büyük | DLQ |
 | `SerializationException` | Avro/JSON serialize fail | DLQ, code bug |
 | `AuthenticationException` | mTLS/SASL fail | Alert ops |
 | `AuthorizationException` | Topic ACL deny | Alert ops |
 
-Banking pattern:
+Callback'te bu matrix'i tipe göre uygularsın:
 
 ```java
 future.whenComplete((result, ex) -> {
@@ -562,15 +621,13 @@ future.whenComplete((result, ex) -> {
 
 ### 13. Banking anti-pattern'leri
 
-**Anti-pattern 1: `acks=0` veya `acks=1` banking event'inde**
+Mülakatta "bu producer kodunda ne yanlış?" sorusunun cephaneliği burası. Yedi klasik:
 
-Veri kaybı kabul edilemez. Hep `acks=all`.
+**Anti-pattern 1 — `acks=0`/`acks=1` banking event'inde:** Veri kaybı kabul edilemez, hep `acks=all`.
 
-**Anti-pattern 2: `enable.idempotence=false`**
+**Anti-pattern 2 — `enable.idempotence=false`:** Network glitch gerçek; duplicate event = duplicate notification = müşteri rahatsızlığı.
 
-Network glitch real. Duplicate event = duplicate notification = customer rahatsızlığı.
-
-**Anti-pattern 3: Sync send hot path'te**
+**Anti-pattern 3 — Sync send hot path'te:**
 
 ```java
 @PostMapping("/transfers")
@@ -581,13 +638,11 @@ public Transfer transfer(@RequestBody TransferRequest req) {
 }
 ```
 
-API latency Kafka publish latency'sine bağlanır. Async + outbox.
+API latency Kafka publish latency'sine bağlanır. Doğrusu async + outbox.
 
-**Anti-pattern 4: Partition key = timestamp / UUID**
+**Anti-pattern 4 — Partition key = timestamp/UUID:** Per-key ordering kaybolur.
 
-Ordering kaybolur.
-
-**Anti-pattern 5: Producer per send**
+**Anti-pattern 5 — Producer per send:**
 
 ```java
 public void publish(Event e) {
@@ -597,15 +652,11 @@ public void publish(Event e) {
 }
 ```
 
-Producer **singleton** (Spring bean). KafkaTemplate yeniden kullan.
+Producer **singleton** olmalı (Spring bean); KafkaTemplate'i yeniden kullan.
 
-**Anti-pattern 6: Outbox fallback yok**
+**Anti-pattern 6 — Outbox fallback yok:** Network down → publish fail → callback log'lu ama event kayboldu. Outbox eventual delivery garantisi verir.
 
-Network down → Kafka publish fail → callback log'lu ama event kayboldu. Outbox eventual delivery garantisi.
-
-**Anti-pattern 7: Schema evolution check yok**
-
-JSON ile field rename → consumer kırılır deploy sonrası. Avro + Schema Registry'de backward compat check otomatik.
+**Anti-pattern 7 — Schema evolution check yok:** JSON ile field rename → consumer kırılır. Avro + Schema Registry backward compat'ı otomatik doğrular.
 
 ---
 
@@ -621,96 +672,133 @@ JSON ile field rename → consumer kırılır deploy sonrası. Avro + Schema Reg
 
 ---
 
-## Mini task'ler
+## Kendini Sına
 
-### Task 6.2.1 — Basic producer + acks=all (30 dk)
+Aşağıdaki soruları önce **cevaba bakmadan** kendi cümlelerinle yanıtlamayı dene — hepsi Kafka producer mülakatlarında karşına çıkabilecek tarzda. Takıldığın soru olursa ilgili Kavramlar başlığına dön, sonra tekrar dene.
 
-`TransferEventPublisher` yaz:
+**S1. `acks=0`, `acks=1` ve `acks=all` arasındaki fark nedir? Banking neden yalnızca `acks=all` kullanır?**
 
-```java
-@Component
-public class TransferEventPublisher {
-    private final KafkaTemplate<String, String> template;
-    
-    public CompletableFuture<SendResult<String, String>> publish(TransferCompleted event) {
-        return template.send("banking.transfers", event.getFromAccountId().toString(), 
-            new ObjectMapper().writeValueAsString(event));
-    }
-}
-```
+<details>
+<summary>Cevabı göster</summary>
 
-Test:
-- `application.yml`'da `acks: all` + `enable.idempotence: true`
-- Bir mesaj gönder, ack al
-- `kafka-console-consumer` ile gör
+`acks=0` fire-and-forget'tir: producer hiç onay beklemez, en yüksek throughput ama mesaj hiç yazılmasa da fark etmez — veri kaybı riski en yüksek. `acks=1` leader broker yazınca ack döner, ama replica'lara kopyalanmadan önce; leader fail olur ve replica henüz almamışsa mesaj kaybolur. `acks=all` leader + tüm in-sync replica'lar (ISR) yazdı dediğinde ack döner, en güvenlisi.
 
-### Task 6.2.2 — Async callback + Outbox fallback (45 dk)
+Banking event'leri (transfer, audit, notification) kaybolamaz — regulatory durability şart. Bu yüzden standart her zaman `acks=all`, yanında `min.insync.replicas=2` (en az 2 replica ISR'da olmalı, yoksa producer fail eder) ve `replication.factor=3`. Bu üçlü, tek broker düşse bile mesajın en az bir kopyada güvende kalmasını sağlar.
 
-`TransferEventPublisher`'a outbox fallback ekle:
+</details>
 
-```java
-future.whenComplete((result, ex) -> {
-    if (ex != null) {
-        outboxRepo.save(...);
-        meterRegistry.counter("publish.failure").increment();
-    } else {
-        meterRegistry.counter("publish.success").increment();
-    }
-});
-```
+**S2. Idempotent producer duplicate'i nasıl engeller? `enable.idempotence=true` hangi ayarları zorunlu kılar?**
 
-Test: Kafka container'ı stop et, publish çağır → outbox tablo'sunda kayıt görmeli.
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 6.2.3 — Transactional producer (45 dk)
+Producer her batch'e bir `Producer ID (PID)` ve artan bir `sequence number` ekler. Broker per-partition olarak son gördüğü `(PID, sequence)`'ı tutar. Bir batch'in ack'i network glitch yüzünden kaybolup producer retry ettiğinde, aynı `(PID, sequence)` tekrar gelir ve broker onu **drop** eder — diske ikinci kez yazmaz. Sonuç: per-partition exactly-once-write (per producer session).
 
-3 topic'e atomic publish:
+Aktivasyon şunları zorunlu kılar: `acks=all` (otomatik set olur), `retries >= 0` (default `Integer.MAX_VALUE`) ve `max.in.flight.requests.per.connection <= 5`. Banking'de bu ayar her zaman açık tutulur çünkü retry kaçınılmazdır ve duplicate event duplicate müşteri notification'ı demektir.
 
-```java
-@Transactional("kafkaTransactionManager")
-public void publishMultiple(Transfer t, AuditEvent a, NotificationEvent n) {
-    template.send("banking.transfers", t.getId(), t);
-    template.send("banking.audit", t.getId(), a);
-    template.send("banking.notifications", n.recipient(), n);
-}
-```
+</details>
 
-Ortasında exception fırlat → tüm event'ler rollback olmalı. Consumer (read_committed) görmemeli.
+**S3. `max.in.flight.requests.per.connection=5` ile idempotence açıkken ordering neden bozulmaz? Idempotence kapalıyken ne olur?**
 
-### Task 6.2.4 — Partition key deneme (30 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-10 partition'lı topic. Aynı `accountId` ile 100 event gönder. Hepsi **aynı partition**'a gitmeli (consume ederek doğrula).
+Idempotence kapalıyken `max.in.flight > 1` + `retries > 0` kombinasyonu out-of-order delivery üretir: M1 ve M2 paralel gönderilir, M1 fail edip retry olunca broker'a `M2, M1` sırasıyla düşer — sıralama bozulur.
 
-Sonra random UUID key ile 100 event → 10 partition'a yaklaşık eşit dağılım.
+Idempotence açıkken broker her mesajın sequence number'ını görür ve beklediği sıradan sapan bir batch gelirse onu reddedip doğru sırayı zorlar. Bu yüzden `max.in.flight=5` bırakılsa bile per-partition ordering korunur — hem throughput hem sıralama garantisi. Account event'lerinin sırası (`Opened` → `Deposited` → `Closed`) banking'de kritik olduğu için bu kombinasyon idealdir.
 
-### Task 6.2.5 — Avro + Schema Registry (60 dk)
+</details>
 
-Schema Registry docker compose ekle. `TransferCompleted.avsc` yaz. Maven plugin ile Java class generate. Producer'ı Avro'ya çevir. Schema Registry UI'da schema'yı gör.
+**S4. Transactional producer nasıl çalışır ve exactly-once semantics'i nasıl sağlar? Consumer tarafında ne yapman gerekir?**
 
-Sonra field ekle (`description: string`) → backward compat check OK olmalı (default value ile).
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 6.2.6 — Compression test (30 dk)
+Transactional producer `transactional.id` alır, `initTransactions()` ile başlatılır ve `beginTransaction()` / `commitTransaction()` / `abortTransaction()` arasında birden fazla topic/partition'a atomic publish yapar. Üç event ya hepsi commit olur ya hiçbiri consumer'a görünür — multi-partition atomicity. Hata durumunda `abortTransaction()` çağrılır ve yazılanlar iptal edilir.
 
-Aynı 10000 transfer event:
-- `compression-type=none` → topic size ölç
-- `compression-type=lz4` → topic size ölç
-- `compression-type=gzip` → topic size ölç
+Exactly-once üç parçadan doğar: idempotent producer per-partition duplicate'i engeller (exactly-once-write), transactional producer bunu multi-partition atomicity'ye taşır, consumer'da `isolation-level: read_committed` yarım/abort edilmiş transaction event'lerini filtreler. Üçü birlikte end-to-end exactly-once verir. Consumer `read_committed` ayarlanmazsa (default `read_uncommitted`) abort edilmiş event'leri de görür ve garanti kırılır. Not: DB + Kafka'yı tek transaction'a koyamazsın; dual-write için Outbox pattern gerekir.
 
-Kafka tool: `kafka-log-dirs --describe` ile partition size.
+</details>
 
-**Defterine** tablo: compression ratio + CPU usage trade-off.
+**S5. Partition key seçimi per-key ordering'i nasıl etkiler? Yanlış key seçmenin banking'deki bedeli nedir?**
 
-### Task 6.2.7 — Error handling matrix (45 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-Test her bir error case:
-- Kafka stop → TimeoutException → outbox
-- Çok büyük mesaj (>1MB) → RecordTooLargeException → DLQ
-- Wrong serializer → SerializationException → DLQ
+Partition key mesajın partition'ını belirler (default `hash(key) % partitions`). Aynı key ile gönderilen tüm event'ler aynı partition'a gider ve Kafka bir partition içinde sıralamayı garanti eder — yani per-key ordering elde edersin. `accountId` key'i seçersen o hesabın tüm event'leri sıralı consume edilir; farklı partition'lardaki farklı account'lar arasında sıra garantisi yoktur (ama gerekmez de).
 
-`@SpringBootTest` ile mock ProducerFactory + verify behavior.
+Yanlış key (random UUID veya timestamp) her event'i farklı partition'a dağıtır → aynı hesabın `Opened`, `Deposited`, `Closed` event'leri farklı partition'lara düşer ve yanlış sırada consume edilebilir. Doğru seçim entity ID'dir: TransferCompleted için `fromAccountId`, CardTransaction için `cardId`, CustomerActivity için `customerId`.
+
+</details>
+
+**S6. Async callback pattern'i sync `.get()`'e neden tercih edilir? Callback'te outbox fallback ne işe yarar?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Sync `.get()` ack gelene kadar bloklar; bunu API hot path'inde yaparsan API latency'si doğrudan Kafka publish latency'sine bağlanır ve broker yavaşladığında tüm request'lerin yavaşlar. Async + callback ise hot path'i bloklamaz: `send()` hemen döner, sonuç `whenComplete` callback'inde işlenir — başarıda metric artar, hatada hata yakalanır.
+
+Outbox fallback callback'in hata dalında devreye girer: publish fail ettiğinde (örneğin Kafka down) event'i bir DB tablosuna `PENDING` olarak yazarsın; ayrı bir relay process bunları sonradan Kafka'ya gönderir. Böylece event kaybolmaz — guaranteed eventual delivery. Fallback olmadan callback sadece log'lar ve event buharlaşır.
+
+</details>
+
+**S7. Avro + Schema Registry, JSON'a göre banking'de hangi avantajları sağlar? Compression'ı neden hep açık tutarsın?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+JSON'un üç zaafı var: schema evolution yok, payload büyük, type-safe değil — bir field'ı rename edersen consumer deploy sonrası sessizce kırılır. Avro + Schema Registry bunları çözer: generated Java class'lar compile-time type safety verir, Schema Registry schema'yı merkezi tutar ve backward/forward compatibility'yi otomatik kontrol eder (uyumsuz değişiklik publish'i engellenir), payload da binary olduğu için küçüktür. Banking'de `amount` gibi alanlar için `decimal` logical type kullanmak money handling'i doğru tutar.
+
+Compression batch-level çalışır ve küçük bir CPU maliyeti karşılığında büyük network/disk tasarrufu sağlar. Banking JSON payload'ları %50-70 sıkışır; `lz4` düşük CPU ile 2-3x, `zstd` modern setup'larda 4-6x ratio verir. `none` bırakmak için pratik bir sebep yoktur, bu yüzden her zaman açık tutulur.
+
+</details>
 
 ---
 
-## Test yazma rehberi
+## Tamamlama kriterleri
+
+- [ ] "Kendini Sına" bölümündeki tüm soruları cevaba bakmadan açıklayabiliyorum
+- [ ] `acks=0/1/all` farkını ve banking'in neden `acks=all` + `min.insync.replicas=2` + `replication.factor=3` kullandığını anlatabiliyorum
+- [ ] Idempotent producer'ın `(PID, sequence)` dedup mekanizmasını çizebiliyorum
+- [ ] `max.in.flight=5` + idempotence ordering garantisini neden bozmadığını açıklayabiliyorum
+- [ ] Transactional producer + `read_committed` ile exactly-once semantics'i anlatabiliyorum
+- [ ] Partition key seçiminin per-key ordering'e etkisini (accountId örneği) biliyorum
+- [ ] Async callback + outbox fallback pattern'ini ve sync `.get()`'in neden anti-pattern olduğunu açıklayabiliyorum
+- [ ] Avro + Schema Registry'nin 3 avantajını ve error handling matrix'ini sayabiliyorum
+- [ ] (Opsiyonel) "Pratik yapmak istersen" bölümündeki testleri yazdım ve Claude-verify prompt'uyla doğrulattım
+
+---
+
+## Defter notları
+
+1. "Producer'ın 4 aşamalı pipeline'ı (serializer → partitioner → accumulator → sender): ____."
+2. "`acks=0` / `1` / `all` farkları + banking için seçim: ____."
+3. "`enable.idempotence=true` ile broker (PID, sequence) dedup mekanizması: ____."
+4. "`max.in.flight=5` + idempotence ordering garantisini neden bozmaz: ____."
+5. "Partition key seçiminin per-key ordering'e etkisi (accountId örneği): ____."
+6. "Transactional producer + `read_committed` ile exactly-once semantics: ____."
+7. "Async send + callback vs sync `.get()` banking hot path için: ____."
+8. "Outbox fallback eventual delivery garantisi: ____."
+9. "Avro + Schema Registry banking için 3 avantaj: ____."
+10. "Compression (lz4) banking JSON payload için tipik ratio + CPU cost: ____."
+
+```admonish success title="Bölüm Özeti"
+- Producer async pipeline'dır: `send()` hemen döner, gerçek gönderim Sender thread'de olur — "yazıldı" demek için callback veya `get()` ile ack bekle
+- Durability zinciri `acks=all` + `min.insync.replicas=2` + `replication.factor=3`; banking'de `acks=0`/`acks=1` yasaktır
+- `enable.idempotence` broker'da `(PID, sequence)` ile per-partition exactly-once-write sağlar, retry duplicate yaratmaz; `max.in.flight<=5` ile ordering korunur
+- Transactional producer + `read_committed` consumer = multi-topic atomic publish ve end-to-end exactly-once; DB+Kafka dual-write için outbox (Topic 6.6)
+- Throughput katmanı: `batch-size`/`linger-ms` tuning + compression (lz4/zstd); partition key entity ID olmalı → per-key ordering
+- Banking dayanıklılık kalıbı: async + callback + outbox fallback, Avro + Schema Registry, error handling matrix (Timeout→outbox, RecordTooLarge/Serialization→DLQ)
+```
+
+---
+
+## Pratik yapmak istersen
+
+Kavramları koda dökmek istersen aşağıdaki iki ek hazır: test yazma rehberi partition key, outbox fallback, transactional rollback ve idempotence için TestContainers örnekleri içerir; Claude-verify prompt'u ile yazdığın producer kodunu banking-grade perspektiften denetletebilirsin.
+
+<details>
+<summary>Test yazma rehberi</summary>
 
 ### Test 6.2.1 — Producer integration with TestContainers
 
@@ -719,19 +807,19 @@ Test her bir error case:
 @Testcontainers
 @DirtiesContext
 class TransferEventPublisherIT {
-    
+
     @Container
     static KafkaContainer kafka = new KafkaContainer(
         DockerImageName.parse("confluentinc/cp-kafka:7.5.0"));
-    
+
     @DynamicPropertySource
     static void kafkaProps(DynamicPropertyRegistry registry) {
         registry.add("spring.kafka.bootstrap-servers", kafka::getBootstrapServers);
     }
-    
+
     @Autowired TransferEventPublisher publisher;
     @Autowired KafkaTemplate<String, String> template;
-    
+
     @Test
     void shouldPublishWithCorrectPartitionKey() throws Exception {
         UUID accountId = UUID.randomUUID();
@@ -742,11 +830,11 @@ class TransferEventPublisherIT {
             .amount(new BigDecimal("100.00"))
             .currency("TRY")
             .build();
-        
+
         SendResult<String, String> result = publisher.publish(event).get(5, TimeUnit.SECONDS);
-        
+
         assertThat(result.getRecordMetadata().topic()).isEqualTo("banking.transfers");
-        
+
         // Aynı partition key ile 10 daha gönder, hepsi aynı partition'a gitmeli
         Set<Integer> partitions = new HashSet<>();
         for (int i = 0; i < 10; i++) {
@@ -756,18 +844,18 @@ class TransferEventPublisherIT {
         }
         assertThat(partitions).hasSize(1);   // Hepsi aynı partition
     }
-    
+
     @Test
     void shouldFallbackToOutboxWhenKafkaDown() throws Exception {
         kafka.stop();
-        
+
         TransferCompleted event = createTestEvent();
         publisher.publish(event);
-        
+
         await().atMost(10, TimeUnit.SECONDS).untilAsserted(() ->
             assertThat(outboxRepo.findByAggregateId(event.getTransferId())).isPresent()
         );
-        
+
         kafka.start();
     }
 }
@@ -780,23 +868,23 @@ class TransferEventPublisherIT {
 @Transactional("kafkaTransactionManager")
 void transactionalSendShouldBeAtomic() {
     UUID transferId = UUID.randomUUID();
-    
+
     try {
         publisher.publishMultiple(transfer, audit, notification);
         if (Math.random() < 0.5) throw new RuntimeException("Simulated failure");
     } catch (RuntimeException e) {
         // expected - transaction rolls back
     }
-    
+
     // Consumer with isolation_level=read_committed should see all or nothing
     KafkaConsumer<String, String> consumer = ...;
     consumer.subscribe(List.of("banking.transfers", "banking.audit", "banking.notifications"));
-    
+
     int found = 0;
     for (ConsumerRecord<String, String> record : consumer.poll(Duration.ofSeconds(5))) {
         if (record.key().equals(transferId.toString())) found++;
     }
-    
+
     // Either 0 (rollback) or 3 (success), not 1 or 2
     assertThat(found).isIn(0, 3);
 }
@@ -808,40 +896,48 @@ void transactionalSendShouldBeAtomic() {
 @Test
 void duplicateRetryShouldNotDuplicateInTopic() throws Exception {
     // Producer config'inde retries=10, idempotence=true
-    
+
     UUID transferId = UUID.randomUUID();
     TransferCompleted event = createEvent(transferId);
-    
-    // Simulate network glitch — manuel retry pattern
+
+    // Simulate network glitch — producer içinde retry otomatik olur
     publisher.publish(event).get();
-    // (Producer içinde retry happens otomatik)
-    
+
     // Consume and count
     KafkaConsumer<String, String> consumer = ...;
     consumer.subscribe(List.of("banking.transfers"));
-    
+
     int count = 0;
     for (ConsumerRecord<String, String> record : consumer.poll(Duration.ofSeconds(5))) {
         if (record.value().contains(transferId.toString())) count++;
     }
-    
+
     assertThat(count).isEqualTo(1);   // not 2, idempotence working
 }
 ```
 
----
+### Bonus — Compression ratio ölçümü
 
-## Claude-verify prompt
+Aynı 10000 transfer event'ini üç ayrı topic'e `compression-type=none`, `lz4` ve `gzip` ile gönder. Her topic'in partition size'ını `kafka-log-dirs --describe` ile ölç ve tabloya geçir: compression ratio + gözlemlenen CPU trade-off'u. Banking JSON payload'da lz4'ün 2-3x'i beklenir.
+
+### Bonus — Error handling matrix testi
+
+Her error case'i tetikle ve doğru stratejiye gittiğini doğrula: Kafka stop → `TimeoutException` → outbox; >1MB mesaj → `RecordTooLargeException` → DLQ; yanlış serializer → `SerializationException` → DLQ. `@SpringBootTest` ile mock `ProducerFactory` kullanıp callback davranışını verify et.
+
+</details>
+
+<details>
+<summary>Claude-verify prompt</summary>
 
 ```
-Kafka producer kodumu banking-grade kriterlere göre değerlendir. Eksiklerimi 
+Kafka producer kodumu banking-grade kriterlere göre değerlendir. Eksiklerimi
 söyle, kod yazma:
 
 1. Durability config:
    - acks=all aktif mi?
    - enable.idempotence=true mu?
    - min.insync.replicas=2 topic config'inde mi?
-   - replication-factor=3 mi?
+   - replication-factor=3 mü?
 
 2. Async pattern:
    - send() callback ile mi yapılıyor (sync get() değil)?
@@ -849,7 +945,7 @@ söyle, kod yazma:
    - Hata callback'inde outbox fallback var mı?
 
 3. Idempotence + ordering:
-   - max.in.flight.requests.per.connection ≤ 5 mi?
+   - max.in.flight.requests.per.connection <= 5 mi?
    - idempotence aktif olduğu için retry duplicate yaratmıyor mu?
    - Partition key entity ID mi (UUID random DEĞİL)?
 
@@ -869,10 +965,10 @@ söyle, kod yazma:
    - Schema evolution backward compatible mi?
 
 7. Error handling:
-   - TimeoutException → outbox fallback?
-   - RecordTooLargeException → DLQ?
-   - SerializationException → DLQ?
-   - Authentication/Authorization → alert ops?
+   - TimeoutException -> outbox fallback?
+   - RecordTooLargeException -> DLQ?
+   - SerializationException -> DLQ?
+   - Authentication/Authorization -> alert ops?
 
 8. Banking-specific:
    - Sensitive data (PAN, TC No) event payload'da YOK mu?
@@ -887,40 +983,11 @@ söyle, kod yazma:
 
 10. Test:
     - TestContainers KafkaContainer integration?
-    - Partition key test (aynı key → aynı partition)?
-    - Idempotence test (duplicate retry → tek mesaj)?
+    - Partition key test (aynı key -> aynı partition)?
+    - Idempotence test (duplicate retry -> tek mesaj)?
     - Transactional rollback test?
 
-Her madde için PASS / FAIL / EKSIK işaretle.
+Her madde için PASS / FAIL / EKSIK işaretle, kanıt göster, kod yazma.
 ```
 
----
-
-## Tamamlama kriterleri
-
-- [ ] `acks=all` + `enable.idempotence=true` + `min.insync.replicas=2`
-- [ ] Async callback pattern + outbox fallback
-- [ ] Partition key entity ID (accountId)
-- [ ] Transactional producer ile multi-topic atomic publish denedim
-- [ ] Compression aktif (lz4)
-- [ ] Avro + Schema Registry setup (en az 1 topic için)
-- [ ] Error handling matrix uygulanmış
-- [ ] TestContainers ile integration test (4+ test)
-- [ ] Idempotence test'le doğrulandı
-- [ ] Compression ratio ölçüldü, defterimde tablo
-- [ ] Banking PII payload'da YOK kontrolü
-
----
-
-## Defter notları (10 madde)
-
-1. "Producer'ın 4 aşamalı pipeline'ı (serializer → partitioner → accumulator → sender): ____."
-2. "`acks=0` / `1` / `all` farkları + banking için seçim: ____."
-3. "`enable.idempotence=true` ile broker (PID, sequence) dedup mekanizması: ____."
-4. "`max.in.flight=5` + idempotence ordering garantisini neden bozmaz: ____."
-5. "Partition key seçiminin per-key ordering'e etkisi (accountId örneği): ____."
-6. "Transactional producer 3-topic atomic publish — banking örneği: ____."
-7. "Async send + callback vs sync .get() banking hot path için: ____."
-8. "Outbox fallback eventual delivery garantisi: ____."
-9. "Avro + Schema Registry banking için 3 avantaj: ____."
-10. "Compression (lz4) banking JSON payload için tipik ratio + CPU cost: ____."
+</details>
