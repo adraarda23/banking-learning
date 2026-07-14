@@ -1,6 +1,10 @@
 # Faz 11 — PHASE TEST
 
-Faz 12'ye geçmeden önce kendini sına.
+```admonish question title="Bu test ne işe yarar?"
+Faz 12'ye geçmeden önce kendini sına. Bu bir sınav değil, **dürüstlük kontrolü**:
+işaretleyemediğin her madde, hangi topic'e geri döneceğini gösterir.
+Hepsine "evet" diyebiliyorsan hazırsın.
+```
 
 ## Pratik test
 
@@ -132,4 +136,8 @@ Phase 11 = **deployment operability**. TR bankaları için:
 
 Mid+ engineer **deployment'a ait** bilgi olmadan kariyer ilerletemiyor. Phase 11 + Phase 12 (Testing) ile **complete profile**.
 
-Senior banking engineer için Phase 11 = "kod yazıp gönderilmesi" vs "production'a güvenle gidişi" arasındaki fark. Bu fark — değer farkı.
+```admonish success title="Sonraki durak: Faz 12"
+Senior banking engineer için Phase 11 = "kod yazıp gönderilmesi" ile "production'a güvenle
+gidişi" arasındaki fark. Son faz Testing Mastery ile bu güveni sağlamlaştıracaksın.
+→ [Faz 12 — Testing Mastery](../12-testing/index.md)
+```

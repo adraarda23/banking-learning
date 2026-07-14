@@ -49,7 +49,8 @@
 - [x] Faz 7 (Microservices): 7 topic + mini proje, 32 diyagram, 47 kutu, 56 soru — commit b66bb92
 - [x] Faz 8 (Security): 7 topic + mini proje, 32 diyagram, 47 kutu, 53 soru — commit 854a4e8
 - [x] Faz 9 (Observability): 7 topic + mini proje, 37 diyagram, 51 kutu, 60 soru — commit b36d9e6 (push'landı)
-- [ ] Kalan: Faz 10-12 (3 faz)
+- [x] Faz 10 (Domain Mastery): 7 topic + mini proje, 32 diyagram, 49 kutu, 54 soru — commit 42af605 (push'landı)
+- [ ] Kalan: Faz 11-12 (2 faz)
 - Not: mdbook src="." nedeniyle _book/.git kopyalanıyor (bloat, zararsız — build sonrası rm -rf _book/.git ile temizle)
 
 ## Review

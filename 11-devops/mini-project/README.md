@@ -1,39 +1,82 @@
 # Phase 11 Mini-Project — Banking Production Deployment Pipeline
 
+```admonish info title="Bu projede"
+- Phase 7-10'un 10 banking microservice'ini JIB ile image'a alıp her build'de Trivy scan + Cosign sign'dan geçiriyorsun
+- Kustomize base + 3 overlay ile K8s manifest'leri (security + observability + autoscale) yazıyor, PostgreSQL + Kafka operator ve Vault Secrets CSI ile platformu kuruyorsun
+- GitHub Actions matrix CI/CD + ArgoCD GitOps + Argo Rollouts canary ile progressive delivery pipeline'ı uçtan uca bağlıyorsun
+- Opsiyonel Istio service mesh ile mTLS STRICT + canary routing ekliyorsun
+- 6 production senaryosunu (deploy / rollback / security gate / hotfix / drift / DR) reproduce edip pipeline'ının davranışını ispatlıyorsun
+```
+
 ## Hedef
 
-Phase 7-10 banking microservice'lerini **production-grade** deploy etmek: Docker image (multi-stage + JIB + scan + sign), K8s manifests (security + observability + autoscale), CI/CD pipeline (build + test + quality + deploy), GitOps (ArgoCD), canary rollout.
+Phase 11'in 4 topic'inde Docker, docker compose, Kubernetes ve CI/CD öğrendin; bu projede hepsini birleştirip Phase 7-10 banking microservice'lerini **production-grade** deploy ediyorsun. Yeni teori yok — **synthesis** var: image build, K8s security, GitOps ve progressive delivery tek pipeline'da buluşuyor. Bir adımda takılırsan ilgili topic'e dön, oku, düzelt.
 
-## Süre
+Projenin sonunda elinde şunlar olacak: signed + scanned image üreten CI, Kustomize'lı GitOps repo, operator'larla ayakta duran veri katmanı ve metric bozulunca kendini geri alan canary rollout. Bu, TR bankalarında **DevOps / Platform Engineer** rolünün istediği tam paket.
 
-10-12 gün (günde 3 saat)
+```admonish tip title="Süre ve önbilgi"
+10-12 gün ayır (günde ~3 saat). Başlamadan önce Phase 10 mini-project bitmiş, Topic 11.1-11.4 ([Docker](../01-docker-for-java/index.md), [Compose](../02-docker-compose/index.md), [K8s](../03-kubernetes-basics/index.md), [CI/CD](../04-ci-cd/index.md)) tamamlanmış olmalı. Buradaki işin çoğu **deploy strategy + pipeline design** — servislerin kendisi hazır kabul ediliyor.
+```
 
-## Önbilgi
+## Deployment mimarisi
 
-- Phase 10 mini-project tamam
-- Topic 11.1-11.4 bitti
+Sistemin belkemiği tek yönlü bir akış: developer kod push eder, CI image üretip imzalar, GitOps repo'ya tag yazılır, ArgoCD cluster'ı git state'e senkronlar. <mark>Cluster'a hiçbir şey `kubectl apply` ile elle girmez</mark> — tek gerçek kaynağı git'tir, drift otomatik geri alınır.
 
----
+```mermaid
+flowchart LR
+    DEV["Developer<br/>git push"] --> CI["GitHub Actions<br/>build test scan sign"]
+    CI --> REG["Image registry<br/>signed image"]
+    CI --> GIT["GitOps repo<br/>Kustomize tag"]
+    GIT --> ARGO["ArgoCD<br/>sync"]
+    ARGO --> K8S["K8s cluster<br/>canary rollout"]
+```
 
-## Görev listesi
+```admonish warning title="Signed image olmadan deploy yok"
+Banking'de provenance zorunlu: her image build'inde Trivy HIGH/CRITICAL bulursa build kırılır, Cosign imzası olmayan image cluster'a admission almaz. BDDK change management için audit trail = git commit history + signed image digest. Bu iki kural gevşetilirse phase'in banking değeri sıfırlanır.
+```
 
-### 1. Banking image build — all services (1.5 gün)
+## Build plan
 
-Phase 10'daki 8 service için:
-- account-service
-- transfer-service
-- card-service
-- xborder-service
-- loan-service
-- fx-service
-- compliance-service
-- recon-service
-- gateway-service
-- ledger-service
+Sekiz adım var: ilk dördü image + platform katmanını kurar, son dördü pipeline ve progressive delivery'yi bağlar.
 
-Her biri için:
+```mermaid
+flowchart LR
+    subgraph Platform["Image ve platform"]
+        direction LR
+        A1["Adim 1<br/>Image build"] --> A2["Adim 2<br/>K8s manifest"] --> A3["Adim 3<br/>Infra operator"] --> A4["Adim 4<br/>Service mesh"]
+    end
+    subgraph Delivery["Pipeline ve delivery"]
+        direction LR
+        A5["Adim 5<br/>CI CD"] --> A6["Adim 6<br/>ArgoCD"] --> A7["Adim 7<br/>Canary"] --> A8["Adim 8<br/>Senaryolar"]
+    end
+    A4 --> A5
+```
 
-**JIB plugin** ile build:
+### Adım 1 — Banking image build: JIB + scan + sign (1.5 gün)
+
+**Ne yapacaksın:** 10 service'i JIB ile image'a alıp her build'de Trivy scan + Cosign sign uygulayacaksın. **Neden:** JIB, Dockerfile'sız, daemonsuz ve reproducible layer'lı image üretir; scan + sign ise supply-chain güvenliğinin banking şartıdır.
+
+Kapsamdaki 10 service: `account`, `transfer`, `card`, `xborder`, `loan`, `fx`, `compliance`, `recon`, `gateway`, `ledger`.
+
+JIB config'in kritik parçası container güvenliği — non-root UID ve memory-aware JVM flag'leri:
+
+```xml
+<container>
+    <user>10001:10001</user>
+    <jvmFlags>
+        <jvmFlag>-XX:MaxRAMPercentage=75.0</jvmFlag>
+        <jvmFlag>-XX:+UseG1GC</jvmFlag>
+        <jvmFlag>-XX:+HeapDumpOnOutOfMemoryError</jvmFlag>
+    </jvmFlags>
+    <ports><port>8080</port><port>8081</port></ports>
+</container>
+```
+
+Registry hedefi `registry.mavibank.com/banking/${artifactId}`, tag'ler `${version}` + `latest`. Build sonrası zinciri: `trivy image` HIGH/CRITICAL'da exit 1, `cosign sign` ile imza.
+
+<details>
+<summary>Tam kod: JIB plugin config (~33 satır)</summary>
+
 ```xml
 <plugin>
     <groupId>com.google.cloud.tools</groupId>
@@ -69,11 +112,27 @@ Her biri için:
 </plugin>
 ```
 
-Image scan (Trivy) + sign (Cosign) every build.
+</details>
 
-### 2. K8s manifests — all services (2 gün)
+Kontrol noktası: 10 service'in her biri multi-tag image üretiyor; Trivy raporu temiz, Cosign imzası `cosign verify` ile doğrulanıyor.
 
-Directory structure (GitOps repo):
+### Adım 2 — K8s manifests: Kustomize base + overlays (2 gün)
+
+**Ne yapacaksın:** Her service için banking-grade Deployment template'i yazıp Kustomize base + 3 overlay (dev/staging/prod) yapısına oturtacaksın. **Neden:** Environment farklarını (replica, resource, image tag) patch'le yönetmek copy-paste'ten güvenli; base tek yerde, overlay sadece farkı taşır.
+
+Deployment template'inin banking şartları:
+
+- 3 replica, `maxUnavailable: 0` (zero-downtime)
+- Non-root + `readOnlyRootFilesystem` + `drop: [ALL]` capabilities
+- Resources requests **ve** limits; liveness + readiness + startup probe
+- `topologySpreadConstraints` (zone) + `podAntiAffinity` (host)
+- PDB `minAvailable: 2`, HPA CPU + custom RPS
+- Vault Secrets CSI + NetworkPolicy ingress/egress whitelist
+
+GitOps repo'nun iskeleti base / overlays / shared / infrastructure olarak ayrılır:
+
+<details>
+<summary>Tam referans: GitOps repo dizin yapısı (~38 satır)</summary>
 
 ```
 banking-k8s/
@@ -115,22 +174,39 @@ banking-k8s/
     └── observability/
 ```
 
-Banking-grade Deployment template (per service):
-- 3 replica
-- maxUnavailable: 0
-- Non-root + readOnlyRootFS + dropAll caps
-- Resources requests + limits
-- Probes (liveness + readiness + startup)
-- NetworkPolicy ingress + egress whitelist
-- Vault Secrets CSI
-- topologySpreadConstraints zone
-- PodAntiAffinity host
-- PDB minAvailable 2
-- HPA CPU + custom RPS
+</details>
 
-### 3. Infrastructure — K8s manifests (1.5 gün)
+```admonish warning title="Default-deny önce gelir"
+`shared/networkpolicy-default-deny.yaml` namespace'e tüm ingress/egress'i kapatır; her service ancak kendi `networkpolicy.yaml`'ında ihtiyacı olan trafiği (DB, Kafka, ArgoCD) açar. PCI/BDDK segmentasyonu bunun üstüne kurulur — <mark>bir service'in DB'ye erişimi açıkça izinlenmediyse erişemez</mark>.
+```
 
-PostgreSQL operator (Zalando Postgres Operator):
+Kontrol noktası: `kustomize build overlays/prod` hatasız render ediyor; render edilen Deployment'ta non-root, probe'lar ve PDB görünüyor.
+
+### Adım 3 — Infrastructure: operator'larla veri katmanı (1.5 gün)
+
+**Ne yapacaksın:** PostgreSQL (Zalando) ve Kafka (Strimzi) operator'larını, ardından Keycloak + Vault + observability stack'i manifest'le kuracaksın. **Neden:** Stateful sistemleri elle yönetmek banking'de kabul edilemez; operator failover, backup ve replica'yı deklaratif hale getirir.
+
+PostgreSQL'de kritik satırlar: 3 instance + fast-ssd storage + connection/memory parametreleri.
+
+```yaml
+spec:
+  teamId: "banking"
+  numberOfInstances: 3
+  volume:
+    size: 100Gi
+    storageClass: fast-ssd
+  postgresql:
+    version: "16"
+    parameters:
+      max_connections: "200"
+      shared_buffers: "2GB"
+```
+
+Kafka'da banking dayanıklılığı `min.insync.replicas: 2` + `replication.factor: 3` ile gelir — bir broker düşse bile veri kaybı olmaz.
+
+<details>
+<summary>Tam referans: Postgres + Kafka operator manifest'leri (~65 satır)</summary>
+
 ```yaml
 apiVersion: acid.zalan.do/v1
 kind: postgresql
@@ -164,7 +240,6 @@ spec:
       memory: 8Gi
 ```
 
-Kafka Strimzi operator:
 ```yaml
 apiVersion: kafka.strimzi.io/v1beta2
 kind: Kafka
@@ -201,9 +276,33 @@ spec:
       size: 10Gi
 ```
 
-Keycloak operator, Vault, observability stack (Prometheus operator, Loki, Tempo, Grafana).
+</details>
 
-### 4. Service mesh (Istio) — optional (1 gün)
+Aynı yöntemle Keycloak operator, Vault ve observability stack'i (Prometheus operator, Loki, Tempo, Grafana) kur.
+
+Kontrol noktası: `kubectl get postgresql,kafka -n banking-data` üç instance READY gösteriyor; bir Kafka broker'ı sildiğinde topic erişilebilir kalıyor.
+
+### Adım 4 — Service mesh: Istio (opsiyonel) (1 gün)
+
+**Ne yapacaksın:** Istio kurup namespace'e sidecar injection, mTLS STRICT ve canary VirtualService routing ekleyeceksin. **Neden:** Servisler arası trafiği şifrelemek (mTLS) ve canary trafiğini header/weight ile yönlendirmek uygulama koduna dokunmadan mesh katmanında yapılır. Bu adım opsiyonel — atlayabilirsin, ama canary trafik yönlendirmesi Adım 7'de mesh'e yaslanır.
+
+Namespace'i `istio-injection: enabled` label'ıyla işaretle, sonra mesh içi tüm trafiği zorunlu mTLS'e al:
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: banking
+spec:
+  mtls:
+    mode: STRICT
+```
+
+Canary routing header (`x-canary: true`) ile explicit, geri kalan trafik 90/10 weight ile stable/canary'ye dağılır.
+
+<details>
+<summary>Tam referans: IstioOperator + VirtualService canary (~45 satır)</summary>
 
 ```yaml
 apiVersion: install.istio.io/v1alpha1
@@ -228,29 +327,6 @@ spec:
             memory: 2Gi
 ```
 
-Sidecar injection:
-```yaml
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: banking
-  labels:
-    istio-injection: enabled
-```
-
-mTLS PeerAuthentication:
-```yaml
-apiVersion: security.istio.io/v1beta1
-kind: PeerAuthentication
-metadata:
-  name: default
-  namespace: banking
-spec:
-  mtls:
-    mode: STRICT   # All service-to-service mTLS
-```
-
-VirtualService routing (canary):
 ```yaml
 apiVersion: networking.istio.io/v1beta1
 kind: VirtualService
@@ -280,9 +356,41 @@ spec:
           weight: 10
 ```
 
-### 5. GitHub Actions CI/CD pipeline (1.5 gün)
+</details>
 
-Workflow per service (matrix):
+Kontrol noktası: `istioctl proxy-config` sidecar'ları enjekte ediyor; iki pod arası plaintext bağlantı reddediliyor (mTLS STRICT çalışıyor).
+
+### Adım 5 — GitHub Actions CI/CD pipeline (1.5 gün)
+
+**Ne yapacaksın:** Sadece değişen service'leri build eden matrix pipeline yazacaksın: build + test + quality gate + image build/scan/sign + environment deploy. **Neden:** 10 service'i her push'ta baştan build etmek israf; path filter + matrix ile yalnızca dokunulan service çalışır.
+
+Pipeline'ın omurgası dört aşama — quality gate her katmanda defense-in-depth kurar:
+
+```mermaid
+flowchart LR
+    PR["PR acildi"] --> BUILD["Build test"]
+    BUILD --> GATE{"Quality gate<br/>SAST SCA Sonar"}
+    GATE -- "gecti" --> IMG["Image build<br/>scan sign"]
+    GATE -- "kaldi" --> STOP["PR blok"]
+    IMG --> STG["Staging deploy"]
+    STG --> PROD["Prod canary"]
+```
+
+`detect-changes` job'ı `dorny/paths-filter` ile hangi service'in değiştiğini çıkarır, `ci` job'ı bunu matrix olarak alır. Kritik quality gate adımları:
+
+```yaml
+- name: SCA
+  run: ./mvnw -B org.owasp:dependency-check-maven:check -DfailBuildOnCVSS=7
+- name: SonarQube
+  env:
+    SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+  run: ./mvnw -B sonar:sonar -Dsonar.qualitygate.wait=true
+```
+
+`deploy-staging` develop branch'te otomatik, `deploy-prod` main branch'te <mark>environment: production ile zorunlu reviewer onayı</mark> ister — GitOps repo'da tag güncellenip ArgoCD sync beklenir.
+
+<details>
+<summary>Tam referans: Banking CI/CD workflow (~108 satır)</summary>
 
 ```yaml
 name: Banking Services CI/CD
@@ -309,14 +417,13 @@ jobs:
             transfer-service:
               - 'services/transfer-service/**'
             # ... all services
-  
+
   ci:
     needs: detect-changes
     strategy:
       matrix:
         service: ${{ fromJson(needs.detect-changes.outputs.services) }}
     runs-on: banking-runner
-    
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -324,25 +431,20 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
           cache: 'maven'
-      
       - name: Build & test
         working-directory: services/${{ matrix.service }}
         run: ./mvnw -B clean verify
-      
       - name: SAST
         working-directory: services/${{ matrix.service }}
         run: ./mvnw -B com.github.spotbugs:spotbugs-maven-plugin:check
-      
       - name: SCA
         working-directory: services/${{ matrix.service }}
         run: ./mvnw -B org.owasp:dependency-check-maven:check -DfailBuildOnCVSS=7
-      
       - name: SonarQube
         working-directory: services/${{ matrix.service }}
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: ./mvnw -B sonar:sonar -Dsonar.qualitygate.wait=true
-      
       - name: Build image (JIB)
         if: github.event_name == 'push'
         working-directory: services/${{ matrix.service }}
@@ -350,7 +452,6 @@ jobs:
           ./mvnw -B compile jib:build \
             -Djib.to.image=${{ env.REGISTRY }}/banking/${{ matrix.service }}:sha-${GITHUB_SHA::7} \
             -Djib.to.tags=sha-${GITHUB_SHA::7},${{ github.ref_name }}
-      
       - name: Scan + sign
         if: github.event_name == 'push'
         run: |
@@ -360,7 +461,7 @@ jobs:
             -o spdx-json=sbom.json
           cosign sign --yes --key cosign.key \
             ${{ env.REGISTRY }}/banking/${{ matrix.service }}:sha-${GITHUB_SHA::7}
-  
+
   deploy-staging:
     needs: ci
     if: github.ref == 'refs/heads/develop'
@@ -383,7 +484,7 @@ jobs:
           git push
       - name: Wait ArgoCD
         run: argocd app wait banking-staging --timeout 600
-  
+
   deploy-prod:
     needs: ci
     if: github.ref == 'refs/heads/main'
@@ -393,7 +494,18 @@ jobs:
       # Similar, with canary rollout via Argo Rollouts
 ```
 
-### 6. ArgoCD applications (0.5 gün)
+</details>
+
+Kontrol noktası: tek service'e dokunan PR sadece o service'in job'ını tetikliyor; CVSS≥7 dependency ekleyince build kırılıyor.
+
+### Adım 6 — ArgoCD ApplicationSet (0.5 gün)
+
+**Ne yapacaksın:** 10 service × 3 environment'ı tek ApplicationSet ile üretecek, prod sync'i manuele bırakacaksın. **Neden:** 30 Application'ı elle yazmak yerine matrix generator service × env kombinasyonunu otomatik üretir; dev/staging self-heal ile otomatik, prod kontrollü kalır.
+
+Template `automated: { prune, selfHeal }` ile drift'i geri alır; prod list elemanında `syncPolicy.manual: true` ile prod deploy'u insan onayına bağlar.
+
+<details>
+<summary>Tam referans: ArgoCD ApplicationSet (~52 satır)</summary>
 
 ```yaml
 apiVersion: argoproj.io/v1alpha1
@@ -427,7 +539,6 @@ spec:
                   cluster: banking-prod
                   syncPolicy:
                     manual: true   # Prod manual approval
-  
   template:
     metadata:
       name: '{{service}}-{{env}}'
@@ -448,7 +559,36 @@ spec:
           limit: 5
 ```
 
-### 7. Canary rollout (Argo Rollouts) (1 gün)
+</details>
+
+Kontrol noktası: `argocd app list` 30 application gösteriyor; dev/staging Synced+Healthy, prod OutOfSync (manuel bekliyor).
+
+### Adım 7 — Canary rollout: Argo Rollouts + metric analiz (1 gün)
+
+**Ne yapacaksın:** transfer-service'i Argo Rollouts ile canary'ye çevirip Prometheus metric analiziyle otomatik promote/rollback kuracaksın. **Neden:** Yeni sürümü %100 açmak riskli; trafiği kademeli artırıp her adımda success-rate ve latency ölçmek, kötü sürümü müşteriye yayılmadan yakalar.
+
+Rollout adımlarının davranışı: her `setWeight` sonrası `pause` + `analysis` çalışır; metric fail ederse rollout durur ve stable'a döner.
+
+```mermaid
+flowchart LR
+    S1["Canary yuzde 10"] --> AN{"Metric analiz"}
+    AN -- "saglikli" --> S2["Canary yuzde 25 50"]
+    AN -- "bozuk" --> RB["Auto rollback<br/>stable"]
+    S2 --> S4["Stable yuzde 100"]
+```
+
+Analiz şablonu Prometheus'a sorar: success-rate `>= 0.99`, `failureLimit: 3`. <mark>Ölçüm eşiği aşılırsa canary otomatik geri alınır</mark> — insan müdahalesi gerekmez.
+
+```yaml
+successCondition: result[0] >= 0.99
+failureLimit: 3
+provider:
+  prometheus:
+    address: http://prometheus.observability:9090
+```
+
+<details>
+<summary>Tam referans: Rollout + AnalysisTemplate (~85 satır)</summary>
 
 ```yaml
 apiVersion: argoproj.io/v1alpha1
@@ -463,7 +603,6 @@ spec:
       app: transfer-service
   template:
     # ... Deployment template
-  
   strategy:
     canary:
       canaryService: transfer-service-canary
@@ -476,7 +615,6 @@ spec:
             name: transfer-service
             canarySubsetName: canary
             stableSubsetName: stable
-      
       steps:
         - setWeight: 10
         - pause: { duration: 5m }
@@ -535,54 +673,30 @@ spec:
             histogram_quantile(0.99, sum(rate(http_server_requests_seconds_bucket{service="{{args.service-name}}"}[5m])) by (le))
 ```
 
-### 8. Production-like senaryolar (1 gün)
+</details>
 
-#### Senaryo 1: Successful deploy
-1. PR opened
-2. CI: build + test + SonarQube pass → image build + scan + sign
-3. Merge to develop
-4. Deploy staging
-5. Smoke test pass
-6. PR to main → manual approval
-7. Canary 10% → metric pass → 25% → 50% → 100%
-8. Production stable
+Kontrol noktası: sağlıklı sürüm %10→25→50→100 promote oluyor; latency'yi bilerek bozunca rollout %10'da durup stable'a dönüyor.
 
-#### Senaryo 2: Auto-rollback canary
-1. PR introduces regression (latency spike)
-2. CI passes (regression below CI threshold)
-3. Canary 10% deploy
-4. Argo Rollouts analysis: latency p99 > 1s → fail
-5. Auto-rollback to stable
-6. Slack alert + PR comment
+### Adım 8 — Production-like senaryolar (1 gün)
 
-#### Senaryo 3: Security gate fail
-1. PR adds vulnerable dependency
-2. OWASP dependency-check → CVE 9.8 detected
-3. Build fail
-4. PR blocked
+**Ne yapacaksın:** Pipeline'ı 6 gerçek senaryoyla sınayıp beklenen davranışı gözlemleyeceksin. **Neden:** "Pipeline hazır" demek yetmez — happy path'in yanında rollback, security gate, hotfix, drift ve DR yollarının da doğru tepki verdiğini kanıtlaman gerekir.
 
-#### Senaryo 4: Production hotfix
-1. Critical bug in prod
-2. Hotfix branch from main
-3. Expedited PR (1 approver if hotfix label)
-4. Quick canary 100% (skipped intermediate steps)
-5. Monitor
+Her senaryoyu koştur, log/ekran görüntüsüyle kanıtla:
 
-#### Senaryo 5: GitOps drift detect
-1. Someone kubectl apply manually (anti-pattern)
-2. ArgoCD detect drift
-3. Self-heal: revert to git state
-4. Slack alert: "manual change detected, reverted"
+1. **Successful deploy** — PR → CI + quality gate pass → image sign → staging → smoke test → main manuel onay → canary 10→25→50→100 → prod stable.
+2. **Auto-rollback canary** — regression (latency spike) CI'yı geçer ama canary analiz p99 > 1s'de fail → stable'a otomatik dönüş + Slack alert.
+3. **Security gate fail** — vulnerable dependency (CVE 9.8) OWASP check'te yakalanır → build fail → PR blok.
+4. **Production hotfix** — main'den hotfix branch, hotfix label ile 1 approver, ara adımlar atlanıp hızlı canary 100%, sonra monitor.
+5. **GitOps drift** — birileri elle `kubectl apply` yapar → ArgoCD drift'i görür → self-heal git state'e döner → alert.
+6. **Disaster recovery** — region down → ArgoCD ikincil cluster'ı git'ten bootstrap eder → DB failover → RTO < 1 saat, RPO < 5 dakika.
 
-#### Senaryo 6: Disaster recovery
-1. Region down
-2. Cluster lost
-3. ArgoCD bootstrap secondary cluster from git
-4. Database failover (replica → primary)
-5. Service restored
-6. RTO < 1 hour, RPO < 5 minutes
+```admonish tip title="Kanıt topla"
+Her senaryonun **beklenen** davranışını önceden yaz, sonra çalıştırıp gözlemini karşılaştır — özellikle Senaryo 2 (rollback) ve 5 (drift) otomasyonun kalbidir. Screenshot + log'ları `docs/deploy-scenarios/` altına koy; mülakatta "pipeline'ım kötü sürümü kendi yakalar" cümlesinin kanıtı budur.
+```
 
-### 9. Defter notları (15 item)
+### Adım 9 — Defter notları (15 madde)
+
+Her maddeyi kendi kelimelerinle, projedeki dosya/komut kanıtına bağlayarak tamamla:
 
 1. "JIB build banking 10 service multi-tag + Cosign sign: ____."
 2. "K8s manifests Kustomize base + overlays (dev/staging/prod): ____."
@@ -602,33 +716,39 @@ spec:
 
 ---
 
-## Tamamlama kriterleri
+## Tamamlama kriterleri (kendine sor)
 
-- [ ] 10 banking service Docker image (JIB + scan + sign)
-- [ ] K8s manifests Kustomize (base + 3 overlay)
-- [ ] Banking Deployment template (security + observability + autoscale)
+Başlamadan bir kez oku, bitince tek tek işaretle.
+
+- [ ] 10 banking service Docker image (JIB + Trivy scan + Cosign sign)
+- [ ] K8s manifests Kustomize (base + 3 overlay), `kustomize build` hatasız
+- [ ] Banking Deployment template (security + observability + autoscale) render'da görünüyor
 - [ ] NetworkPolicy default-deny + service-specific allow
-- [ ] Vault Secrets CSI integration
-- [ ] PostgreSQL + Kafka operator
-- [ ] Istio service mesh (optional)
-- [ ] GitHub Actions CI/CD matrix
-- [ ] ArgoCD ApplicationSet 10 service x 3 env
-- [ ] Argo Rollouts canary + auto-rollback
-- [ ] 6 senaryo reproduce + verify
-- [ ] 15 defter notu
+- [ ] Vault Secrets CSI integration çalışıyor
+- [ ] PostgreSQL + Kafka operator READY, failover doğrulandı
+- [ ] Istio service mesh (opsiyonel) mTLS STRICT
+- [ ] GitHub Actions CI/CD matrix, path filter + quality gate çalışıyor
+- [ ] ArgoCD ApplicationSet 10 service × 3 env, prod manuel
+- [ ] Argo Rollouts canary + metric analiz + auto-rollback doğrulandı
+- [ ] 6 senaryo reproduce + kanıt (`docs/deploy-scenarios/`)
+- [ ] 15 defter notu tam
+- [ ] Cevabı **rahatça** verebileceğim sorular: "Image nasıl imzalanıyor?", "Prod deploy neden manuel?", "Canary kötü sürümü nasıl yakalıyor?", "Drift'i ne geri alıyor?"
+
+Hepsi onaylı → Faz 11 PHASE_TEST'e geç → [PHASE_TEST.md](../PHASE_TEST.md)
 
 ---
 
-## Önemli not
+## Bu mini-project'in seviye işareti
 
-Phase 11 = **production deployment maturity**. Banking için bu phase:
+Phase 11 = **production deployment maturity**. Banking için bu, BDDK IT regülasyonlarına uyumlu, zero-downtime, audit trail'li (git + signed image), DR-capable ve compliance gate'li bir deploy demek. TR bankalarında **DevOps / Platform Engineer** rolleri tam bu skill setini istiyor.
 
-- BDDK IT regulations uyumlu deploy
-- Zero-downtime deploy
-- Audit trail (git + signed images)
-- DR capable
-- Compliance gate enforced
+Bunu bitiren senior backend engineer artık "deploy nasıl yapılıyor" değil **"deploy strategy + pipeline design"** perspektifinden konuşur. Phase 12 (Testing) ile quality assurance boyutunu da kapatınca **complete banking engineer** profilin tamamlanır.
 
-TR bankalarında **DevOps / Platform Engineer** roller bu skills'i istiyor. Senior backend engineer "deploy nasıl yapılıyor" değil "deploy strategy + pipeline design" perspective'inden bakabilmeli.
-
-Phase 12 (Testing) ile **quality assurance** dimension'unu kapatacağız → complete banking engineer profile.
+```admonish success title="Proje Tamamlama Kriterleri"
+- 10 banking service JIB ile image'a alınıyor; her build Trivy HIGH/CRITICAL'da kırılıyor, Cosign imzası `cosign verify` ile doğrulanıyor
+- Kustomize base + 3 overlay `kustomize build` ile hatasız render ediliyor; Deployment'ta non-root + probe + PDB + NetworkPolicy default-deny aktif
+- PostgreSQL (Zalando) + Kafka (Strimzi) operator'ları READY; broker/instance kaybında veri erişilebilir kalıyor
+- GitHub Actions matrix CI path filter + quality gate (SAST + SCA + Sonar + scan) ile çalışıyor; prod deploy zorunlu onay istiyor
+- ArgoCD ApplicationSet 10 service × 3 env üretiyor (prod manuel); Argo Rollouts canary metric bozulunca stable'a otomatik dönüyor
+- 6 senaryo (deploy / rollback / security gate / hotfix / drift / DR) reproduce edilip `docs/deploy-scenarios/` altında kanıtlanmış; 15 defter notu tam
+```

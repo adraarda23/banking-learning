@@ -1,4 +1,35 @@
+<div class="phase-cover-kicker">On Birinci Bölüm</div>
+
 # Faz 11 — DevOps: Docker, Kubernetes, CI/CD
+
+<div class="phase-cover-meta">
+<div><strong>Süre</strong> 1-2 hafta</div>
+<div><strong>Topic</strong> 4 konu + mini proje</div>
+<div><strong>Çıktı</strong> Containerized + K8s deploy</div>
+<div><strong>Ön koşul</strong> Faz 1-10 tamamlandı</div>
+</div>
+
+```admonish info title="Bu fazda ne öğreneceksin?"
+`core-banking`'i **production-grade dağıtıma** hazırlayacaksın: multi-stage Dockerfile,
+docker compose ile tam lokal stack, Kubernetes temel objeleri (Pod/Deployment/Service/Ingress/HPA),
+probe konfigürasyonu, Helm/Kustomize ve GitHub Actions + Jenkins ile CI/CD pipeline. TR bankalarının
+çoğu on-prem Kubernetes/OpenShift kullanıyor — bu artık nice-to-have değil, **must**.
+```
+
+## Fazın haritası
+
+```mermaid
+flowchart TD
+    subgraph Container["Hafta 1 — Container"]
+        direction LR
+        A["11.1 Docker for Java"] --> B["11.2 Docker Compose"]
+    end
+    subgraph Orkestrasyon["Hafta 2 — Orkestrasyon ve Pipeline"]
+        direction LR
+        C["11.3 Kubernetes Basics"] --> D["11.4 CI/CD"]
+    end
+    Container --> Orkestrasyon --> MP(["Mini Proje: E2E Container + K8s Deploy + CI/CD"])
+```
 
 ## Faz hedefi
 
@@ -113,3 +144,8 @@ Faz 11'i bitirdiğinde:
 ---
 
 > **Not:** Bu faz, "Java developer mıyım yoksa SRE/DevOps engineer mı olacağım?" sorusunun cevabı **değil**. Java developer'sın. Ama DevOps'u **konuşabilen, kendi pipeline'ını kurabilen, production incident'ı debug edebilen** bir Java developer'sın. TR'de mid-level role bunu artık zorunlu kılıyor.
+
+```admonish success title="Başla"
+İlk durak: [Topic 11.1 — Docker for Java](./01-docker-for-java/index.md).
+Her topic'i `core-banking` üzerinde uygula; mini projede E2E containerized deploy + K8s + CI/CD kuracaksın.
+```
