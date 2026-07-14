@@ -41,6 +41,11 @@
 - [x] QA temiz: 27 diyagram, 53 kutu, 56 soru, 89 katlanır kutu, 30 mark
 - [x] Commit: fba7574
 
+## Faz 3-4 yayılımı (2026-07-14)
+- [x] Faz 3 (Concurrency & JVM): 11 topic + mini proje, 45 diyagram, 66 kutu, 84 soru — commit e69c0d0
+- [x] Faz 4 (SQL & Oracle): 6 topic + mini proje, 29 diyagram, 44 kutu, 46 soru — commit 9b843ed
+- [ ] Kalan: Faz 5-12 (8 faz)
+
 ## Review
 - Faz 1 pilot tamam: 34 diyagram, ~70 kutu, 56 soru, 93 katlanır kutu; QA temiz
 - Format standardı tasks/lessons.md + hafızada — kalan 11 faza aynı şablonla yayılacak

@@ -1,6 +1,10 @@
 # Faz 5 — PHASE TEST
 
-Faz 6'ya geçmeden önce kendini sına.
+```admonish question title="Bu test ne işe yarar?"
+Faz 6'ya geçmeden önce kendini sına. Bu bir sınav değil, **dürüstlük kontrolü**:
+işaretleyemediğin her madde, hangi topic'e geri döneceğini gösterir.
+Hepsine "evet" diyebiliyorsan hazırsın.
+```
 
 ## Pratik test
 
@@ -113,4 +117,8 @@ TR bankalarının "core banking" sistemlerinin **gece 8 saati** EOD batch'lerle 
 
 **Mid-level developer için en çok zaman geçen alan.** Phase 5'i sağlam bilirsen TR bank tech ekibinin **iş gücüne hazır** olursun.
 
-Phase 6 mesajlaşma fazı — TR bankaları için modern uçtan biraz uzak (eski IBM MQ hâlâ var), ama yeni servislerin standart.
+```admonish success title="Sonraki durak: Faz 6"
+Phase 6 mesajlaşma fazı — TR bankaları için modern uçtan biraz uzak (eski IBM MQ hâlâ var),
+ama yeni servislerin standardı.
+→ [Faz 6 — Messaging & Events](../06-messaging/index.md)
+```

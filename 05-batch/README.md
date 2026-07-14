@@ -1,4 +1,35 @@
+<div class="phase-cover-kicker">Beşinci Bölüm</div>
+
 # Faz 5 — Spring Batch: Banking EOD ve Toplu İşleme
+
+<div class="phase-cover-meta">
+<div><strong>Süre</strong> 2-2.5 hafta</div>
+<div><strong>Topic</strong> 6 konu + mini proje</div>
+<div><strong>Çıktı</strong> EOD job'ları</div>
+<div><strong>Ön koşul</strong> Faz 1-4 tamamlandı</div>
+</div>
+
+```admonish info title="Bu fazda ne öğreneceksin?"
+Banking core sistemlerinin gece yarısı çalıştırdığı **EOD (End-of-Day) batch job'larını**
+Spring Batch ile yazmayı öğreneceksin: Job/Step modeli, chunk-oriented işleme, skip/retry/restart
+semantiği, listener'lar, partitioning ve scheduling. Fazın sonunda `core-banking`'de deterministik,
+restartable, izlenebilir mutabakat, faiz ve fraud job'ları çalışıyor olacak.
+```
+
+## Fazın haritası
+
+```mermaid
+flowchart TD
+    subgraph HaftaBir["Hafta 1 — Batch Temelleri"]
+        direction LR
+        A["5.1 Batch Architecture"] --> B["5.2 Chunk-Oriented"] --> C["5.3 Skip/Retry/Restart"]
+    end
+    subgraph HaftaIki["Hafta 2 — Akış ve Ölçek"]
+        direction LR
+        D["5.4 Listeners & Flow"] --> E["5.5 Partitioning"] --> F["5.6 Scheduling"]
+    end
+    HaftaBir --> HaftaIki --> MP(["Mini Proje: EOD Jobs + Faz Testi"])
+```
 
 ## Hedef
 
@@ -79,31 +110,20 @@ Bu faz tam olarak bu özellikleri öğretiyor.
 
 ## Spring Batch'in mimari resmi (high-level)
 
+```mermaid
+flowchart LR
+    JL["JobLauncher"] --> J["Job"]
+    J --> S1["Step 1"]
+    J --> S2["Step 2"]
+    J -->|"state persist eder"| JR[("JobRepository<br/>BATCH_* tabloları")]
+    subgraph Chunk["Chunk-Oriented Step"]
+        direction LR
+        R["ItemReader"] --> P["ItemProcessor"] --> W["ItemWriter"]
+    end
+    S1 -.-> Chunk
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Spring Batch Framework                                     │
-│                                                             │
-│  ┌─────────────┐    ┌──────────────┐    ┌──────────────┐    │
-│  │ JobLauncher │───→│     Job      │───→│    Step 1    │    │
-│  └─────────────┘    │              │    └──────────────┘    │
-│                     │              │    ┌──────────────┐    │
-│                     │              │───→│    Step 2    │    │
-│                     │              │    └──────────────┘    │
-│                     └──────┬───────┘                        │
-│                            │ persists state                 │
-│                            ↓                                │
-│                     ┌──────────────────┐                    │
-│                     │  JobRepository   │                    │
-│                     │  (BATCH_* tables)│                    │
-│                     └──────────────────┘                    │
-│                                                             │
-│   Step (chunk-oriented):                                    │
-│   ┌────────────┐  ┌──────────────┐  ┌────────────┐          │
-│   │ ItemReader │→ │ItemProcessor │→ │ ItemWriter │          │
-│   └────────────┘  └──────────────┘  └────────────┘          │
-│   read N items → process each → write batch (1 TX)          │
-└─────────────────────────────────────────────────────────────┘
-```
+
+Chunk-oriented step'te akış şu: N item oku → her birini işle → batch halinde tek transaction'da yaz.
 
 `JobRepository` PostgreSQL'de `BATCH_JOB_INSTANCE`, `BATCH_JOB_EXECUTION`, `BATCH_STEP_EXECUTION`, `BATCH_JOB_EXECUTION_CONTEXT`, `BATCH_STEP_EXECUTION_CONTEXT`, `BATCH_JOB_EXECUTION_PARAMS` tablolarında state tutar. Bu tablolar **restart'ın anahtarıdır**.
 
@@ -119,7 +139,9 @@ Bu faz tam olarak bu özellikleri öğretiyor.
 - [ ] ShedLock'lu bir scheduled job'u 2 instance'ta çalıştırdım, yalnızca biri tetikledi
 - [ ] PHASE_TEST'in tüm sorularına cevap verebiliyorum
 
-Sonraki adım: Faz 6 → [06-messaging/](../06-messaging/)
+```admonish success title="Sonraki durak: Faz 6"
+6 topic + mini proje bitti ve EOD job'ların çalışıyorsa → [Faz 6 — Messaging & Events](../06-messaging/index.md)'a geç.
+```
 
 ---
 

@@ -1,4 +1,35 @@
+<div class="phase-cover-kicker">Altıncı Bölüm</div>
+
 # Faz 6 — Messaging & Events (Kafka odaklı)
+
+<div class="phase-cover-meta">
+<div><strong>Süre</strong> 3-4 hafta</div>
+<div><strong>Topic</strong> 7 konu + mini proje</div>
+<div><strong>Çıktı</strong> Event-driven core-banking</div>
+<div><strong>Ön koşul</strong> Faz 1-5 tamamlandı</div>
+</div>
+
+```admonish info title="Bu fazda ne öğreneceksin?"
+Synchronous monolitik `core-banking`'i **event-driven mimariye** taşıyacaksın: Kafka cluster
+mimarisi, producer (idempotence, transactions), consumer (group, offset, rebalancing), Spring Kafka,
+Kafka Streams, outbox pattern ve saga. Fazın sonunda bir transfer `TransferCompleted` event'i yayınlayacak,
+notification/audit/fraud servisleri onu bağımsız tüketecek.
+```
+
+## Fazın haritası
+
+```mermaid
+flowchart TD
+    subgraph Temel["Hafta 1-2 — Kafka Çekirdeği"]
+        direction LR
+        A["6.1 Architecture"] --> B["6.2 Producer"] --> C["6.3 Consumer"] --> D["6.4 Spring Kafka"]
+    end
+    subgraph Ileri["Hafta 3-4 — İleri Patterns"]
+        direction LR
+        E["6.5 Kafka Streams"] --> F["6.6 Outbox & CDC"] --> G["6.7 Saga"]
+    end
+    Temel --> Ileri --> MP(["Mini Proje: Event-Driven Banking + Faz Testi"])
+```
 
 ## Genel bakış
 
@@ -15,21 +46,13 @@ Bu faza geldiğinde elinde **monolitik core-banking** uygulaması var (Faz 1-5):
 
 **Çözüm:** **Event-driven mimari**. Transfer tamamlandığında bir `TransferCompleted` event'i yayınla. İlgilenen her servis bağımsız tüketsin.
 
-```
-       ┌─────────────────┐
-       │ transfer-service│
-       └────────┬────────┘
-                │ publish TransferCompleted
-                ↓
-        ┌───────────────────┐
-        │   Kafka topic     │
-        │ transfer.completed│
-        └────┬──┬──┬───┬────┘
-             │  │  │   │
-   ┌─────────┘  │  │   └────────┐
-   │            │  │            │
-   ↓            ↓  ↓            ↓
-notification  audit  fraud   bi-report
+```mermaid
+flowchart TD
+    TS["transfer-service"] -->|"publish TransferCompleted"| K[["Kafka topic<br/>transfer.completed"]]
+    K --> N["notification"]
+    K --> A["audit"]
+    K --> F["fraud"]
+    K --> B["bi-report"]
 ```
 
 Her consumer **kendi hızında** tüketir, kendi DB'sine yazar, kendi hatasını yönetir.
