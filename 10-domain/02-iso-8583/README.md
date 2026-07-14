@@ -1,54 +1,76 @@
 # Topic 10.2 — ISO 8583: Card Transaction Messaging
 
+```admonish info title="Bu bölümde"
+- Kart makinesinin bankaya gönderdiği mesajın anatomisi: **MTI** (4 hane) + **bitmap** (hangi alanlar var) + **data element**'ler
+- `0100` authorization ile `0200` financial mesajlarının farkı ve authorization hold → capture → settlement döngüsü
+- POS → acquirer → network → issuer uçtan uca akışı, BIN routing ve `< 2 saniye` hedefi
+- Reversal'ın (0400) neden idempotent olması gerektiği, EMV cryptogram (ARQC) ile klon kart koruması
+- Banking'in taviz vermediği katman: PCI-DSS — PAN maskeleme, track/CVV hiç saklanmama, tokenization
+```
+
 ## Hedef
 
-ISO 8583 kart işlem mesajlaşma standardını banking-grade derinlikte öğrenmek: MTI (Message Type Indicator), bitmap, data elements, transaction flow (authorization, capture, refund, reversal), POS/ATM acquirer-issuer flow, BKM (Türk kart yapısı), Visa/Mastercard/Troy network entegrasyonu, EMV co-existence, ISO 8583 → ISO 20022 migration.
+ISO 8583 kart işlem mesajlaşma standardını banking-grade derinlikte öğrenmek: MTI (Message Type Indicator), bitmap, data element'ler, transaction flow (authorization, capture, refund, reversal), POS/ATM acquirer-issuer akışı, BKM (Türk kart yapısı), Visa/Mastercard/Troy network entegrasyonu, EMV co-existence ve ISO 8583 → ISO 20022 migration.
 
 ## Süre
 
-Okuma: 2.5 saat • Mini task: 2.5 saat • Test: 1 saat • Toplam: ~6 saat
+Okuma: 2.5 saat • Kendini Sına: 30 dk • Pratik (opsiyonel): 3-4 saat • Toplam: ~2.5 saat (+ pratik)
 
 ## Önbilgi
 
-- Topic 10.1 (Double-entry accounting) bitti
-- Kart işleme temel kavramı
-- Binary protokol bilmek bonus
+- Topic 10.1 (Double-entry accounting) bitti — debit/credit ve journal posting biliyorsun
+- Kart işlemenin temel akışını (müşteri kartı okutur, banka onaylar) kabaca gördün
+- Binary protokol ve bit-level düşünmek bonus
 
 ---
 
 ## Kavramlar
 
-### 1. ISO 8583 — what + why
+### 1. ISO 8583 — neden var, ne çözer
 
-ISO 8583 = **financial transaction card-originated message** standardı. Versions:
-- ISO 8583:1987 — orijinal
+Kart makinesi bankaya bir mesaj göndermek zorunda: "şu kartla, şu tutarda, şu terminalden bir alışveriş yapılmak isteniyor — onaylıyor musun?". Bu mesajın formatı bankadan bankaya, ülkeden ülkeye farklı olsaydı hiçbir POS hiçbir bankaya bağlanamazdı. **ISO 8583** işte bu ortak dili tanımlayan *financial transaction card-originated message* standardıdır.
+
+Üç ana sürümü var ve pratikte üçü de sahada dolaşır:
+
+- ISO 8583:1987 — orijinal, hâlâ en yaygın (`ISO87` packager)
 - ISO 8583:1993 — güncellenmiş
-- ISO 8583:2003 — modern (XML-friendly versions)
+- ISO 8583:2003 — modern, XML-friendly
 
-**Use cases:**
+Standart tek bir işlem tipi için değil; kart ekosisteminin neredeyse tüm mesajlaşmasını taşır:
+
 - POS terminal → acquirer → network (Visa/MC/Troy) → issuer
-- ATM cash withdrawal
-- E-commerce auth
+- ATM nakit çekme
+- E-ticaret authorization (online doğrulama)
 - Refund / void / reversal
-- Card authorization (online verification)
 - Card capture (batch settlement)
 
-**Banking ecosystem:**
-```
-[POS Terminal]                                 
-   ↓ ISO 8583
-[Merchant Acquirer Bank]                       
-   ↓ ISO 8583
-[Network (Visa/Mastercard/Troy/BKM)]           
-   ↓ ISO 8583
-[Issuer Bank (kart sahibi banka)]              
-   ↓ approve/decline
-... back to merchant
+Ekosistemdeki oyuncular bir zincir oluşturur; **acquirer** işyerinin bankası, **issuer** kart sahibinin bankası, ortada da network switch vardır:
+
+```mermaid
+flowchart LR
+    POS["POS terminal"] -->|"0100 istek"| ACQ["Acquirer banka"]
+    ACQ -->|"route by BIN"| NET["Network switch"]
+    NET --> ISS["Issuer banka"]
+    ISS -->|"0110 yanit"| NET
+    NET --> ACQ
+    ACQ --> POS
 ```
 
-End-to-end < 2 saniye (target).
+Müşteri kartını okuttuğunda bu tüm tur `< 2 saniye` içinde tamamlanmalıdır — hedef budur ve gecikme doğrudan kasa kuyruğuna yansır.
 
-### 2. Message Type Indicator (MTI) — 4 digit
+### 2. Message Type Indicator (MTI) — mesajın kimliği
+
+Her ISO 8583 mesajı 4 haneli bir **MTI** ile başlar; bu dört hane mesajın "kim, ne, hangi yönde" sorularını tek bakışta cevaplar. Her pozisyon bağımsız bir anlam taşır:
+
+```mermaid
+flowchart LR
+    MTI["MTI ornek 0200"] --> P1["Pozisyon 1 version"]
+    MTI --> P2["Pozisyon 2 class"]
+    MTI --> P3["Pozisyon 3 function"]
+    MTI --> P4["Pozisyon 4 origin"]
+```
+
+Pozisyonların açılımı:
 
 ```
 Position 1: Version
@@ -82,7 +104,7 @@ Position 4: Message origin
   4 — Other
 ```
 
-**Common MTI:**
+Örnek okuma: `0200` = ISO87 + Financial + Request + Acquirer, yani "acquirer'dan gelen bir financial istek". Sahada en çok karşılaşacağın MTI'lar:
 
 | MTI | Anlam |
 |---|---|
@@ -98,20 +120,26 @@ Position 4: Message origin
 | `0800` | Network Management (echo, sign-on, sign-off) |
 | `0810` | Network Management Response |
 
-### 3. Bitmap — which fields are present
+Bir tuzak: `0100` (authorization) ile `0200` (financial) sık karıştırılır. `0100` sadece "para var mı, kart geçerli mi" sorar ve **hold** koydurur; `0200` ise fonu gerçekten hareket ettiren financial mesajdır. Bu ayrımı Bölüm 6'da somutlaştıracağız.
 
-Each ISO 8583 message has 1-2 bitmaps (64 or 128 bits).
+### 3. Bitmap — hangi alanlar var
 
-```
-Primary bitmap (bits 1-64): mandatory
-Secondary bitmap (bits 65-128): if bit 1 of primary set
-```
+Bir ISO 8583 mesajı yüzlerce olası alan içerebilir ama her mesajda hepsi bulunmaz. **Bitmap** tam olarak "bu mesajda hangi data element'ler mevcut" sorusunu cevaplayan bit haritasıdır. Alıcı, önce bitmap'i okur, sonra sadece işaretli alanları parse eder.
 
-Bit X set → field X present in message.
+Her mesajda 1-2 bitmap bulunur:
 
 ```
-Hex bitmap example: 7220000102C04822
-Binary:             0111 0010 0010 0000 0000 0000 ...
+Primary bitmap (bits 1-64): zorunlu
+Secondary bitmap (bits 65-128): primary'nin bit 1'i set ise var
+```
+
+Kural basit: **bit X set → field X mesajda mevcut**. Primary bitmap'in 1. biti bir "flag"tir; set ise ikinci bir 64-bitlik secondary bitmap daha gelir ve toplam 128 alana kadar çıkarsın.
+
+Hex bir bitmap'in nasıl okunduğunu görelim — her hex hane 4 bit açar:
+
+```
+Hex bitmap:  7220000102C04822
+Binary:      0111 0010 0010 0000 ...
 
 Bit 2 set → PAN present
 Bit 3 set → Processing code present
@@ -119,27 +147,82 @@ Bit 4 set → Amount, transaction present
 ...
 ```
 
-Parsing logic:
+Kavramı tek resimde toplayalım — wire üzerinde sıra MTI → bitmap → set edilmiş data element'ler şeklindedir:
+
+```mermaid
+flowchart LR
+    subgraph WIRE["ISO 8583 mesaji"]
+        MTI["MTI 4 hane"] --> BM["Primary bitmap 64 bit"]
+        BM --> SEC["Secondary bitmap 64 bit"]
+        SEC --> DE["Data elements"]
+    end
+    BM -->|"bit 2 set"| PAN["DE2 PAN"]
+    BM -->|"bit 4 set"| AMT["DE4 amount"]
+    BM -->|"bit 39 set"| RC["DE39 response"]
+```
+
+Parse mantığının kalbi de bu sıradır: MTI'yı oku, bitmap'i çöz, ikincil varsa birleştir, sonra set olan her bit için ilgili alanı oku. Önce iskeleti görelim:
+
 ```java
 public class IsoMessage {
     private String mti;
     private BitSet bitmap;
     private Map<Integer, String> fields;
-    
+```
+
+Bitmap parse edilirken önce primary, ardından (bit 1 set ise) secondary alınır ve ikisi `or` ile birleştirilir; `offset` her adımda ilerler:
+
+```java
+    public void parse(byte[] data) {
+        mti = readAscii(data, 0, 4);              // MTI ilk 4 char
+        bitmap = parseBitmap(data, 4, 8);         // primary: 8 byte = 64 bit
+
+        int offset = 12;
+        if (bitmap.get(0)) {                       // bit 1 = secondary bitmap var
+            BitSet secondary = parseBitmap(data, offset, 8);
+            bitmap.or(secondary);                  // 128 bit toplam
+            offset += 8;
+        }
+```
+
+Son olarak 2'den 128'e kadar set olan her bit için, alanın tanımına (`FieldDefinition`) göre değeri okuyup `offset`'i o kadar ilerletirsin:
+
+```java
+        for (int i = 2; i <= 128; i++) {           // bit 1 bitmap gostergesi
+            if (bitmap.get(i - 1)) {
+                FieldDefinition def = FIELD_DEFS.get(i);
+                String value = readField(data, offset, def);
+                fields.put(i, value);
+                offset += def.length(value);
+            }
+        }
+    }
+}
+```
+
+<details>
+<summary>Tam kod: IsoMessage.parse (~30 satır)</summary>
+
+```java
+public class IsoMessage {
+    private String mti;
+    private BitSet bitmap;
+    private Map<Integer, String> fields;
+
     public void parse(byte[] data) {
         // MTI first 4 chars (BCD or ASCII)
         mti = readAscii(data, 0, 4);
-        
+
         // Primary bitmap: bytes 4-12 (8 bytes = 64 bits)
         bitmap = parseBitmap(data, 4, 8);
-        
+
         int offset = 12;
         if (bitmap.get(0)) {   // bit 1 = secondary bitmap
             BitSet secondary = parseBitmap(data, offset, 8);
             bitmap.or(secondary);   // 128 total
             offset += 8;
         }
-        
+
         for (int i = 2; i <= 128; i++) {   // bit 1 is bitmap indicator
             if (bitmap.get(i - 1)) {
                 FieldDefinition def = FIELD_DEFS.get(i);
@@ -152,7 +235,11 @@ public class IsoMessage {
 }
 ```
 
-### 4. Data elements — most important fields
+</details>
+
+### 4. Data element'ler — en kritik alanlar
+
+Bitmap "hangi alan var" der; data element'ler o alanların ne taşıdığıdır. Yüzden fazla tanımlı alan var ama banking'de günlük işin %90'ı aşağıdaki tabloyla döner. En önemlisi **DE2 = PAN** (Primary Account Number), yani kart numarası:
 
 | Bit | Field | Format | Banking örnek |
 |---|---|---|---|
@@ -162,7 +249,7 @@ public class IsoMessage {
 | 5 | Amount, settlement | n12 | (after FX) |
 | 6 | Amount, cardholder billing | n12 | (multi-currency) |
 | 7 | Transmission date+time | n10 (MMDDhhmmss) | "0512103045" |
-| 11 | Systems trace audit number (STAN) | n6 | "123456" — unique per device |
+| 11 | Systems trace audit number (STAN) | n6 | "123456" — cihaz başına unique |
 | 12 | Local transaction time | n6 (hhmmss) | "103045" |
 | 13 | Local transaction date | n4 (MMDD) | "0512" |
 | 14 | Expiration date | n4 (YYMM) | "2512" |
@@ -172,7 +259,7 @@ public class IsoMessage {
 | 32 | Acquiring institution ID | n..11 LLVAR | "987654321" |
 | 35 | Track 2 data | z..37 LLVAR | "4532...=2512..." (deprecated, PCI-DSS) |
 | 37 | Retrieval reference number (RRN) | an12 | "240512103045" |
-| 38 | Authorization ID response | an6 | "123456" — issued by issuer |
+| 38 | Authorization ID response | an6 | "123456" — issuer üretir |
 | 39 | Response code | an2 | "00" = approved, "05" = decline |
 | 41 | Card acceptor terminal ID | ans8 | "TERM0001" |
 | 42 | Card acceptor ID | ans15 | "MERCHANT0000001" |
@@ -183,17 +270,17 @@ public class IsoMessage {
 | 55 | ICC data (EMV) | an..255 LLLVAR | TLV EMV chip data |
 | 62 | Custom data | an..999 LLLVAR | Network-specific |
 
-**Format codes:**
-- `n` = numeric
-- `a` = alpha
-- `an` = alphanumeric
-- `ans` = alphanumeric + special
-- `b` = binary
-- `z` = track 2
-- `LLVAR` = 2-digit length prefix
-- `LLLVAR` = 3-digit length prefix
+Format kodları alan uzunluğunu ve tipini söyler; `LLVAR`/`LLLVAR` değişken uzunluklu alanların başındaki uzunluk önekidir:
 
-### 5. Response codes — common
+- `n` = numeric, `a` = alpha, `an` = alphanumeric, `ans` = alphanumeric + special
+- `b` = binary, `z` = track 2
+- `LLVAR` = 2 haneli uzunluk öneki, `LLLVAR` = 3 haneli uzunluk öneki
+
+Dikkat edilecek nokta: **DE4 (amount)** implicit 2 decimal taşır — `000000010000` on iki hanelik sabit alan olup `100.00 TL` demektir. Ondalık nokta yoktur; kayan noktayı asla kullanma, tam sayı olarak işle.
+
+### 5. Response code'lar — issuer'ın cevabı
+
+Issuer kararını **DE39 (response code)** ile bildirir; `00` onay, geri kalan her şey bir tür ret veya yönlendirmedir. Spesifik kod seçmek UX ve operasyon açısından kritiktir — "insufficient funds" ile "expired card" müşteriye tamamen farklı şey söyler:
 
 | Code | Anlam | Banking |
 |---|---|---|
@@ -218,11 +305,11 @@ public class IsoMessage {
 | `91` | Issuer or switch inoperative | Timeout |
 | `96` | System malfunction | Generic |
 
-### 6. Authorization flow — full example
+### 6. Authorization flow — uçtan uca örnek
 
-#### Step 1: Cardholder swipes / inserts / taps card at POS
+Şimdi teoriyi tek bir alışverişte birleştirelim: müşteri kartını okuttu, ne oluyor? Akış yedi adımdan geçer; önce mesaj kurulur, sonra zincir boyunca ilerler.
 
-POS construct message:
+**Adım 1 — POS mesajı kurar.** Kart okunduğunda POS bir `0100` inşa eder ve gerekli alanları doldurur:
 
 ```
 MTI: 0100
@@ -242,69 +329,56 @@ Bit 49 (Currency): 949 (TRY)
 Bit 55 (EMV chip data): <TLV EMV>
 ```
 
-#### Step 2: POS → Acquirer bank (Maven Bank)
+**Adım 2 — POS → Acquirer.** Acquirer mesaj formatını doğrular, işyerinin aktif olduğunu kontrol eder, fraud kurallarını (velocity, coğrafya) uygular ve network'e route eder.
 
-Acquirer:
-- Validate message format
-- Verify merchant active
-- Apply fraud rules (velocity, geography)
-- Route to network (Visa/Mastercard/Troy/BKM)
-
-#### Step 3: Acquirer → Network → Issuer
-
-Network routing by **BIN (Bank Identification Number)**, first 6-8 digits of PAN.
+**Adım 3 — Acquirer → Network → Issuer.** Yönlendirme **BIN (Bank Identification Number)** üzerinden yapılır; BIN, PAN'ın ilk 6-8 hanesidir:
 
 ```
 PAN: 4532-1488-0343-6467
-BIN: 453214 → resolves to "ABC Bank issuer"
+BIN: 453214 → "ABC Bank issuer"
 ```
 
-Network forwards to issuer bank.
+Network, BIN'e bakıp mesajı doğru issuer'a iletir.
 
-#### Step 4: Issuer decision
+**Adım 4 — Issuer karar verir.** Kartı bulur (PAN içeride tokenize/encrypted), durum kontrolü (aktif mi, bloklu mu), velocity ve limit kontrolü, bakiye (debit) veya kullanılabilir kredi (credit) kontrolü, fraud skoru, e-ticarette 3D Secure, PIN/CVV doğrulaması yapar. Karar approve ise kartta **authorization hold** koyar — para henüz düşmez, ayrılır.
 
-Issuer:
-- Card lookup (PAN encrypted/tokenized internally)
-- Card status check (active, not blocked)
-- Velocity check (daily TX count)
-- Limit check (daily amount)
-- Balance check (debit card) / credit available (credit card)
-- Fraud score
-- 3D Secure verify (e-commerce için)
-- PIN/CVV verify
-
-Decision: approve / decline → response code.
-
-If approve: **hold amount** on card account (authorization hold).
-
-#### Step 5: Issuer response
+**Adım 5 — Issuer yanıt döner.** `0110` mesajında karar taşınır:
 
 ```
 MTI: 0110
 Bit 2-49: (echo)
 Bit 38 (Auth ID): 123456 (issuer-generated)
-Bit 39 (Response): 00 (approved) or other
+Bit 39 (Response): 00 (approved) veya diğer
 ```
 
-#### Step 6: Back through network → acquirer → POS
+**Adım 6 — Geri dönüş.** Network → acquirer → POS. POS fişi basar, müşteri malını alır.
 
-POS: prints receipt, customer leaves with goods.
+**Adım 7 — Settlement (sonra, batch).** Acquirer authorization'ları biriktirir (genelde EOD) ve `0220` advice ile network'e gönderir; issuer hold'u gerçek debit'e çevirir. Tüm bu akış zaman ekseninde şöyledir:
 
-#### Step 7: Settlement (later, batch)
-
-Acquirer batches authorizations (typically EOD):
+```mermaid
+sequenceDiagram
+    participant POS as POS terminal
+    participant ACQ as Acquirer
+    participant NET as Network
+    participant ISS as Issuer
+    POS->>ACQ: 0100 authorization request
+    ACQ->>NET: route by BIN
+    NET->>ISS: 0100 forward
+    Note over ISS: limit, bakiye, fraud, PIN kontrol
+    ISS-->>NET: 0110 response code 00
+    NET-->>ACQ: 0110
+    ACQ-->>POS: onay ve fis
+    Note over ACQ,ISS: EOD settlement batch
+    ACQ->>NET: 0220 advice capture
+    NET->>ISS: 0220
+    Note over ISS: hold artik gercek debit
 ```
-MTI: 0220 (Advice)
-... captured authorizations ...
-```
 
-Sent to network → cleared via central bank.
+Buradaki kritik ayrım: `0100`/`0110` sadece parayı **ayırır** (hold), `0220` ise fonu **hareket ettirir** (capture). Authorization ile settlement arasında saatler olabilir.
 
-Issuer: actual debit (was hold, now confirmed).
+### 7. Reversal flow — bir şey ters gidince
 
-### 7. Reversal flow — what when wrong
-
-POS timeout, partial complete, customer cancellation:
+Her işlem temiz bitmez: POS timeout yer, işlem yarım kalır, müşteri iptal eder. Bu durumda ayrılan hold'un geri bırakılması gerekir — bunu **`0400` reversal request** yapar:
 
 ```
 MTI: 0400 (Reversal Request)
@@ -312,52 +386,50 @@ Bit 90 (Original data elements): MTI + STAN + transmission date+time + acquirer 
 Bit 39: (reason code)
 ```
 
-Issuer: release hold.
+**DE90 (original data elements)** hangi orijinal işlemin geri alındığını tanımlar — issuer bununla doğru hold'u bulup serbest bırakır. Reversal'ın banking'de üç değişmezi vardır:
 
-**Banking critical:**
-- Reversal **idempotent** (network retry safe)
-- 24-hour SLA reversal window
-- Late reversal → chargeback dispute
+<mark>Reversal idempotent olmak zorundadır: network aynı reversal'ı birçok kez retry edebilir ve hold tam olarak bir kez serbest bırakılmalıdır.</mark> Ayrıca 24 saatlik bir SLA penceresi vardır; geç reversal chargeback dis'una dönüşür.
 
-### 8. EMV chip data — bit 55
+```admonish warning title="Reversal olmadan olmaz"
+POS timeout aldığında issuer belki authorization'ı onaylamıştır (hold koydu) ama POS yanıtı hiç görmedi. Reversal göndermezsen müşterinin parası "asılı" kalır — bakiyesi düşük görünür, şikayet gelir. Timeout = otomatik reversal, pazarlık yok.
+```
 
-EMV (Europay/Mastercard/Visa) chip data carried in bit 55 (TLV format):
+### 8. EMV chip data — DE55
+
+Manyetik şerit kopyalanabilir; EMV chip bunu çözmek için her işlemde dinamik bir kriptografik imza üretir. Bu chip verisi **DE55**'te TLV (Tag-Length-Value) formatında taşınır:
 
 ```
 Tag-Length-Value:
 
-9F1A 02 0840           # Terminal country code
-5A   08 4532148803436467  # PAN
-9F26 08 ABCD1234...     # Application Cryptogram (ARQC)
-9F27 01 80              # Cryptogram Information Data
-9F36 02 00FF            # Application Transaction Counter
+9F1A 02 0840              # Terminal country code
+5A   08 4532148803436467 # PAN
+9F26 08 ABCD1234...      # Application Cryptogram (ARQC)
+9F27 01 80               # Cryptogram Information Data
+9F36 02 00FF             # Application Transaction Counter
 ```
 
-EMV cryptogram (ARQC) = card-generated, includes transaction details + dynamic counter → **replay attack prevention**.
+İşin sırrı **ARQC (Application Request Cryptogram)**'dadır: kart, işlem detaylarını ve artan bir sayacı (ATC) kullanarak bu kriptogramı üretir. <mark>ARQC her işlemde değiştiği ve issuer'ın paylaşılan anahtarıyla doğrulandığı için replay ve klon kart saldırılarını engeller.</mark> Issuer kriptogramı doğrulayamazsa kart "gerçek" değildir.
 
-Issuer verifies cryptogram with shared key → genuine card.
+### 9. Türk kart altyapısı — BKM ve Troy
 
-### 9. Banking — Türk kart altyapısı (BKM, Troy)
+Türkiye'de kart trafiği kendi switch'inden geçer; global network'lere ek olarak yerel bir katman vardır. Bunun merkezi **BKM (Bankalararası Kart Merkezi)**'dir:
 
-**BKM (Bankalararası Kart Merkezi):**
 - TR domestic card network
-- Switch between Turkish banks
+- Türk bankaları arasında switch
 - ATM/POS routing
-- Settlement coordination
+- Settlement koordinasyonu
 
-**Troy:**
-- Turkish chip-and-PIN card brand (national)
-- BKM operates
-- Visa/MC alternative for domestic
+**Troy**, BKM'nin işlettiği yerli chip-and-PIN kart markasıdır — domestic işlemlerde Visa/MC alternatifi.
 
-**TR card flow specifics:**
-- All POS traffic via BKM switch (regulation)
-- 3D Secure mandatory online (BDDK requirement)
-- KKB (Kredi Kayıt Bürosu) — credit score check before approval
+TR'ye özgü akış kuralları da var ve mülakatta sorulur:
 
-### 10. Implementation — ISO 8583 Java library
+- Tüm POS trafiği regülasyon gereği BKM switch üzerinden
+- Online işlemlerde 3D Secure zorunlu (BDDK gerekliliği)
+- Kredi için KKB (Kredi Kayıt Bürosu) skor kontrolü onay öncesi
 
-`jPOS` (open source) en yaygın:
+### 10. jPOS ile ISO 8583 — Java implementasyonu
+
+Teoriyi koda dökerken tekerleği yeniden icat etmezsin; Java dünyasında en yaygın açık kaynak kütüphane **jPOS**'tur. Önce dependency:
 
 ```xml
 <dependency>
@@ -367,7 +439,7 @@ Issuer verifies cryptogram with shared key → genuine card.
 </dependency>
 ```
 
-Build message:
+Mesaj kurmak `ISOMsg` ile alan-alan set etmektir; MTI ve bitmap'i jPOS senin yerine yönetir:
 
 ```java
 ISOMsg msg = new ISOMsg();
@@ -390,7 +462,8 @@ msg.setPackager(packager);
 byte[] data = msg.pack();
 ```
 
-Parse incoming:
+Gelen mesajı parse etmek de simetriktir — packager set edip `unpack`, sonra alanları oku:
+
 ```java
 ISOMsg incoming = new ISOMsg();
 incoming.setPackager(packager);
@@ -404,13 +477,13 @@ String responseCode = incoming.getString(39);
 
 ### 11. ISO 8583 server — TCP socket
 
-jPOS Q2 framework:
+ISO 8583 HTTP değil, ham TCP socket üzerinde konuşur; kalıcı bağlantılar ve uzunluk-öneki framing gerektirir. jPOS'un **Q2** framework'ü bunu deklaratif XML ile kurar — bir channel-adaptor (giden) ve bir server (gelen):
 
 ```xml
 <!-- q2 deploy file -->
-<channel-adaptor name="acquirer-channel" 
+<channel-adaptor name="acquirer-channel"
                  class="org.jpos.q2.iso.ChannelAdaptor">
-    <channel class="org.jpos.iso.channel.ASCIIChannel" 
+    <channel class="org.jpos.iso.channel.ASCIIChannel"
              packager="org.jpos.iso.packager.ISO87BPackager">
         <property name="host" value="acquirer.bank.tr"/>
         <property name="port" value="9999"/>
@@ -421,7 +494,7 @@ jPOS Q2 framework:
 
 <server name="server" class="org.jpos.q2.iso.QServer">
     <attr name="port" type="java.lang.Integer">8000</attr>
-    <channel class="org.jpos.iso.channel.NACChannel" 
+    <channel class="org.jpos.iso.channel.NACChannel"
              packager="org.jpos.iso.packager.ISO87BPackager"/>
     <request-listener class="com.bank.iso.AuthRequestListener">
         <property name="space" value="space:default"/>
@@ -430,14 +503,22 @@ jPOS Q2 framework:
 </server>
 ```
 
-### 12. ISO 8583 in Spring Boot — modern wrapping
+Gelen `0100`'ler `AuthRequestListener`'a düşer; orada iş mantığını çalıştırıp `0110` dönersin.
+
+### 12. Spring Boot'ta ISO 8583 — modern sarma
+
+Modern banking servisinde ISO 8583'ü çıplak kullanmazsın; onu bir Spring service arkasına saklayıp domain-friendly bir API sunarsın. Servis, request'i `ISOMsg`'a çevirir, acquirer'a yollar, yanıtı domain nesnesine döndürür. İskelet:
 
 ```java
 @Service
 public class CardAuthorizationService {
-    
+
     private final AcquirerClient acquirerClient;
-    
+```
+
+Ana method request'i alıp mesajı kurar; processing code ve amount dönüşümleri domain'den ISO'ya köprüdür:
+
+```java
     public AuthorizationResult authorize(AuthorizationRequest req) {
         ISOMsg msg = new ISOMsg();
         msg.setMTI("0100");
@@ -445,19 +526,27 @@ public class CardAuthorizationService {
         msg.set(3, processingCode(req.transactionType()));
         msg.set(4, formatAmount(req.amount(), 2));   // 2 decimal implicit
         // ... fields
-        
+```
+
+Mesaj gönderilir (timeout ile), yanıttan response code ve auth ID okunup domain sonucuna paketlenir:
+
+```java
         ISOMsg response = acquirerClient.send(msg, Duration.ofSeconds(5));
-        
+
         String rc = response.getString(39);
         String authId = response.getString(38);
-        
+
         return AuthorizationResult.builder()
             .approved("00".equals(rc))
             .responseCode(rc)
             .authorizationId(authId)
             .build();
     }
-    
+```
+
+Kritik detay `formatAmount`'tadır: `BigDecimal` tutarı DE4'ün 12 hanelik implicit-2-decimal formatına çevirir — `movePointRight` ile ondalığı kaydırıp sıfır-pad edersin:
+
+```java
     private String formatAmount(BigDecimal amount, int decimals) {
         // 100.00 TL → "000000010000"
         BigDecimal scaled = amount.movePointRight(decimals);
@@ -466,23 +555,62 @@ public class CardAuthorizationService {
 }
 ```
 
-### 13. PCI-DSS + ISO 8583
+<details>
+<summary>Tam kod: CardAuthorizationService (~32 satır)</summary>
 
-ISO 8583 carries **cardholder data** (PAN, expiry, track data).
+```java
+@Service
+public class CardAuthorizationService {
 
-**PCI-DSS requirements:**
-- PAN encrypted at rest (envelope encryption Topic 8.6)
-- PAN masked in logs (last 4 only)
-- Track data NEVER stored after authorization
-- CVV NEVER stored
-- Encryption in transit (mutual TLS)
-- Logs without sensitive data
-- Tokenization preferred (acquirer stores token, not PAN)
+    private final AcquirerClient acquirerClient;
+
+    public AuthorizationResult authorize(AuthorizationRequest req) {
+        ISOMsg msg = new ISOMsg();
+        msg.setMTI("0100");
+        msg.set(2, req.pan());
+        msg.set(3, processingCode(req.transactionType()));
+        msg.set(4, formatAmount(req.amount(), 2));   // 2 decimal implicit
+        // ... fields
+
+        ISOMsg response = acquirerClient.send(msg, Duration.ofSeconds(5));
+
+        String rc = response.getString(39);
+        String authId = response.getString(38);
+
+        return AuthorizationResult.builder()
+            .approved("00".equals(rc))
+            .responseCode(rc)
+            .authorizationId(authId)
+            .build();
+    }
+
+    private String formatAmount(BigDecimal amount, int decimals) {
+        // 100.00 TL → "000000010000"
+        BigDecimal scaled = amount.movePointRight(decimals);
+        return String.format("%012d", scaled.toBigInteger());
+    }
+}
+```
+
+</details>
+
+### 13. PCI-DSS + ISO 8583 — pazarlıksız katman
+
+ISO 8583 mesajı **cardholder data** taşır: PAN, expiry, track data, PIN. Bu, PCI-DSS'in tam sorumluluk alanıdır ve banking'de en sıkı denetlenen kısımdır. Temel gereksinimler:
+
+- PAN at-rest encrypted (envelope encryption, Topic 8.6)
+- PAN log'da maskeli (sadece ilk 6 + son 4)
+- Track data authorization sonrası **asla** saklanmaz
+- CVV **asla** saklanmaz
+- In-transit encryption (mutual TLS)
+- Tokenization tercih edilir (acquirer PAN yerine token tutar)
+
+Log'a yazmadan önce hassas alanları maskeleyen bir helper standarttır — PAN kısmen maskelenir, track/PIN/EMV tamamen gizlenir:
 
 ```java
 @Component
 public class IsoMessageMasker {
-    
+
     public String maskForLog(ISOMsg msg) {
         ISOMsg copy = (ISOMsg) msg.clone();
         if (copy.hasField(2)) {
@@ -497,61 +625,47 @@ public class IsoMessageMasker {
 }
 ```
 
-### 14. ISO 8583 → ISO 20022 migration
-
-Industry moving to ISO 20022 (XML/JSON, richer):
-- Visa: Visa Token Service moving partly
-- Mastercard: MTN program
-- TR (BKM): hybrid period
-
-Banking için:
-- Legacy ISO 8583 sürmeye devam (10+ yıl)
-- Yeni features ISO 20022
-- Bridge / adapter pattern (banking için yaygın)
-
-### 15. Banking — ISO 8583 anti-pattern'leri
-
-**Anti-pattern 1: PAN log'da plain**
-
-```java
-log.info("Authorization for PAN: {}", pan);   // ❌ PCI-DSS ihlali
+```admonish warning title="PCI-DSS ihlali = para ve lisans"
+PAN'ı düz metin loglamak, track data veya CVV'yi saklamak sadece kötü pratik değil; denetimde bulunursa ağır ceza ve kart kabul lisansı riski demektir. Kural mutlak: track ve CVV authorization anında geçer, işlem biter bitmez silinir — hiçbir yerde (DB, Kafka, log, cache) kalmaz.
 ```
 
-**Anti-pattern 2: Track data store**
+### 14. ISO 8583 → ISO 20022 migration
 
-Authorization sonrası track data saklamak. PCI-DSS yasak.
+Endüstri daha zengin, XML/JSON tabanlı **ISO 20022**'ye kayıyor; ama bu bir gecede olmuyor. Visa (Visa Token Service), Mastercard (MTN program) ve BKM kısmi/hibrit geçiş yapıyor.
 
-**Anti-pattern 3: CVV log/store**
+Banking pratiğinde gerçeklik şudur: legacy ISO 8583 10+ yıl daha yaşayacak, yeni özellikler ISO 20022'de gelecek, arada bir **bridge/adapter pattern** çalışacak. Yani ikisini birden konuşan bir katman bankacılıkta uzun süre norm olacak.
 
-CVV asla saklanmaz. Authorization sırasında geçer, sonra silinir.
+```admonish tip title="Geçiş dönemi stratejisi"
+İki standardı aynı anda desteklemek için domain'ini nötr tut: iç modelini (Authorization, Capture, Reversal) ISO 8583'e de ISO 20022'ye de bağımlı olmayacak şekilde tasarla, kenarlarda adapter'larla çevir. Böylece network hangi formatı isterse iç mantığın değişmez.
+```
 
-**Anti-pattern 4: Sync POS terminal timeout**
+### 15. Banking anti-pattern'leri
 
-POS 5+ saniye bekler → terminal locked. Async ack + later reconcile.
+"Bu kodda ne yanlış?" mülakat sorusunun cephaneliği burasıdır. On klasik:
 
-**Anti-pattern 5: Reversal yok / late**
+**1 — PAN log'da plain.** `log.info("Authorization for PAN: {}", pan)` doğrudan PCI-DSS ihlalidir. Her zaman maskele.
 
-Timeout durumunda reversal şart. Banking 24h SLA.
+**2 — Track data store.** Authorization sonrası track data saklamak yasaktır. Sadece işlem anında geçer.
 
-**Anti-pattern 6: STAN reuse**
+**3 — CVV log/store.** CVV asla saklanmaz; authorization sırasında geçer, sonra silinir.
 
-STAN per-terminal unique. Reuse = duplicate transaction risk.
+**4 — Sync POS terminal timeout.** POS 5+ saniye beklerse terminal kilitlenir. Async ack + sonradan reconcile gerekir.
 
-**Anti-pattern 7: Manual field positions hardcoded**
+**5 — Reversal yok / geç.** Timeout durumunda reversal şart; 24h SLA vardır.
 
-Magic numbers. Use packager + constants.
+**6 — STAN reuse.** STAN terminal başına unique olmalı; tekrar kullanımı duplicate transaction riski doğurur.
 
-**Anti-pattern 8: ISO message in DB / Kafka as binary blob**
+**7 — Field pozisyonları hardcoded.** Magic number'lar yerine packager + sabitler kullan.
 
-Audit zor. Parse + structured store + masked.
+**8 — ISO mesajını DB/Kafka'ya binary blob olarak yazmak.** Audit imkansızlaşır; parse et, structured ve maskeli sakla.
 
-**Anti-pattern 9: Issuer response code generic**
+**9 — Generic issuer response code.** Spesifik kodlar (`51` insufficient, `54` expired, `61` limit) generic `05`'ten iyidir; UX etkisi büyük.
 
-Specific codes (51 insufficient, 54 expired, 61 limit) > generic 05. UX impact.
+**10 — EMV cryptogram verify yok.** Magstripe-only akış klonlamaya açıktır; EMV ARQC doğrulaması şarttır.
 
-**Anti-pattern 10: EMV cryptogram verify yok**
-
-Magstripe-only flow → cloning vulnerable. EMV ARQC verify şart.
+```admonish tip title="STAN ve idempotency"
+STAN (DE11) + transmission date+time + terminal ID birlikte bir işlemi benzersiz kılar. Bu üçlüyü idempotency anahtarı olarak kullanırsan network retry'larında (aynı 0100 iki kez gelirse) çift işlemi tespit edip tek onay dönebilirsin — banking'de bu bir tercih değil, zorunluluktur.
+```
 
 ---
 
@@ -562,56 +676,155 @@ Magstripe-only flow → cloning vulnerable. EMV ARQC verify şart.
 - "ISO 8583 Implementation Guide" — vendor docs
 - BKM (Bankalararası Kart Merkezi) docs
 - Visa/Mastercard operating regulations
-- EMV books (4 cilt EMVCo)
+- EMV books (4 cilt, EMVCo)
 - PCI-DSS v4.0
 
 ---
 
-## Mini task'ler
+## Kendini Sına
 
-### Task 10.2.1 — jPOS setup + first message (45 dk)
+Aşağıdaki soruları önce **cevaba bakmadan** kendi cümlelerinle yanıtlamayı dene — hepsi kart/ödeme ekiplerinin mülakatlarında karşına çıkabilecek tarzda. Takıldığın soru olursa ilgili Kavramlar başlığına dön, sonra tekrar dene.
 
-Maven dependency. Build `0100` MTI message with required fields. Pack/unpack roundtrip.
+**S1. MTI nedir, 4 hanesi neyi kodlar ve `0200` mesajını nasıl decode edersin?**
 
-### Task 10.2.2 — Bitmap parse (30 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-Hex `7220000102C04822` bitmap → which bits set → field list.
+MTI (Message Type Indicator) her ISO 8583 mesajının başındaki 4 haneli kimliktir. Pozisyon 1 = version (0=1987, 1=1993, 2=2003), pozisyon 2 = message class (1=authorization, 2=financial, 4=reversal, 8=network management), pozisyon 3 = function (0=request, 1=request response, 2=advice), pozisyon 4 = origin (0=acquirer, 2=issuer).
 
-### Task 10.2.3 — Field formatter (45 dk)
+`0200` = version 1987 + financial + request + acquirer, yani "acquirer'dan gelen bir financial istek" (purchase/capture). Yanıtı `0210` olur (function 0→1). MTI'ı okuyabilmek, mesajın hangi akışa ait olduğunu tek bakışta anlamanı sağlar.
 
-Amount BigDecimal → 12-digit fixed format. Date format. PAN length-prefix.
+</details>
 
-### Task 10.2.4 — POS simulator (60 dk)
+**S2. Bitmap ne işe yarar? Primary ve secondary bitmap arasındaki ilişki nedir?**
 
-CLI tool: PAN + amount input → 0100 message construct → send to mock acquirer.
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 10.2.5 — Acquirer server (60 dk)
+Bitmap, mesajda hangi data element'lerin mevcut olduğunu gösteren bit haritasıdır: bit X set ise field X mesajda vardır. Alıcı önce bitmap'i okur, sonra sadece işaretli alanları parse eder — yüzden fazla olası alanın hepsini her mesaja koymak zorunda kalmazsın.
 
-jPOS Q2 server. Listen port 8000. Parse 0100. Validate. Return 0110 with response code.
+Primary bitmap 64 bittir (alan 1-64) ve zorunludur. Primary'nin 1. biti bir flag'tir: set ise 64 bitlik bir secondary bitmap daha gelir (alan 65-128) ve toplam 128 alana çıkarsın. Parse ederken ikisini `or` ile birleştirip set olan her bit için ilgili alanı okursun.
 
-### Task 10.2.6 — Issuer authorization logic (60 dk)
+</details>
 
-Card balance check, limit check, fraud check (velocity), response code map. Approve/decline.
+**S3. PAN hangi data element'te taşınır, formatı nedir ve PCI-DSS gereği nasıl korunur?**
 
-### Task 10.2.7 — Reversal flow (45 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-0400 reversal request. Find original by STAN + transmission date. Release hold. Idempotent.
+PAN (Primary Account Number, kart numarası) **DE2**'de taşınır. Formatı `n..19 LLVAR`: numeric, en fazla 19 hane, başında 2 haneli uzunluk öneki olan değişken uzunluklu alan.
 
-### Task 10.2.8 — Settlement (capture) batch (45 dk)
+PCI-DSS gereği PAN at-rest encrypted saklanır (envelope encryption), log'da sadece ilk 6 + son 4 hane görünecek şekilde maskelenir (`453214******6467`), in-transit ise mutual TLS ile korunur. Tercih edilen yaklaşım tokenization'dır: sistem PAN yerine bir token tutar, gerçek PAN sadece güvenli bir vault'ta yaşar. PAN'ın ilk 6-8 hanesi ayrıca BIN'dir ve routing için kullanılır.
 
-EOD job: authorized but uncaptured → 0220 advice batch. Ledger posting (Topic 10.1).
+</details>
 
-### Task 10.2.9 — PCI-DSS masking (30 dk)
+**S4. `0100` ile `0200` mesajları arasındaki fark nedir?**
 
-PAN, track, CVV, PIN, EMV cryptogram masking in logs. Test.
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 10.2.10 — Network management (echo) (30 dk)
+`0100` bir **authorization request**'tir: "bu kartta yeterli para/limit var mı, kart geçerli mi" sorar. Onaylanırsa issuer parayı düşürmez, sadece **authorization hold** koyar — fonu ayırır. ATM ve online auth'ta kullanılır.
 
-0800 echo request → 0810 response. Heartbeat keep-alive.
+`0200` bir **financial request**'tir ve fonu gerçekten hareket ettirir (purchase, capture). Authorization ile settlement arasında ayrım olmayan tek-adım işlemlerde `0200` doğrudan parayı taşır. Klasik kart akışında ise `0100` ile hold konur, sonra `0220` advice ile capture edilip hold gerçek debit'e çevrilir. Kısaca: `0100` ayırır, `0200`/`0220` taşır.
+
+</details>
+
+**S5. Authorization hold nedir ve capture/settlement ile ilişkisi nasıldır?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Authorization hold, `0100` onaylandığında issuer'ın kart hesabında ilgili tutarı "ayırmasıdır" — para henüz düşmez ama kullanılabilir bakiyeden blokelenir. Böylece müşteri aynı parayı ikinci kez harcayamaz.
+
+Capture (settlement) sonradan gelir: acquirer authorization'ları biriktirir ve genelde gün sonu (EOD) `0220` advice batch'iyle network'e gönderir. Issuer bu noktada hold'u gerçek debit'e çevirir ve ledger'a işler (Topic 10.1 double-entry). Hold ile capture arasında saatler geçebilir; capture hiç gelmezse hold bir süre sonra otomatik düşer.
+
+</details>
+
+**S6. Reversal (`0400`) neden idempotent olmak zorundadır ve DE90 ne işe yarar?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Reversal, POS timeout / yarım işlem / iptal durumunda ayrılan hold'u geri bırakan `0400` mesajıdır. Network güvenilmez olduğu için aynı reversal'ı birçok kez retry edebilir; idempotent değilse hold birden fazla kez serbest bırakılır veya çift düzeltme olur — bakiye bozulur. Bu yüzden reversal tam olarak bir kez etki etmelidir.
+
+DE90 (original data elements) hangi orijinal işlemin geri alındığını tanımlar: orijinal MTI + STAN + transmission date+time + acquirer ID + forwarding ID. Issuer bu bilgiyle doğru hold'u bulup serbest bırakır. Banking'de 24 saatlik bir reversal SLA'sı vardır; geç kalınan reversal chargeback dis'una döner.
+
+</details>
+
+**S7. EMV chip data DE55'te nasıl taşınır ve ARQC magnetik şeritten neden daha güvenlidir?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+EMV chip verisi DE55'te TLV (Tag-Length-Value) formatında taşınır: terminal country code, PAN, application cryptogram, cryptogram information data, application transaction counter gibi tag'ler.
+
+Güvenliğin kalbi ARQC (Application Request Cryptogram)'dir: kart, işlem detaylarını ve her işlemde artan bir sayacı (ATC) kullanarak dinamik bir kriptogram üretir. Bu kriptogram her işlemde değişir ve issuer'ın paylaşılan anahtarıyla doğrulanır. Magnetik şeritteki statik veri kopyalanıp tekrar kullanılabilirken (klon kart, replay), ARQC dinamik olduğu için replay saldırısı işe yaramaz. Issuer kriptogramı doğrulayamazsa kart gerçek kabul edilmez.
+
+</details>
+
+**S8. TR kart altyapısında BKM, Troy ve 3D Secure'un rolü nedir?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+BKM (Bankalararası Kart Merkezi) Türkiye'nin domestic kart switch'idir: Türk bankaları arasında ATM/POS routing yapar ve settlement'i koordine eder. Regülasyon gereği tüm yerel POS trafiği BKM üzerinden geçer.
+
+Troy, BKM'nin işlettiği yerli chip-and-PIN kart markasıdır — domestic işlemlerde Visa/Mastercard'a ulusal alternatif. 3D Secure ise online (card-not-present) işlemlerde BDDK gerekliliği olarak zorunludur; kart sahibini ek bir doğrulama adımıyla teyit eder. Kredi işlemlerinde ayrıca onay öncesi KKB (Kredi Kayıt Bürosu) skor kontrolü yapılır.
+
+</details>
 
 ---
 
-## Test yazma rehberi
+## Tamamlama kriterleri
+
+- [ ] "Kendini Sına" bölümündeki tüm soruları cevaba bakmadan açıklayabiliyorum
+- [ ] MTI'ın 4 hanesini decode edebiliyorum (`0100`/`0110`/`0200`/`0400`/`0800`)
+- [ ] Bitmap'in (primary + secondary) hangi alanların var olduğunu nasıl gösterdiğini anlatabiliyorum
+- [ ] Kritik data element'leri biliyorum: PAN (DE2), Amount (DE4), STAN (DE11), Response code (DE39), Auth ID (DE38)
+- [ ] Authorization flow'u (`0100` → `0110` + hold) uçtan uca çizebiliyorum
+- [ ] Capture/settlement (`0220` advice) ile ledger posting (Topic 10.1) ilişkisini kurabiliyorum
+- [ ] Reversal'ın (`0400`) neden idempotent olduğunu ve DE90'ın rolünü açıklayabiliyorum
+- [ ] EMV DE55 TLV ve ARQC cryptogram'ın klon koruması nasıl sağladığını anlatabiliyorum
+- [ ] PCI-DSS kurallarını sayabiliyorum: PAN tokenization + log masking + track/CVV saklamama
+- [ ] TR specifics'i (BKM switch + Troy + 3D Secure + KKB) biliyorum
+- [ ] (Opsiyonel) "Pratik yapmak istersen" bölümündeki testleri yazdım ve Claude-verify prompt'uyla doğrulattım
+
+---
+
+## Defter notları
+
+1. "ISO 8583 acquirer → network → issuer flow, banking ecosystem: ____."
+2. "MTI 4-hane (version + class + function + origin) decode: ____."
+3. "Bitmap primary + secondary 64+64 bit, field presence: ____."
+4. "Kritik alanlar (PAN DE2, Amount DE4, STAN DE11, Response DE39, Auth ID DE38): ____."
+5. "Authorization flow (0100 → 0110) + hold balance + EMV ARQC: ____."
+6. "Capture (0220 advice) settlement + ledger posting Topic 10.1: ____."
+7. "Reversal (0400) idempotent 24h SLA + DE90 original data: ____."
+8. "PCI-DSS PAN tokenization + log masking + track/CVV saklamama: ____."
+9. "TR specifics — BKM switch + Troy domestic + 3D Secure + KKB: ____."
+10. "ISO 8583 → ISO 20022 migration, banking geçiş dönemi: ____."
+
+```admonish success title="Bölüm Özeti"
+- ISO 8583 kart ekosisteminin ortak dilidir: POS → acquirer → network → issuer zinciri `< 2 saniye` içinde bir `0100` gönderir, bir `0110` alır
+- Her mesaj MTI (4 hane: version + class + function + origin) + bitmap (hangi alan var) + data element'ler yapısındadır; bitmap set olan bitler parse edilecek alanları söyler
+- Kritik ayrım: `0100`/`0110` parayı sadece ayırır (authorization hold), `0200`/`0220` fonu hareket ettirir (capture/settlement) ve ledger'a işler
+- Reversal (`0400`) idempotent olmak zorundadır ve DE90 orijinal işlemi tanımlar; 24h SLA içinde hold serbest bırakılır, geç reversal chargeback'e döner
+- EMV DE55'teki ARQC her işlemde değişen dinamik kriptogramla klon/replay saldırısını engeller; magstripe statik veri olduğu için güvensizdir
+- PCI-DSS pazarlıksız: PAN maskeli/tokenize, track ve CVV hiçbir yerde saklanmaz, in-transit mTLS — ihlali para ve lisans riskidir
+```
+
+---
+
+## Pratik yapmak istersen
+
+Kavramları koda dökmek istersen aşağıdaki iki ek hazır: test yazma rehberi jPOS roundtrip, authorization/decline, reversal idempotency ve PCI-DSS masking için örnek testler içerir; Claude-verify prompt'u ile yazdığın ISO 8583 kodunu banking-grade perspektiften denetletebilirsin.
+
+> Süre beklentisi: testleri baştan sona yazıp yeşile çevirmek ~3-4 saat sürer. Tamamladığını şuradan anlarsın: `0100`/`0110` roundtrip geçiyor, insufficient funds `51` dönüyor, reversal iki kez çağrılınca hold tek kez düşüyor ve loglarda tam PAN hiçbir yerde görünmüyor.
+
+<details>
+<summary>Test yazma rehberi</summary>
+
+Aşağıdaki testler jPOS ve authorization servisini banking senaryolarıyla sınar. Önce roundtrip: kurduğun mesaj pack/unpack sonrası aynı mı?
 
 ```java
 @Test
@@ -626,21 +839,25 @@ void shouldBuildAuthorizationRequest() throws Exception {
     msg.set(41, "TERM0001");
     msg.set(42, "MERCHANT0000001");
     msg.set(49, "949");
-    
+
     ISOPackager packager = new ISO87BPackager();
     msg.setPackager(packager);
     byte[] packed = msg.pack();
-    
+
     // Verify roundtrip
     ISOMsg parsed = new ISOMsg();
     parsed.setPackager(packager);
     parsed.unpack(packed);
-    
+
     assertThat(parsed.getMTI()).isEqualTo("0100");
     assertThat(parsed.getString(2)).isEqualTo("4532148803436467");
     assertThat(parsed.getString(4)).isEqualTo("000000010000");
 }
+```
 
+Geçerli bir authorization approve, yetersiz bakiye ise `51` dönmeli:
+
+```java
 @Test
 void shouldApproveValidAuthorization() {
     AuthorizationRequest req = AuthorizationRequest.builder()
@@ -650,9 +867,9 @@ void shouldApproveValidAuthorization() {
         .terminalId("TERM0001")
         .merchantId("MERCHANT0000001")
         .build();
-    
+
     AuthorizationResult result = authService.authorize(req);
-    
+
     assertThat(result.isApproved()).isTrue();
     assertThat(result.responseCode()).isEqualTo("00");
     assertThat(result.authorizationId()).isNotEmpty();
@@ -661,29 +878,37 @@ void shouldApproveValidAuthorization() {
 @Test
 void shouldDeclineWhenInsufficientFunds() {
     cardRepo.setBalance("4532148803436467", new BigDecimal("50.00"));
-    
+
     AuthorizationResult result = authService.authorize(
         AuthorizationRequest.builder().pan("4532...").amount(new BigDecimal("100.00")).build());
-    
+
     assertThat(result.isApproved()).isFalse();
     assertThat(result.responseCode()).isEqualTo("51");
 }
+```
 
+Reversal idempotency banking'in olmazsa olmazı — aynı reversal iki kez gelince hold tam bir kez düşmeli:
+
+```java
 @Test
 void shouldHandleReversalIdempotently() {
     ISOMsg auth = sendAuthorization(...);
-    
+
     ISOMsg reversal = sendReversal(auth);
     ISOMsg reversalRetry = sendReversal(auth);   // Same reversal
-    
+
     // Hold released exactly once
     assertThat(cardRepo.getHoldCount(pan)).isEqualTo(0);
 }
+```
 
+PCI-DSS masking ve track/CVV saklamama — loglarda tam PAN olmamalı, DB'de track/CVV null olmalı:
+
+```java
 @Test
 void shouldMaskPanInLogs(CapturedOutput output) {
     sendAuthorization(...);
-    
+
     assertThat(output.getOut()).doesNotContain("4532148803436467");
     assertThat(output.getOut()).contains("453214");
     assertThat(output.getOut()).contains("******");
@@ -693,7 +918,7 @@ void shouldMaskPanInLogs(CapturedOutput output) {
 @Test
 void shouldNeverStoreTrackData() {
     sendAuthorization(...);   // with track 2 in field 35
-    
+
     List<CardAuthorization> stored = authRepo.findAll();
     stored.forEach(a -> {
         assertThat(a.getTrack2()).isNull();
@@ -703,12 +928,21 @@ void shouldNeverStoreTrackData() {
 }
 ```
 
----
+### Bonus — kendi başına deneyler
 
-## Claude-verify prompt
+- **Bitmap parse:** Hex `7220000102C04822` bitmap'ini binary'e çevir, hangi bitlerin set olduğunu ve karşılık gelen alanları listele.
+- **Field formatter:** `BigDecimal` tutarı → 12 haneli DE4 formatı, date format dönüşümleri, PAN length-prefix.
+- **Network management:** `0800` echo request → `0810` response heartbeat akışını implement et.
+- **Settlement batch:** authorized ama uncaptured işlemleri `0220` advice batch'e topla, ledger posting'i (Topic 10.1) tetikle.
+
+</details>
+
+<details>
+<summary>Claude-verify prompt</summary>
 
 ```
-ISO 8583 implementation'ımı banking-grade kriterlere göre değerlendir:
+ISO 8583 implementation'ımı banking-grade kriterlere göre değerlendir.
+Eksikleri işaretle, kod yazma:
 
 1. jPOS setup:
    - ISO87BPackager veya custom?
@@ -771,36 +1005,8 @@ ISO 8583 implementation'ımı banking-grade kriterlere göre değerlendir:
     - EMV verify YOK?
     - Sync POS timeout > 5s YOK?
     - Late reversal YOK?
+
+Her madde için PASS / FAIL / EKSIK işaretle, kanıt göster, kod yazma.
 ```
 
----
-
-## Tamamlama kriterleri
-
-- [ ] jPOS dependency + custom packager
-- [ ] 0100/0110 authorization roundtrip
-- [ ] 0220 advice settlement
-- [ ] 0400/0410 reversal idempotent
-- [ ] 0800/0810 echo network management
-- [ ] POS simulator + acquirer server + issuer logic
-- [ ] EMV bit 55 TLV parse
-- [ ] PCI-DSS masking in logs
-- [ ] Tokenization (no PAN stored)
-- [ ] Ledger posting on capture (Topic 10.1)
-- [ ] 8+ integration test
-- [ ] Response code map (10+)
-
----
-
-## Defter notları (10 madde)
-
-1. "ISO 8583 acquirer → network → issuer flow banking ecosystem: ____."
-2. "MTI 4-digit (version + class + function + origin) decoding: ____."
-3. "Bitmap primary + secondary 64+64 bit field presence: ____."
-4. "Critical fields (PAN, Amount, STAN, Response code, Auth ID): ____."
-5. "Authorization flow (0100 → 0110) + hold balance + EMV ARQC: ____."
-6. "Capture (0220 advice) settlement + ledger posting Topic 10.1: ____."
-7. "Reversal (0400) idempotent 24h SLA + bit 90 original data: ____."
-8. "PCI-DSS PAN tokenization + log masking + no track/CVV: ____."
-9. "TR specifics — BKM switch + Troy domestic + 3D Secure + KKB: ____."
-10. "ISO 8583 → ISO 20022 migration banking transitional period: ____."
+</details>

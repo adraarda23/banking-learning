@@ -48,7 +48,8 @@
 - [x] Faz 6 (Messaging/Kafka): 7 topic + mini proje, 33 diyagram, 48 kutu, 52 soru — commit 3692daf
 - [x] Faz 7 (Microservices): 7 topic + mini proje, 32 diyagram, 47 kutu, 56 soru — commit b66bb92
 - [x] Faz 8 (Security): 7 topic + mini proje, 32 diyagram, 47 kutu, 53 soru — commit 854a4e8
-- [ ] Kalan: Faz 9-12 (4 faz)
+- [x] Faz 9 (Observability): 7 topic + mini proje, 37 diyagram, 51 kutu, 60 soru — commit b36d9e6 (push'landı)
+- [ ] Kalan: Faz 10-12 (3 faz)
 - Not: mdbook src="." nedeniyle _book/.git kopyalanıyor (bloat, zararsız — build sonrası rm -rf _book/.git ile temizle)
 
 ## Review

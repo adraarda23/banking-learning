@@ -1,4 +1,39 @@
+<div class="phase-cover-kicker">Onuncu Bölüm</div>
+
 # Faz 10 — Domain Mastery (Banking Domain Bilgisi)
+
+<div class="phase-cover-meta">
+<div><strong>Süre</strong> ~3 hafta</div>
+<div><strong>Topic</strong> 7 konu + mini proje</div>
+<div><strong>Çıktı</strong> Domain bilen developer</div>
+<div><strong>Ön koşul</strong> Faz 1-9 tamamlandı</div>
+</div>
+
+```admonish info title="Bu fazda ne öğreneceksin?"
+Teknik beceriyi **banking domain bilgisiyle** taçlandıracaksın — TR bankasında junior'ı
+öne çıkaran şey bu. Double-entry accounting, ISO 8583 (kart), ISO 20022/SWIFT (havale),
+TR ödeme sistemleri (EFT/FAST/Havale), FX & faiz (stopaj/BSMV), regülasyon (BDDK/MASAK/KVKK)
+ve reconciliation. "Teknik bilen junior çoktur; domain bilen junior nadir."
+```
+
+## Fazın haritası
+
+```mermaid
+flowchart TD
+    subgraph Defter["Ledger ve Kart"]
+        direction LR
+        A["10.1 Double-Entry"] --> B["10.2 ISO 8583"]
+    end
+    subgraph Odeme["Havale ve Para"]
+        direction LR
+        C["10.3 ISO 20022 & SWIFT"] --> D["10.4 TR Ödeme Sistemleri"] --> E["10.5 FX & Faiz"]
+    end
+    subgraph Uyum["Uyum ve Operasyon"]
+        direction LR
+        F["10.6 Regülasyon"] --> G["10.7 Reconciliation"]
+    end
+    Defter --> Odeme --> Uyum --> MP(["Mini Proje: Multi-currency + ISO 8583 + KYC + Reconciliation"])
+```
 
 ## Bu faz neden en kritik
 
@@ -96,4 +131,8 @@ Bu faz bittiğinde sen sadece "Java backend bilen junior" değil, "Java backend 
 
 Faz 11 DevOps (CI/CD, containerization, deploy) ve Faz 12 Testing'in derinleşmiş hâli olacak. Domain bilgisi onları renklendirecek — "Bu pipeline'da Flyway migration sırasında bir AML rule update nasıl rollout edilir?" gibi soruları rahat cevaplayacaksın.
 
-→ İlk topic: [01-double-entry-accounting/](./01-double-entry-accounting/index.md)
+```admonish success title="Başla"
+İlk durak: [Topic 10.1 — Double-Entry Accounting](./01-double-entry-accounting/index.md).
+Bu faz okuma ağırlıklı ama her topic'i kodda uygula — mini projede ISO 8583 parser, FX servisi,
+KYC workflow ve reconciliation report yazacaksın.
+```

@@ -1,18 +1,26 @@
 # Topic 10.5 — FX & Interest Calculations
 
+```admonish info title="Bu bölümde"
+- Faiz matematiği: simple vs compound, sürekli bileşik ve day count convention'ların (ACT/365, ACT/360, 30/360) aynı orandan neden farklı faiz ürettiği
+- French amortization tablosu: eşit taksit formülü, faiz–anapara ayrışması ve son taksit artığının temizlenmesi
+- TR bankacılığının vergi katmanı: mevduatta stopaj, kredide BSMV + KKDF ve müşteriye gösterilen YMO
+- FX'in bel kemiği: bid/ask spread, cross rate, covered interest parity ile forward ve FX swap
+- Günlük faiz tahakkuku: ledger'a idempotent journal, Europe/Istanbul cutoff ve artık yıl tuzakları
+```
+
 ## Hedef
 
-Banking finance hesaplamalarını derinlemesine öğrenmek: simple/compound interest, day count conventions (ACT/360, ACT/365, 30/360), Yield to Maturity, amortization (krediler), FX bid/ask spread, FX swap/forward, BSMV ve KKDF (TR vergi), accrual logic banking ledger (Topic 10.1), Effective Annual Rate (EAR), APR vs APY.
+Banking finance hesaplamalarını "formülü ezberledim"den "neden bu formül, nerede yanlış giderse para kaybederim" seviyesine taşımak. Simple/compound interest, day count convention'lar, Yield to Maturity mantığı, kredi amortization, FX bid/ask + cross rate + forward/swap, TR'ye özgü BSMV/KKDF/stopaj ve double-entry ledger üzerinde günlük faiz tahakkuku — hepsini `BigDecimal` doğruluğunda kodlayabilmek.
 
 ## Süre
 
-Okuma: 2.5 saat • Mini task: 2.5 saat • Test: 1 saat • Toplam: ~6 saat
+Okuma: ~2 saat • Kendini Sına: 45 dk • Pratik (opsiyonel): 2.5-3 saat • Toplam: ~2.5 saat (+ pratik)
 
 ## Önbilgi
 
-- Topic 10.1 (Double-entry) bitti
-- BigDecimal money handling
-- Basic math (logarithm)
+- Topic 10.1 (Double-entry) bitti — journal, debit/credit, ledger post mantığını biliyorsun
+- `BigDecimal` ile para tutma, `RoundingMode`, `MathContext` rahat kullanabiliyorsun
+- Temel matematik: üs alma, logaritma, oran-orantı
 
 ---
 
@@ -20,23 +28,28 @@ Okuma: 2.5 saat • Mini task: 2.5 saat • Test: 1 saat • Toplam: ~6 saat
 
 ### 1. Simple interest
 
+Bir müşteri 90 günlük mevduata para koyduğunda ya da bir kredi bir gün açık kaldığında bankanın hesapladığı en temel büyüklük faizdir; her şey buradan başlar.
+
+**Simple interest (basit faiz)** anaparaya, orana ve süreye orantılıdır — bileşiklenme yoktur, kazanılan faiz yeniden faiz getirmez.
+
 ```
 I = P × r × t
 
-I: interest
-P: principal
-r: annual rate (decimal, 5% = 0.05)
-t: time (years)
+I: interest (faiz)
+P: principal (anapara)
+r: annual rate (yıllık oran, %5 = 0.05)
+t: time (yıl cinsinden süre)
 ```
 
-**Banking örnek:** 100,000 TL, %5 yıllık, 90 gün:
+**Banking örnek:** 100,000 TL, %5 yıllık, 90 gün (ACT/365):
 
 ```
-t = 90 / 365 = 0.2466 (assume ACT/365)
+t = 90 / 365 = 0.2466
 I = 100,000 × 0.05 × 0.2466 = 1,232.88 TL
 ```
 
-Java:
+Java tarafında `int days` ve `int daysInYear`'ı ayrı parametre tutmak, day count convention'ı çağırana bırakır:
+
 ```java
 public BigDecimal simpleInterest(BigDecimal principal, BigDecimal rate, int days, int daysInYear) {
     return principal
@@ -46,94 +59,82 @@ public BigDecimal simpleInterest(BigDecimal principal, BigDecimal rate, int days
 }
 ```
 
+Buradaki tuzak sayı tipinde: <mark>para hesabında asla `double` kullanma; her zaman `BigDecimal` ve `HALF_EVEN` yuvarlama.</mark> `double interest = 100000 * 0.05 * 90 / 365` binlerce müşteride kuruş kaymaları biriktirir ve mutabakatı bozar.
+
 ### 2. Compound interest
+
+Faiz kazanan bir mevduat bir sonraki dönemde önceki faizin de üzerinden faiz kazanıyorsa artık basit faiz yetmez; **compound interest (bileşik faiz)** devreye girer.
+
+Formülde `n` yılda kaç kez bileşiklendiğini söyler — aylık için 12, günlük için 365:
 
 ```
 A = P × (1 + r/n)^(n×t)
 
-A: future value
+A: future value (gelecek değer)
 P: principal
 r: annual rate
-n: compounding periods per year
-t: time (years)
+n: yılda bileşiklenme sayısı
+t: time (yıl)
 ```
 
-**Banking örnek:** 100,000 TL, %5 yıllık, 5 yıl, monthly compound:
+**Banking örnek:** 100,000 TL, %5 yıllık, 5 yıl, aylık bileşik:
 
 ```
 n = 12
 A = 100,000 × (1 + 0.05/12)^(12×5)
 A = 100,000 × (1.00417)^60
-A = 100,000 × 1.2834
 A = 128,335.87 TL
 ```
 
-Java:
+Java'da kritik nokta `MathContext` ile hassasiyeti explicit vermek; `pow` üs alma tamsayı periyot ister:
+
 ```java
 public BigDecimal compoundFutureValue(
-    BigDecimal principal, 
-    BigDecimal annualRate, 
-    int compoundPerYear, 
-    BigDecimal years
-) {
+    BigDecimal principal, BigDecimal annualRate, int compoundPerYear, BigDecimal years) {
     MathContext mc = new MathContext(20, RoundingMode.HALF_EVEN);
-    
-    // (1 + r/n)
-    BigDecimal periodicRate = annualRate.divide(
-        BigDecimal.valueOf(compoundPerYear), mc);
-    BigDecimal base = BigDecimal.ONE.add(periodicRate);
-    
-    // n × t (total periods)
+
+    BigDecimal periodicRate = annualRate.divide(BigDecimal.valueOf(compoundPerYear), mc);
+    BigDecimal base = BigDecimal.ONE.add(periodicRate);            // (1 + r/n)
+
     int totalPeriods = years.multiply(BigDecimal.valueOf(compoundPerYear))
-        .setScale(0, RoundingMode.HALF_EVEN).intValue();
-    
-    // pow
+        .setScale(0, RoundingMode.HALF_EVEN).intValue();          // n × t
+
     BigDecimal factor = base.pow(totalPeriods, mc);
-    
-    return principal.multiply(factor)
-        .setScale(2, RoundingMode.HALF_EVEN);
+    return principal.multiply(factor).setScale(2, RoundingMode.HALF_EVEN);
 }
 ```
 
-**Continuous compounding:**
-
-```
-A = P × e^(r×t)
-```
-
-Banking nadir (mostly theoretical), continuous-style fixed income models.
+**Continuous compounding (sürekli bileşik):** Bileşiklenme sonsuza giderse `A = P × e^(r×t)` olur. Bankacılıkta nadir kullanılır (çoğunlukla teorik ve fixed income türev modellerinde), ama EAR mantığını anlamak için bilmen yeterli.
 
 ### 3. Day count conventions
 
-**Critical for banking accuracy.** Aynı oran, farklı convention = farklı interest.
+Aynı oran, aynı süre, aynı anapara — ama iki farklı banka iki farklı faiz hesaplayabilir. Sebep **day count convention (gün sayım esası)**: bir dönemin kaç gün olduğunu ve yılın kaç gün sayıldığını belirleyen kural.
 
-| Convention | Numerator | Denominator | Use case |
+<mark>Oranı day count convention belirtmeden uygulama; aynı oran farklı convention'da farklı faiz üretir.</mark>
+
+| Convention | Pay (gün) | Payda (yıl) | Kullanım |
 |---|---|---|---|
-| **ACT/365** | Actual days | 365 | TR retail loans |
-| **ACT/365F (Fixed)** | Actual days | 365 (even leap year) | Government bonds (some) |
-| **ACT/360** | Actual days | 360 | TRY money market, USD short rate |
-| **ACT/ACT** | Actual days | Actual days in year (365 or 366) | EUR bonds, US Treasury |
-| **30/360** | 30 days/month assumed | 360 | US corporate bonds |
-| **30E/360 (Eurobond)** | 30 days/month (European method) | 360 | European bonds |
+| **ACT/365** | Gerçek gün | 365 | TR retail krediler |
+| **ACT/365F (Fixed)** | Gerçek gün | 365 (artık yılda bile) | Bazı devlet tahvilleri |
+| **ACT/360** | Gerçek gün | 360 | TRY para piyasası, USD kısa vade |
+| **ACT/ACT** | Gerçek gün | Yılın gerçek günü (365/366) | EUR tahviller, US Treasury |
+| **30/360** | Ay = 30 gün varsayımı | 360 | US corporate bond |
+| **30E/360 (Eurobond)** | Ay = 30 gün (Avrupa) | 360 | Avrupa tahvilleri |
 
-**ACT/360 example:** 100,000 TL, %5, 90 gün:
+Farkı somut gör — 100,000 TL, %5, 90 gün:
+
 ```
-I = 100,000 × 0.05 × 90/360 = 1,250.00 TL
+ACT/365: 100,000 × 0.05 × 90/365 = 1,232.88 TL
+ACT/360: 100,000 × 0.05 × 90/360 = 1,250.00 TL   ← daha yüksek
 ```
 
-ACT/365 ile karşılaştır (1,232.88 TL) — ACT/360 daha yüksek!
+Payda 360'a inince faiz artar. **Banking pratiği:** TR retail krediler ACT/365, TRY para piyasası ACT/360, USD SOFR (eski LIBOR) ACT/360, EUR tahviller ACT/ACT.
 
-**Banking pratiği:**
-- TR retail krediler: ACT/365
-- TRY money market: ACT/360
-- USD LIBOR (now SOFR): ACT/360
-- EUR bonds: ACT/ACT
-
-**Implementation:**
+Implementasyonu bir `enum` ile modellemek en temizi; her convention kendi `fraction` metodunu taşır. Önce sabit-payda olan ACT/365 ve ACT/360:
 
 ```java
 public enum DayCountConvention {
-    
+
     ACT_365 {
         public BigDecimal fraction(LocalDate from, LocalDate to) {
             long days = ChronoUnit.DAYS.between(from, to);
@@ -141,7 +142,6 @@ public enum DayCountConvention {
                 .divide(BigDecimal.valueOf(365), 10, RoundingMode.HALF_EVEN);
         }
     },
-    
     ACT_360 {
         public BigDecimal fraction(LocalDate from, LocalDate to) {
             long days = ChronoUnit.DAYS.between(from, to);
@@ -149,71 +149,155 @@ public enum DayCountConvention {
                 .divide(BigDecimal.valueOf(360), 10, RoundingMode.HALF_EVEN);
         }
     },
-    
-    ACT_ACT {
-        public BigDecimal fraction(LocalDate from, LocalDate to) {
-            // Complex: split if year boundary crossed
-            // ... see ISDA convention
-        }
-    },
-    
+```
+
+30/360 farklıdır: gerçek günü değil, her ayı 30 kabul edip 30/31 uçlarını düzeltir. Ay-sonu kuralı (`d1 == 30 && to == 31 → 30`) klasik ISDA yaklaşımıdır:
+
+```java
     THIRTY_360 {
         public BigDecimal fraction(LocalDate from, LocalDate to) {
             int d1 = Math.min(from.getDayOfMonth(), 30);
-            int d2 = (d1 == 30 && to.getDayOfMonth() == 31) 
+            int d2 = (d1 == 30 && to.getDayOfMonth() == 31)
                      ? 30 : Math.min(to.getDayOfMonth(), 30);
-            
             int days = 360 * (to.getYear() - from.getYear())
                      + 30 * (to.getMonthValue() - from.getMonthValue())
                      + (d2 - d1);
-            
             return BigDecimal.valueOf(days)
                 .divide(BigDecimal.valueOf(360), 10, RoundingMode.HALF_EVEN);
         }
     };
-    
+
     public abstract BigDecimal fraction(LocalDate from, LocalDate to);
 }
 ```
 
+ACT/ACT yıl sınırını geçince dönemleri bölmek gerektiği için daha karmaşıktır (ISDA convention); tam listing'de yerini iskelet olarak koruyoruz.
+
+<details>
+<summary>Tam kod: DayCountConvention enum (~42 satır)</summary>
+
+```java
+public enum DayCountConvention {
+
+    ACT_365 {
+        public BigDecimal fraction(LocalDate from, LocalDate to) {
+            long days = ChronoUnit.DAYS.between(from, to);
+            return BigDecimal.valueOf(days)
+                .divide(BigDecimal.valueOf(365), 10, RoundingMode.HALF_EVEN);
+        }
+    },
+
+    ACT_360 {
+        public BigDecimal fraction(LocalDate from, LocalDate to) {
+            long days = ChronoUnit.DAYS.between(from, to);
+            return BigDecimal.valueOf(days)
+                .divide(BigDecimal.valueOf(360), 10, RoundingMode.HALF_EVEN);
+        }
+    },
+
+    ACT_ACT {
+        public BigDecimal fraction(LocalDate from, LocalDate to) {
+            // Karmaşık: yıl sınırı geçilirse dönemi böl
+            // ... ISDA convention
+            throw new UnsupportedOperationException("ISDA ACT/ACT split gerekli");
+        }
+    },
+
+    THIRTY_360 {
+        public BigDecimal fraction(LocalDate from, LocalDate to) {
+            int d1 = Math.min(from.getDayOfMonth(), 30);
+            int d2 = (d1 == 30 && to.getDayOfMonth() == 31)
+                     ? 30 : Math.min(to.getDayOfMonth(), 30);
+
+            int days = 360 * (to.getYear() - from.getYear())
+                     + 30 * (to.getMonthValue() - from.getMonthValue())
+                     + (d2 - d1);
+
+            return BigDecimal.valueOf(days)
+                .divide(BigDecimal.valueOf(360), 10, RoundingMode.HALF_EVEN);
+        }
+    };
+
+    public abstract BigDecimal fraction(LocalDate from, LocalDate to);
+}
+```
+
+</details>
+
+```admonish warning title="Artık yıl ve hardcoded 365"
+Şubat 29'lu bir yılda `t = days/365` yerine `days/366` gerekebilir (ACT/ACT). ACT/365F ise adı üstünde bilerek sabit 365 kullanır. "365'i her yere gömdüm" bir contract ACT/360 isteyince yanlış faiz demektir — convention'ı üründen türet, kodun içine gömme.
+```
+
 ### 4. Loan amortization
 
-**French amortization (equal periodic payment):**
+Müşteri "60 ay eşit taksitle kredi" istediğinde her ay ne kadar ödeyeceğini ve bu taksitin ne kadarının faiz ne kadarının anapara olduğunu bankanın kuruşu kuruşuna bilmesi gerekir; bunu **amortization (itfa)** tablosu verir.
+
+En yaygın yöntem **French amortization (eşit taksit)**: her ay ödenen toplam tutar sabittir, ama içindeki faiz–anapara oranı zamanla değişir.
 
 ```
 PMT = P × (r / (1 - (1 + r)^(-n)))
 
-P: principal
-r: periodic rate
-n: number of periods
+P: anapara
+r: dönemsel oran (aylık)
+n: dönem sayısı
 ```
 
-**Example:** 100,000 TL kredi, %15 yıllık, 60 ay:
+**Örnek:** 100,000 TL kredi, %15 yıllık, 60 ay:
 
 ```
 r = 0.15 / 12 = 0.0125
 n = 60
 PMT = 100,000 × (0.0125 / (1 - (1.0125)^(-60)))
-PMT = 100,000 × (0.0125 / 0.527594)
-PMT = 100,000 × 0.0237899
-PMT = 2,378.99 TL (monthly)
+PMT = 2,378.99 TL (aylık)
 ```
 
-**Schedule:**
+Tabloda faiz her ay azalan bakiyeden hesaplandığı için başta yüksek, sonra düşük olur; anapara ise tam tersi:
 
-| Month | Beg.Balance | PMT | Interest | Principal | End Balance |
+| Ay | Başl. Bakiye | Taksit | Faiz | Anapara | Kalan |
 |---|---|---|---|---|---|
 | 1 | 100,000.00 | 2,378.99 | 1,250.00 | 1,128.99 | 98,871.01 |
 | 2 | 98,871.01 | 2,378.99 | 1,235.89 | 1,143.10 | 97,727.91 |
-| ... |
+| ... | | | | | |
 | 60 | 2,348.50 | 2,378.99 | 29.36 | 2,349.63 | 0.00 |
 
-Interest = Beg.Balance × r
-Principal = PMT - Interest
+Kural basit: `Faiz = Başl.Bakiye × r`, `Anapara = Taksit − Faiz`. Kodda önce PMT'yi hesaplarız:
+
+```java
+public List<Installment> generate(BigDecimal principal, BigDecimal annualRate, int months) {
+    MathContext mc = new MathContext(20, RoundingMode.HALF_EVEN);
+    BigDecimal r = annualRate.divide(BigDecimal.valueOf(12), mc);
+    BigDecimal onePlusR = BigDecimal.ONE.add(r);
+    BigDecimal denominator = BigDecimal.ONE.subtract(onePlusR.pow(-months, mc));
+    BigDecimal pmt = principal.multiply(r).divide(denominator, 2, RoundingMode.HALF_EVEN);
+    // ... döngü aşağıda
+```
+
+Sonra her ay için faiz/anapara ayrıştırılır; son taksitte yuvarlama artığını temizlemek için bakiyeyi doğrudan kapatırız (yoksa 60. ayda 0.00 yerine 0.03 kalabilir):
+
+```java
+    List<Installment> schedule = new ArrayList<>();
+    BigDecimal balance = principal;
+    for (int i = 1; i <= months; i++) {
+        BigDecimal interest = balance.multiply(r).setScale(2, RoundingMode.HALF_EVEN);
+        BigDecimal principalPaid = pmt.subtract(interest);
+        if (i == months) {                       // son taksit → artığı temizle
+            principalPaid = balance;
+            pmt = principalPaid.add(interest);
+        }
+        BigDecimal endBalance = balance.subtract(principalPaid);
+        schedule.add(new Installment(i, balance, pmt, interest, principalPaid, endBalance));
+        balance = endBalance;
+    }
+    return schedule;
+}
+```
+
+<details>
+<summary>Tam kod: AmortizationSchedule.generate (~35 satır)</summary>
 
 ```java
 public class AmortizationSchedule {
-    
+
     public List<Installment> generate(
         BigDecimal principal,
         BigDecimal annualRate,
@@ -224,71 +308,87 @@ public class AmortizationSchedule {
         BigDecimal onePlusR = BigDecimal.ONE.add(r);
         BigDecimal denominator = BigDecimal.ONE.subtract(onePlusR.pow(-months, mc));
         BigDecimal pmt = principal.multiply(r).divide(denominator, 2, RoundingMode.HALF_EVEN);
-        
+
         List<Installment> schedule = new ArrayList<>();
         BigDecimal balance = principal;
-        
+
         for (int i = 1; i <= months; i++) {
             BigDecimal interest = balance.multiply(r).setScale(2, RoundingMode.HALF_EVEN);
             BigDecimal principalPaid = pmt.subtract(interest);
-            
+
             if (i == months) {
-                // Last installment — adjust to clear residual
+                // Son taksit — artığı temizle
                 principalPaid = balance;
                 pmt = principalPaid.add(interest);
             }
-            
+
             BigDecimal endBalance = balance.subtract(principalPaid);
-            
+
             schedule.add(new Installment(i, balance, pmt, interest, principalPaid, endBalance));
             balance = endBalance;
         }
-        
+
         return schedule;
     }
 }
 ```
 
-**Banking varyasyonlar:**
-- **Eşit anapara:** Same principal, decreasing total payment
-- **Balon:** Last payment large
-- **Faizsiz dönemli:** First N months interest-only
-- **Sabit faiz vs Değişken faiz** (TR LIBOR yerine TLREF — TR floating rate)
+</details>
 
-### 5. BSMV ve KKDF — TR banking vergi
+**Banking varyasyonlar:** eşit anapara (aynı anapara, azalan toplam ödeme), balon (son taksit büyük), faizsiz dönemli (ilk N ay sadece faiz), sabit vs değişken faiz (TR'de TLREF referanslı floating rate).
 
-**BSMV (Banka ve Sigorta Muameleleri Vergisi):**
-- TR-only banking transactions tax
-- Rate: %5 (varies by transaction type)
-- Bank levies, remits to state monthly
+### 5. BSMV, KKDF ve stopaj — TR banking vergi
 
-**Applied to:**
-- Loan interest income (BSMV %5 of interest)
-- Commission income
-- FX gains
-- Money market income
+TR bankacılığı hesabı, uluslararası formülün üstüne bir vergi katmanı bindirir; bunları atlarsan müşteriye yanlış maliyet gösterir ve regülatör uyumsuzluğuna düşersin. İki taraf farklı çalışır: kredide vergi faizin üstüne eklenir, mevduatta faizden kesilir.
 
-**KKDF (Kaynak Kullanımı Destekleme Fonu):**
-- Consumer loan support fund
-- Rate: %10 (consumer loan interest)
-- %0 (mortgage, vehicle loan in some cases)
-- %15 (FX-indexed consumer loan)
+**Kredi tarafı — BSMV + KKDF (faizin üstüne):**
 
-**Banking impact:**
+- **BSMV (Banka ve Sigorta Muameleleri Vergisi):** Banka işlemleri vergisi, kredi faiz gelirine %5. Kredi faizi, komisyon, FX kazancı, para piyasası gelirine uygulanır; banka tahsil edip devlete aylık yatırır.
+- **KKDF (Kaynak Kullanımı Destekleme Fonu):** Tüketici kredisi faizine %10; konut/bazı taşıt kredilerinde %0; döviz endeksli tüketici kredisinde %15.
+
+Her ikisi de brüt faiz matrahı üzerinden hesaplanır ve birbirinin üstüne binmez:
 
 ```
-Customer takes 100,000 TL loan, 5 yıl, %2.5/ay:
-  Pure interest: 17,250 TL (over loan)
-  
-  BSMV: 17,250 × 0.05 = 862.50 TL
-  KKDF: 17,250 × 0.10 = 1,725.00 TL
-  Total effective cost: 100,000 + 17,250 + 862.50 + 1,725 = 119,837.50 TL
+100,000 TL tüketici kredisi, saf faiz 17,250 TL (vade boyunca):
+  BSMV = 17,250 × 0.05 = 862.50 TL
+  KKDF = 17,250 × 0.10 = 1,725.00 TL
+  Müşteriye toplam maliyet = 100,000 + 17,250 + 862.50 + 1,725 = 119,837.50 TL
 ```
 
-**Effective rate calculation:**
-- Stated rate (declared): %2.5/ay
-- Effective rate (TÜFE compliant): include BSMV + KKDF
-- TBB regulation: customer'a effective rate (yıllık maliyet oranı — YMO) gösterilmeli
+**Mevduat tarafı — stopaj (faizden kesilir):** Müşteriye ödenen mevduat faizinden **stopaj (gelir vergisi tevkifatı)** kesilir. Oran vadeye göre kademelidir (kısa vade yüksek, uzun vade düşük — uzun vadeyi teşvik); güncel oranlar Cumhurbaşkanı kararıyla değişir, koda gömme, parametre tut. Akış: brüt faiz hesaplanır → stopaj kesilir → net faiz müşteriye ödenir.
+
+```admonish tip title="YMO — müşteriye gerçek maliyet"
+TBB düzenlemesi gereği müşteriye sadece "aylık %2.5" değil, BSMV + KKDF dahil **yıllık maliyet oranı (YMO)** gösterilmelidir. Beyan edilen oran (BKO) ile efektif maliyet arasındaki farkı saklamak hem güven kaybı hem de şikâyet sebebidir.
+```
+
+YMO hesabında her ay faiz + BSMV + KKDF toplanır. Aylık döngü:
+
+```java
+BigDecimal totalInterest = ZERO;
+BigDecimal balance = principal;
+for (int i = 0; i < months; i++) {
+    BigDecimal monthlyInterest = balance.multiply(monthlyRate);
+    BigDecimal bsmv = monthlyInterest.multiply(bsmvRate);   // 0.05
+    BigDecimal kkdf = monthlyInterest.multiply(kkdfRate);   // 0.10 tüketici
+    BigDecimal totalMonthly = monthlyInterest.add(bsmv).add(kkdf);
+    totalInterest = totalInterest.add(totalMonthly);
+    balance = balance.subtract(/* taksitin anapara kısmı */);
+}
+```
+
+Sonra toplam maliyeti yıllıklandırıp yüzdeye çeviririz:
+
+```java
+// YMO = (toplam maliyet / anapara) × (12 / ay sayısı) × 100
+return totalInterest
+    .divide(principal, 10, RoundingMode.HALF_EVEN)
+    .multiply(BigDecimal.valueOf(12))
+    .divide(BigDecimal.valueOf(months), 4, RoundingMode.HALF_EVEN)
+    .multiply(BigDecimal.valueOf(100));
+```
+
+<details>
+<summary>Tam kod: calculateEffectiveAnnualCost (~28 satır)</summary>
 
 ```java
 public BigDecimal calculateEffectiveAnnualCost(
@@ -296,22 +396,22 @@ public BigDecimal calculateEffectiveAnnualCost(
     BigDecimal monthlyRate,
     int months,
     BigDecimal bsmvRate,    // 0.05
-    BigDecimal kkdfRate     // 0.10 consumer
+    BigDecimal kkdfRate     // 0.10 tüketici
 ) {
     BigDecimal totalInterest = ZERO;
     BigDecimal balance = principal;
-    
+
     for (int i = 0; i < months; i++) {
         BigDecimal monthlyInterest = balance.multiply(monthlyRate);
         BigDecimal bsmv = monthlyInterest.multiply(bsmvRate);
         BigDecimal kkdf = monthlyInterest.multiply(kkdfRate);
         BigDecimal totalMonthly = monthlyInterest.add(bsmv).add(kkdf);
-        
+
         totalInterest = totalInterest.add(totalMonthly);
-        balance = balance.subtract(/* principal of installment */);
+        balance = balance.subtract(/* taksitin anapara kısmı */);
     }
-    
-    // YMO = (totalInterest / principal) * (12 / months) * 100
+
+    // YMO = (toplam maliyet / anapara) × (12 / months) × 100
     return totalInterest
         .divide(principal, 10, RoundingMode.HALF_EVEN)
         .multiply(BigDecimal.valueOf(12))
@@ -320,153 +420,222 @@ public BigDecimal calculateEffectiveAnnualCost(
 }
 ```
 
+</details>
+
+Kredi maliyetinin katman katman büyümesini bir akışta gör:
+
+```mermaid
+flowchart LR
+    F["Brut faiz matrahi"] --> B["BSMV ekle yuzde 5"]
+    F --> K["KKDF ekle yuzde 10"]
+    B --> T["Musteri toplam maliyet"]
+    K --> T
+    A["Anapara"] --> T
+    T --> Y["YMO olarak goster"]
+```
+
 ### 6. APR vs APY (EAR)
 
-**APR (Annual Percentage Rate):**
-- Nominal rate, no compounding
-- TR: BKO (Borçlanma Kâr Oranı)
+Müşteri "yıllık %12" duyar ama bileşiklenme yüzünden cebinden çıkan farklıdır; bu ikisini karıştırmak hem güven hem uyum sorunudur.
 
-**APY (Annual Percentage Yield) / EAR (Effective Annual Rate):**
-- With compounding
-- TR: NKO (Net Kâr Oranı) or YMO
-
-**Relationship:**
+**APR (Annual Percentage Rate)** nominal orandır, bileşiklenme yoktur — TR karşılığı BKO. **APY / EAR (Effective Annual Rate)** bileşiklenmeyi içerir — TR'de NKO ya da YMO.
 
 ```
 EAR = (1 + APR/n)^n - 1
 
-APR: 12%, monthly compound:
-EAR = (1 + 0.12/12)^12 - 1 = 12.683%
+APR %12, aylık bileşik:
+EAR = (1 + 0.12/12)^12 - 1 = %12.683
 ```
 
-Banking pratiği: Customer'a hem APR hem EAR göster (transparency regulation).
+Banking pratiği: şeffaflık düzenlemesi gereği müşteriye hem APR hem EAR gösterilir. %12 nominal, %12.68 efektif — arayı gizlemek UMÇK şikâyeti demektir.
 
 ### 7. FX — bid/ask spread
 
-Bank FX rates:
+Bir müşteri USD hesabından TL hesabına para çevirdiğinde ya da dövizini bozdurduğunda banka tek bir kur değil, iki kur kullanır; aradaki fark bankanın gelir ve risk tamponudur.
+
+**Bid (alış):** bankanın dövizi aldığı kur. **Ask (satış):** bankanın dövizi sattığı kur. İkisinin ortası **mid**, farkı **spread**:
 
 ```
-USD/TRY rates:
-  Bank buys (bid): 32.40    (bank pays TRY for USD)
-  Bank sells (ask): 32.60   (bank receives TRY for USD)
-  Mid:             32.50
-  Spread:          0.20 TRY (~62 bps)
+USD/TRY:
+  Banka alır (bid):  32.40    (banka USD için TRY öder)
+  Banka satar (ask): 32.60    (banka USD için TRY alır)
+  Mid:               32.50
+  Spread:            0.20 TRY (~62 bps)
 ```
 
-**Customer perspective:**
-- Sell 1000 USD → receive 32,400 TL (bank buys at bid)
-- Buy 1000 USD → pay 32,600 TL (bank sells at ask)
+Müşteri açısından: 1000 USD **satar** → 32,400 TL alır (banka bid'den alır); 1000 USD **alır** → 32,600 TL öder (banka ask'ten satar).
 
-**Banking nedeniyle:**
-- Cover risk (FX move during settlement)
-- Operational cost
-- Profit margin
+<mark>Müşteri döviz alırken ask, satarken bid kullan; mid-rate ile işlem bankaya zarar yazar.</mark>
 
-**Spread factors:**
-- Currency pair (major vs exotic) — TRY/USD daha geniş USD/EUR'dan
-- Market volatility (spread widens in stress)
-- Transaction size (large block tighter)
-- Time of day (Asian close TRY wide)
+```mermaid
+flowchart LR
+    S["Musteri 1000 USD satar"] --> BID["Banka alis bid 32.40"]
+    BID --> R1["Musteri alir 32400 TL"]
+    B["Musteri 1000 USD alir"] --> ASK["Banka satis ask 32.60"]
+    ASK --> R2["Musteri oder 32600 TL"]
+```
 
-**Java FX service:**
+Spread'i genişleten faktörler: parite (major dar, exotic geniş — USD/TRY, EUR/USD'den geniş), piyasa volatilitesi (stresde açılır), işlem büyüklüğü (büyük blok daha dar), günün saati (Asya kapanışında TRY geniş).
+
+Serviste yön açık olmalı — müşterinin ne yaptığına göre bid/ask seçilir:
 
 ```java
 @Service
 public class FxRateService {
-    
+
     private final FxRateRepository repo;
-    
-    public BigDecimal convertCustomerSellsForeign(
-        BigDecimal foreignAmount,
-        String foreignCurrency
-    ) {
-        // Customer sells foreign → bank buys at bid
-        FxRate rate = repo.getRate(foreignCurrency, "TRY", FxSide.BID);
-        return foreignAmount.multiply(rate.getRate())
-            .setScale(2, RoundingMode.HALF_EVEN);
+
+    public BigDecimal convertCustomerSellsForeign(BigDecimal foreignAmount, String ccy) {
+        // Müşteri döviz satar → banka bid'den alır
+        FxRate rate = repo.getRate(ccy, "TRY", FxSide.BID);
+        return foreignAmount.multiply(rate.getRate()).setScale(2, RoundingMode.HALF_EVEN);
     }
-    
-    public BigDecimal convertCustomerBuysForeign(
-        BigDecimal foreignAmount,
-        String foreignCurrency
-    ) {
-        // Customer buys foreign → bank sells at ask
-        FxRate rate = repo.getRate(foreignCurrency, "TRY", FxSide.ASK);
-        return foreignAmount.multiply(rate.getRate())
-            .setScale(2, RoundingMode.HALF_EVEN);
+
+    public BigDecimal convertCustomerBuysForeign(BigDecimal foreignAmount, String ccy) {
+        // Müşteri döviz alır → banka ask'ten satar
+        FxRate rate = repo.getRate(ccy, "TRY", FxSide.ASK);
+        return foreignAmount.multiply(rate.getRate()).setScale(2, RoundingMode.HALF_EVEN);
     }
 }
 ```
 
-### 8. FX forward — future rate
+### 8. FX cross rate
 
-**Spot:** Anlık settlement (T+2 standard).
-**Forward:** Future date locked rate.
+Müşteri EUR'sunu TL'ye çevirmek ister ama bankanın doğrudan EUR/TRY kotasyonu her zaman olmayabilir; iki para arasında doğrudan piyasa yoksa **cross rate (çapraz kur)** ortak bir para (genelde USD) üzerinden türetilir.
 
-**Forward rate (covered interest parity):**
+İki kur da USD karşısında aynı yönde (USD quote) ise çarparız:
+
+```
+EUR/TRY = EUR/USD × USD/TRY
+EUR/TRY = 1.08 × 32.50 = 35.10
+```
+
+Eğer kotasyonlar aynı base'e sahipse (ikisi de USD base, örn USD/EUR ve USD/TRY) bölme kullanılır: `EUR/TRY = (USD/TRY) / (USD/EUR)`. Yön karıştırılırsa kur tepetaklak çıkar.
+
+```mermaid
+flowchart LR
+    E["EUR/USD 1.08"] --> X["Carpim"]
+    U["USD/TRY 32.50"] --> X
+    X --> R["EUR/TRY 35.10"]
+```
+
+```java
+public BigDecimal crossRate(BigDecimal eurUsd, BigDecimal usdTry) {
+    return eurUsd.multiply(usdTry).setScale(4, RoundingMode.HALF_EVEN);
+}
+```
+
+```admonish warning title="Cross rate'te spread birikir"
+Cross rate'i müşteriye verirken her iki bacağın da (EUR/USD ve USD/TRY) kendi bid/ask spread'i vardır. Müşteri aleyhine worst-case bacaklar seçilir; iki spread üst üste binince müşterinin gördüğü efektif spread tek pariteden geniş olur. Cross'u mid×mid ile hesaplayıp tek spread eklemek bankayı zarara sokar.
+```
+
+### 9. FX forward — future rate
+
+Kurumsal bir müşteri 3 ay sonra USD ödeyecekse bugünden kuru kilitlemek isteyebilir; **forward** tam olarak budur — ileri tarihli, bugünden sabitlenmiş kur. **Spot** ise anlık işlemdir (standart T+2 valör).
+
+Forward kuru **covered interest parity (CIP)** ile iki paranın faiz farkından türetilir:
 
 ```
 F = S × (1 + r_TRY × t) / (1 + r_USD × t)
 
-F: forward rate
-S: spot rate
-r_TRY: TRY interest rate
-r_USD: USD interest rate
-t: time to forward date (years)
+F: forward kur
+S: spot kur
+r_TRY: TRY faizi
+r_USD: USD faizi
+t: forward tarihine süre (yıl)
 ```
 
-**Banking örnek:** Spot USD/TRY 32.50, TRY rate %50, USD rate %5, 3 ay:
+**Örnek:** Spot USD/TRY 32.50, TRY %50, USD %5, 3 ay:
 
 ```
 t = 0.25
 F = 32.50 × (1 + 0.50 × 0.25) / (1 + 0.05 × 0.25)
 F = 32.50 × 1.125 / 1.0125
-F = 32.50 × 1.1111
 F = 36.11
 ```
 
-Forward 36.11 (3 ay sonra USD/TRY). Spot'tan yüksek = TRY discount (high rate).
+Forward 36.11, spot'tan yüksek — yüksek faizli para (TRY) forward'da **discount** eder. Sezgi: yüksek TRY faizi zaten getiri sağlıyorsa, faiz farkı forward kura yansımalı ki arbitraj kalmasın. Kullanım: kurumsal FX ödemesini bugünden kilitleme, hedge, spekülatif pozisyon.
 
-**Forward use:**
-- Corporate USD payment 3 ay sonra → lock rate today
-- Hedge FX risk
-- Speculative position
+### 10. FX swap
 
-### 9. FX swap
-
-**FX Swap:** Spot + opposite forward.
+Banka bilançosunda kısa süreli TRY likiditesine ihtiyaç duyduğunda döviz ile TRY arasında geçici takas yapar; **FX swap** = spot işlem + ters yönde forward işlem.
 
 ```
-Day 1: Bank buys USD spot @ 32.50, sells TRY
-       Bank sells USD 3-month forward @ 36.11, receives TRY
+Gün 1: Banka spot USD alır @ 32.50, TRY satar
+       Banka 3 ay forward USD satar @ 36.11, TRY alır
 
-Net effect: Bank borrows TRY for 3 months (paying difference as cost)
-           Equivalent to TRY money market borrowing
+Net etki: Banka 3 ay TRY borçlanmış olur (farkı maliyet olarak öder)
+          TRY para piyasası borçlanmasına eşdeğer
 ```
 
-Banking için liquidity management, balance sheet optimization.
+Bankacılıkta likidite yönetimi ve bilanço optimizasyonu için kullanılır — swap'ın maliyeti aslında iki paranın faiz farkıdır, yani forward primi/iskontosunun ta kendisidir.
 
-### 10. Interest accrual — banking ledger
+### 11. Interest accrual — banking ledger
 
-**Daily accrual** banking standard. Faiz **hak edildiği gün** journal'a yazılır.
+Bir kredi ya da mevduat sadece vade sonunda değil, **her gün** faiz üretir; banka bu faizi hak edildiği gün ledger'a yazmalı ki bilanço her gün doğru olsun ve müşteri erken kapatmak isterse tutar hazır olsun. Buna **daily accrual (günlük tahakkuk)** denir ve bankacılık standardıdır.
+
+Tahakkuk bir zamanlanmış işle çalışır; her aktif kredi için günlük faiz hesaplanıp ledger'a post edilir:
+
+```java
+@Scheduled(cron = "0 30 23 * * *")   // her gün 23:30 Europe/Istanbul
+public void accrueDailyInterest() {
+    LocalDate today = LocalDate.now(zone);
+    for (LoanAccount loan : loanRepo.findActiveLoans()) {
+        BigDecimal dailyInterest = computeDailyInterest(loan, today);
+        if (dailyInterest.signum() == 0) continue;
+        postAccrual(loan, today, dailyInterest);
+    }
+}
+```
+
+Post ederken double-entry uygularız (loan receivable debit, interest income credit) ve kritik olarak idempotency key taşırız:
+
+```java
+ledgerService.post(JournalEntryRequest.builder()
+    .description("Daily interest accrual " + loan.getId())
+    .referenceType("interest_accrual")
+    .referenceId(UUID.nameUUIDFromBytes(
+        (loan.getId() + today).getBytes()).toString())            // idempotent
+    .entry(LedgerEntryRequest.debit("loan_receivable_" + loan.getId(), dailyInterest, "TRY"))
+    .entry(LedgerEntryRequest.credit("interest_income_4101", dailyInterest, "TRY"))
+    .build());
+```
+
+<mark>Her günlük tahakkuku (loan, date) bazlı idempotency key ile yaz; yoksa job re-run çift faiz üretir.</mark> `referenceId = hash(loanId + date)` sayesinde aynı günün ikinci çalışması yeni kayıt açmaz.
+
+Günlük faizin kendisi bakiye × oran × bir günlük day count fraction'dır:
+
+```java
+private BigDecimal computeDailyInterest(LoanAccount loan, LocalDate date) {
+    BigDecimal balance = loan.getOutstandingBalance(date);
+    BigDecimal annualRate = loan.getAnnualRate();
+    DayCountConvention convention = loan.getDayCountConvention();
+    BigDecimal fraction = convention.fraction(date.minusDays(1), date);  // 1 gün
+    return balance.multiply(annualRate).multiply(fraction)
+        .setScale(2, RoundingMode.HALF_EVEN);
+}
+```
+
+<details>
+<summary>Tam kod: InterestAccrualService (~40 satır)</summary>
 
 ```java
 @Service
 public class InterestAccrualService {
-    
+
     private final LedgerService ledgerService;
-    
+
     @Scheduled(cron = "0 30 23 * * *")   // Daily 23:30
     public void accrueDailyInterest() {
         LocalDate today = LocalDate.now(zone);
-        
+
         List<LoanAccount> loans = loanRepo.findActiveLoans();
-        
+
         for (LoanAccount loan : loans) {
             BigDecimal dailyInterest = computeDailyInterest(loan, today);
-            
+
             if (dailyInterest.signum() == 0) continue;
-            
+
             ledgerService.post(JournalEntryRequest.builder()
                 .description("Daily interest accrual " + loan.getId())
                 .referenceType("interest_accrual")
@@ -479,12 +648,12 @@ public class InterestAccrualService {
                 .build());
         }
     }
-    
+
     private BigDecimal computeDailyInterest(LoanAccount loan, LocalDate date) {
         BigDecimal balance = loan.getOutstandingBalance(date);
         BigDecimal annualRate = loan.getAnnualRate();
         DayCountConvention convention = loan.getDayCountConvention();
-        
+
         BigDecimal fraction = convention.fraction(date.minusDays(1), date);  // 1 day
         return balance.multiply(annualRate).multiply(fraction)
             .setScale(2, RoundingMode.HALF_EVEN);
@@ -492,86 +661,47 @@ public class InterestAccrualService {
 }
 ```
 
-**Idempotency:** `referenceId = hash(loanId + date)` → same day re-run = no duplicate.
+</details>
 
-### 11. Banking interest products
+Akışı ve idempotency dallanmasını gör:
 
-**Vadeli mevduat (Time deposit):**
-- Customer locks money for term (1, 3, 6, 12 ay)
-- Higher rate than vadesiz
-- Pre-mature withdrawal: penalty or no interest
-
-**Vadesiz mevduat (Demand deposit):**
-- Withdrawal anytime
-- Low/no interest
-- Banking: cheap funding (most banks)
-
-**Kredi (Loan):**
-- Customer borrows, pays interest
-- Term, schedule, collateral (mortgage)
-- BSMV + KKDF apply
-
-**Kredi kartı (Credit card):**
-- Revolving credit
-- Minimum payment monthly
-- High rates (gecikme faizi BDDK regulated max)
-
-**Konut kredisi (Mortgage):**
-- Long term (5-30 yıl)
-- Lower rate
-- Collateral: gayrimenkul
-- KKDF %0 (regulatory)
-
-**Otomobil kredisi (Auto loan):**
-- Medium term (3-5 yıl)
-- Collateral: araç
-- KKDF varies
-
-### 12. Banking — FX/interest anti-pattern'leri
-
-**Anti-pattern 1: double for interest calc**
-
-```java
-double interest = principal * rate * days / 365;   // ❌
+```mermaid
+flowchart LR
+    D["Gunluk cron 23:30"] --> B["Bakiye x oran x gun kesri"]
+    B --> ID{"Idempotency key var mi"}
+    ID -->|"evet"| SKIP["Atla, cift kayit yok"]
+    ID -->|"hayir"| POST["Ledger debit ve credit post"]
 ```
 
-Precision loss. **BigDecimal HALF_EVEN.**
+```admonish warning title="Zaman dilimi cutoff'u"
+Günlük accrual cutoff'u UTC değil Europe/Istanbul olmalı. `LocalDate.now()` sunucu zaman dilimini alırsa gün kayması olur ve bir günlük faiz ya iki kez ya hiç yazılmaz. Zone'u explicit ver: `LocalDate.now(ZoneId.of("Europe/Istanbul"))`.
+```
 
-**Anti-pattern 2: Day count convention assumption**
+### 12. Banking interest products
 
-Code "365 hardcoded" — ACT/360 contract için yanlış.
+Faiz matematiği hep aynı olsa da her ürün farklı kurallarla gelir; müşteriye doğru ürünü doğru faizle sunmak için haritayı bil.
 
-**Anti-pattern 3: BSMV + KKDF ignore TR products**
+- **Vadeli mevduat (time deposit):** Para vade boyunca (1/3/6/12 ay) kilitli, vadesizden yüksek faiz; erken bozum penaltı ya da faizsiz. Faizden stopaj kesilir.
+- **Vadesiz mevduat (demand deposit):** İstediğin an çek, düşük/sıfır faiz; banka için ucuz fonlama.
+- **Kredi (loan):** Müşteri borçlanır, faiz öder; BSMV + KKDF uygulanır.
+- **Kredi kartı:** Revolving kredi, aylık asgari ödeme, yüksek oran (gecikme faizi BDDK ile tavanlı).
+- **Konut kredisi (mortgage):** Uzun vade (5-30 yıl), düşük oran, teminat gayrimenkul, KKDF %0.
+- **Taşıt kredisi:** Orta vade (3-5 yıl), teminat araç, KKDF değişken.
 
-Customer şikayet, regulatory non-compliance.
+### 13. FX / interest anti-pattern'leri
 
-**Anti-pattern 4: APR/APY confusion**
+Mülakatta "bu kodda ne yanlış?" cephaneliği; on klasik hata:
 
-Customer "%12 yıllık" duyduğu, gerçek effective %13.5 → güven kaybı + UMÇK şikayet.
-
-**Anti-pattern 5: FX rate spread ignore**
-
-Mid-rate kullan → bank kaybeder. Bid/ask explicit.
-
-**Anti-pattern 6: Daily interest accrual yok**
-
-Customer pre-mature withdraw → manual calculate karmaşık. Daily accrual baseline.
-
-**Anti-pattern 7: Leap year ignore**
-
-Şubat 29 → 365 değil 366 gün. ACT/365 vs ACT/365F farkı.
-
-**Anti-pattern 8: Time zone yanlış**
-
-UTC vs Europe/Istanbul. Daily accrual cutoff TR zaman dilimi.
-
-**Anti-pattern 9: Idempotency yok accrual'da**
-
-Job re-run → double interest. Idempotency key per (loan, date).
-
-**Anti-pattern 10: FX forward stale rate**
-
-Real-time rate yok → market move sonrası eski rate ile işlem. Rate refresh + expiry.
+1. **`double` ile faiz:** `principal * rate * days / 365` → precision loss. `BigDecimal` + `HALF_EVEN`.
+2. **Day count varsayımı:** "365 hardcoded" → ACT/360 contract için yanlış.
+3. **BSMV/KKDF/stopaj atlama:** TR ürünlerinde müşteri şikâyeti, regülatör uyumsuzluğu.
+4. **APR/APY karışıklığı:** Müşteri %12 duyar, efektif %13.5 → güven kaybı + şikâyet.
+5. **FX mid-rate kullanma:** Bid/ask explicit değilse banka kaybeder.
+6. **Günlük accrual yok:** Erken kapamada manuel hesap karmaşık; daily accrual baseline.
+7. **Artık yıl ihmali:** Şubat 29 → 365 değil 366; ACT/365 vs ACT/365F farkı.
+8. **Zaman dilimi hatası:** UTC vs Europe/Istanbul; accrual cutoff TR saatinde.
+9. **Accrual'da idempotency yok:** Job re-run → çift faiz; key per (loan, date).
+10. **FX forward stale rate:** Real-time rate yoksa market hareketi sonrası eski kurla işlem; refresh + expiry.
 
 ---
 
@@ -579,60 +709,155 @@ Real-time rate yok → market move sonrası eski rate ile işlem. Rate refresh +
 
 - ISDA day count conventions
 - "Fixed Income Mathematics" — Fabozzi
-- TCMB MK (Mevduat Kanunu)
-- BSMV / KKDF mevzuat
+- TCMB mevzuatı (mevduat, munzam karşılık)
+- BSMV / KKDF / stopaj mevzuatı
 - TBB Tüketici Kredisi Sözleşmesi rehberi
 - BDDK tüketici kredisi tebliği
-- TRLIBOR / TLREF reference rates
+- TRLIBOR / TLREF referans oranları
 - "Options, Futures, and Other Derivatives" — Hull
 
 ---
 
-## Mini task'ler
+## Kendini Sına
 
-### Task 10.5.1 — Simple + compound interest (45 dk)
+Aşağıdaki soruları önce **cevaba bakmadan** kendi cümlelerinle yanıtlamayı dene — hepsi TR bank mülakatlarında finance/domain tarafında karşına çıkabilecek tarzda. Takıldığında ilgili Kavramlar başlığına dön, sonra tekrar dene.
 
-BigDecimal implementation. Test edge cases (zero rate, zero principal, very long period).
+**S1. Müşteri elindeki 1000 USD'yi bozdurmak istiyor. Banka hangi kuru kullanır, neden? Ya USD almak isteseydi?**
 
-### Task 10.5.2 — Day count conventions enum (60 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-ACT/365, ACT/360, ACT/ACT, 30/360. Test her convention için fraction calculation.
+Müşteri dövizi **satıyor**, yani banka dövizi alıyor → **bid (alış)** kuru kullanılır. Bid 32.40 ise müşteri 32,400 TL alır. Müşteri USD **alsaydı** banka satıyor olurdu → **ask (satış)** kuru, örn 32.60 → müşteri 32,600 TL öderdi.
 
-### Task 10.5.3 — Loan amortization schedule (60 dk)
+Aradaki 0.20 TRY spread bankanın gelir + risk tamponudur (settlement sırasındaki kur hareketi, operasyonel maliyet, kâr marjı). Kural: müşteri alırken ask, satarken bid; mid-rate ile işlem yaparsan banka her işlemde yarım spread kaybeder.
 
-French method. 60-month consumer loan. Schedule table. Test: last installment clears balance.
+</details>
 
-### Task 10.5.4 — BSMV + KKDF effective cost (45 dk)
+**S2. Bankada doğrudan EUR/TRY kotasyonu yok; elinde EUR/USD 1.08 ve USD/TRY 32.50 var. EUR/TRY cross rate'i nasıl bulursun? Kotasyonlar aynı base olsaydı?**
 
-YMO calculation. TR consumer loan. Customer-facing display.
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 10.5.5 — APR ↔ APY conversion (30 dk)
+İki kur da USD karşısında aynı yönde (EUR/USD ve USD/TRY, USD ortada zincirleniyor) olduğu için **çarparız**: `EUR/TRY = EUR/USD × USD/TRY = 1.08 × 32.50 = 35.10`.
 
-EAR formula. Test: monthly vs daily vs continuous compound.
+Eğer kotasyonlar aynı base'e sahip olsaydı (örn ikisi de USD base: USD/EUR ve USD/TRY) o zaman **bölme** gerekir: `EUR/TRY = (USD/TRY) / (USD/EUR)`. Cross'u müşteriye verirken her iki bacağın bid/ask spread'i üst üste biner, o yüzden müşteri aleyhine worst-case bacaklar seçilir — mid×mid ile tek spread eklemek bankayı zarara sokar.
 
-### Task 10.5.6 — FX bid/ask conversion (45 dk)
+</details>
 
-Customer buys/sells foreign. Rate table seed. Spread display.
+**S3. 30/360 day count convention nasıl çalışır ve ACT/365'ten neden farklı sonuç verir? 100,000 TL %5 için üç convention'ı karşılaştır.**
 
-### Task 10.5.7 — FX forward calculator (45 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-CIP formula. Spot + 2 rate inputs + tenor → forward.
+30/360 her ayı 30 gün, yılı 360 gün kabul eder — gerçek takvimi değil, standart bir dönem uzunluğu kullanır (30/31 ay-sonu düzeltmesiyle: `d1=30 && d2=31 → d2=30`). Bu yüzden gerçek gün sayısı fark etmeksizin dönemleri düzgünleştirir; US corporate bond'larda yaygındır.
 
-### Task 10.5.8 — Daily interest accrual job (60 dk)
+90 gün için karşılaştırma: ACT/365 → `100000 × 0.05 × 90/365 = 1,232.88 TL`; ACT/360 → `× 90/360 = 1,250.00 TL`; 30/360 → 90 gün tam 3 ay olduğundan yine `90/360 = 1,250.00 TL`. Payda 360'a inince faiz artar; convention'ı üründen türet, koda 365 gömme.
 
-Spring `@Scheduled` 23:30. Ledger post via Topic 10.1 service. Idempotency. Test rerun.
+</details>
 
-### Task 10.5.9 — Loan early payoff calculator (45 dk)
+**S4. Bir tüketici kredisinde ve bir vadeli mevduatta vergi hangi sırayla, hangi tarafa uygulanır? BSMV ve KKDF birbirinin üstüne biner mi?**
 
-Customer wants to close loan early. Outstanding balance + accrued interest to date.
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 10.5.10 — TR consumer loan calculator UI/API (60 dk)
+İki taraf terstir. **Kredide** vergi faizin **üstüne eklenir**: brüt faiz matrahından BSMV %5 ve KKDF %10 (tüketici) ayrı ayrı, ikisi de aynı matrah üzerinden hesaplanır — birbirinin üstüne binmez. Müşteri maliyeti = anapara + faiz + BSMV + KKDF. **Mevduatta** ise faizden **stopaj kesilir**: brüt faiz → stopaj (gelir vergisi tevkifatı, vadeye göre kademeli) → net faiz müşteriye.
 
-Input: amount, term, rate. Output: schedule + BSMV/KKDF + YMO. Customer-facing API.
+Yani kredide müşteri faizden fazlasını öder, mevduatta faizden azını alır. Oranlar (KKDF %0-15, stopaj kademeleri) Cumhurbaşkanı kararıyla değişir; koda gömmeyip parametre tutmak şart. Müşteriye BSMV+KKDF dahil YMO gösterilmesi TBB zorunluluğu.
+
+</details>
+
+**S5. APR ile APY/EAR farkı nedir? APR %12 aylık bileşiklenirse EAR kaç olur ve bu neden önemli?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+APR (nominal, TR'de BKO) bileşiklenmeyi yok sayar; APY/EAR (TR'de NKO/YMO) bileşiklenmeyi içerir, yani paranın gerçek yıllık getirisi/maliyetidir. Formül: `EAR = (1 + APR/n)^n − 1`. %12 aylık bileşik için `(1 + 0.12/12)^12 − 1 = %12.683`.
+
+Önemi şeffaflık: müşteri "%12" duyup gerçekte %12.68 ödediğinde/aldığında fark güven kaybına ve UMÇK şikâyetine döner. Düzenleme gereği müşteriye hem nominal hem efektif oran gösterilir; ikisini karıştıran kod compliance açığıdır.
+
+</details>
+
+**S6. FX forward kuru CIP ile nasıl hesaplanır? TRY faizi USD'den çok yüksekken forward, spot'tan yüksek mi düşük mü çıkar ve neden?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Covered interest parity: `F = S × (1 + r_TRY × t) / (1 + r_USD × t)`. Spot 32.50, TRY %50, USD %5, 3 ay (t=0.25) için `F = 32.50 × 1.125 / 1.0125 = 36.11`.
+
+TRY faizi yüksek olduğu için forward **spot'tan yüksek** çıkar — yani yüksek faizli para (TRY) forward'da iskonto (discount) eder. Sezgi: TRY'de para tutmak yüksek faiz kazandırıyorsa, arbitrajın kapanması için bu faiz avantajı forward kura yansımalı; aksi halde "bugün USD sat, TRY'de faiz kazan, forward'dan USD geri al" ile risksiz kâr olurdu. FX swap'ın maliyeti de tam bu faiz farkıdır.
+
+</details>
+
+**S7. Günlük faiz tahakkuku (daily accrual) neden vade sonunu beklemez, ledger'a nasıl yazılır ve job iki kez çalışırsa ne olur?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Bilanço her gün doğru olmalı ve müşteri krediyi/mevduatı herhangi bir gün kapatmak isterse o ana kadar hak edilmiş faiz hazır olmalı; bu yüzden faiz hak edildiği gün journal'a yazılır (loan receivable debit, interest income credit), vade sonu beklenmez. Günlük tutar = bakiye × yıllık oran × bir günlük day count fraction.
+
+Job re-run tehlikelidir: idempotency yoksa aynı gün iki kez çalışınca çift faiz yazılır. Çözüm `referenceId = hash(loanId + date)` — aynı (loan, date) için ikinci post yeni kayıt açmaz. Ayrıca cutoff Europe/Istanbul olmalı, UTC değil; yoksa gün kayması bir günü çift ya da eksik yazar.
+
+</details>
+
+**S8. French amortization tablosunda ilk taksitte faiz neden yüksek anapara düşük, son taksitte tam tersi? Son taksitte neden özel bir düzeltme gerekir?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Toplam taksit (PMT) sabittir ama faiz her ay **kalan bakiye** üzerinden hesaplanır (`faiz = bakiye × r`). Başta bakiye en yüksek olduğundan faiz payı büyük, anapara payı (`PMT − faiz`) küçük; bakiye eridikçe faiz azalır, anapara payı büyür. Yani sabit taksit içinde faiz→anapara kayması olur.
+
+Son taksitte düzeltme gerekir çünkü her ay `setScale(2)` ile yapılan yuvarlamalar birikip 60. ayda bakiyeyi tam sıfıra getirmeyebilir (0.02-0.03 artık kalır). Bu yüzden son taksitte anaparayı doğrudan kalan bakiyeye eşitleyip taksiti buna göre ayarlarız — böylece kredi kuruşu kuruşuna kapanır.
+
+</details>
 
 ---
 
-## Test yazma rehberi
+## Tamamlama kriterleri
+
+- [ ] Simple vs compound interest farkını ve continuous compounding'in nerede kullanıldığını açıklayabiliyorum
+- [ ] ACT/365, ACT/360, 30/360 convention'larını ve aynı orandan neden farklı faiz çıktığını anlatabiliyorum
+- [ ] French amortization tablosunda faiz–anapara kaymasını ve son taksit düzeltmesini çizebiliyorum
+- [ ] Kredide BSMV+KKDF, mevduatta stopaj uygulama sırasını ve YMO'yu müşteriye neden gösterdiğimizi biliyorum
+- [ ] APR ile APY/EAR farkını formülle açıklayıp örnek EAR hesaplayabiliyorum
+- [ ] FX bid/ask yönünü (müşteri alır→ask, satar→bid) ve cross rate hesabını hatasız yapabiliyorum
+- [ ] FX forward CIP formülünü ve TRY yüksek faiz senaryosunu (forward > spot) açıklayabiliyorum
+- [ ] Daily interest accrual + ledger post + (loan, date) idempotency + Europe/Istanbul cutoff mantığını biliyorum
+- [ ] (Opsiyonel) "Pratik yapmak istersen" bölümündeki testleri yazdım ve Claude-verify prompt'uyla doğrulattım
+
+---
+
+## Defter notları
+
+1. "Simple vs compound interest banking ürünleri (mevduat vs kredi) eşlemesi: ____."
+2. "Day count conventions (ACT/365, ACT/360, ACT/ACT, 30/360) ürün haritası: ____."
+3. "French amortization formülü + faiz payının azalan paterni + son taksit düzeltmesi: ____."
+4. "Kredide BSMV+KKDF (faiz üstüne) vs mevduatta stopaj (faizden kesme) + YMO: ____."
+5. "APR (BKO) vs APY/EAR (YMO/NKO) + şeffaflık düzenlemesi: ____."
+6. "FX bid/ask + müşteri alır→ask, satar→bid + cross rate spread birikmesi: ____."
+7. "FX forward CIP formülü + TRY yüksek faiz → forward discount senaryosu: ____."
+8. "Daily interest accrual + ledger (Topic 10.1) + (loan, date) idempotency: ____."
+9. "Europe/Istanbul cutoff + artık yıl + accrual kararı: ____."
+10. "TBB + BDDK tüketici düzenlemesi YMO + sözleşme uyumu: ____."
+
+```admonish success title="Bölüm Özeti"
+- Para hesabı her zaman `BigDecimal` + `HALF_EVEN`'dir; `double` binlerce müşteride kuruş kaymaları biriktirip mutabakatı bozar
+- Day count convention faizi doğrudan değiştirir: aynı %5 ACT/365'te 1,232.88, ACT/360'ta 1,250.00 TL — convention'ı üründen türet, 365'i koda gömme
+- TR vergi katmanı iki yönlüdür: kredide BSMV %5 + KKDF %10-15 faizin üstüne eklenir, mevduatta stopaj faizden kesilir; müşteriye BSMV/KKDF dahil YMO gösterilir
+- FX'in bel kemiği bid/ask yönüdür (müşteri alır→ask, satar→bid, mid ile işlem yapma); doğrudan parite yoksa cross rate ortak para üzerinden türetilir, spread'ler birikir
+- Forward CIP ile faiz farkından çıkar (yüksek TRY faizi → forward > spot, discount); FX swap = spot + ters forward, maliyeti faiz farkıdır
+- Faiz her gün hak edilir: daily accrual ledger'a idempotent (loan, date) key ile yazılır, cutoff Europe/Istanbul olur, artık yıl ACT/365 vs ACT/365F ayrımını değiştirir
+```
+
+---
+
+## Pratik yapmak istersen
+
+Kavramları koda dökmek istersen aşağıdaki iki ek hazır: test yazma rehberi simple/compound interest, day count, amortization, BSMV/KKDF, FX bid/ask ve idempotent accrual için örnek testler içerir; Claude-verify prompt'u ile yazdığın finance kodunu banking-grade perspektiften denetletebilirsin. Süre olarak testleri yazmak ~2.5-3 saat sürer; hepsini bitirmek zorunda değilsin, en az simple interest + day count + amortization + FX bid/ask'i kendi elinle yazmayı hedefle.
+
+<details>
+<summary>Test yazma rehberi</summary>
+
+### Simple + compound interest
 
 ```java
 @Test
@@ -642,185 +867,186 @@ void shouldCalculateSimpleInterest() {
         new BigDecimal("0.05"),
         90,
         365);
-    
+
     assertThat(interest).isEqualByComparingTo("1232.88");
 }
+```
 
+Edge case'leri unutma: sıfır oran, sıfır anapara, çok uzun vade (overflow yok, `BigDecimal` sınırsız). Compound için aylık vs günlük vs continuous bileşiklenmeyi karşılaştır.
+
+### Day count conventions
+
+```java
 @ParameterizedTest
 @CsvSource({
     "365, ACT_365, 1232.88",
     "360, ACT_360, 1250.00",
-    "365, THIRTY_360, 1250.00"   // 90 days under 30/360 = same as 90/360
+    "365, THIRTY_360, 1250.00"   // 90 gün 30/360 = 90/360
 })
 void shouldUseDayCountConvention(int daysInYear, DayCountConvention convention, String expected) {
     BigDecimal interest = financeService.interest(
         new BigDecimal("100000"),
         new BigDecimal("0.05"),
         LocalDate.of(2024, 1, 1),
-        LocalDate.of(2024, 4, 1),    // 91 days
+        LocalDate.of(2024, 4, 1),    // 91 gün
         convention);
-    
-    // close compare
+
     assertThat(interest.subtract(new BigDecimal(expected)).abs())
         .isLessThan(new BigDecimal("5"));
 }
+```
 
+Artık yıl testini ekle: 2024 (artık) Şubat'ı içeren dönemi ACT/365 ve ACT/ACT ile karşılaştır.
+
+### Loan amortization
+
+```java
 @Test
 void shouldGenerateAmortizationSchedule() {
     List<Installment> schedule = financeService.amortize(
-        new BigDecimal("100000"),
-        new BigDecimal("0.15"),
-        60);
-    
+        new BigDecimal("100000"), new BigDecimal("0.15"), 60);
+
     assertThat(schedule).hasSize(60);
-    
+
     Installment first = schedule.get(0);
     assertThat(first.getInstallment()).isEqualByComparingTo("2378.99");
     assertThat(first.getInterest()).isEqualByComparingTo("1250.00");
-    
+
     Installment last = schedule.get(59);
-    assertThat(last.getEndBalance()).isEqualByComparingTo("0.00");
-    
+    assertThat(last.getEndBalance()).isEqualByComparingTo("0.00");   // son taksit temizler
+
     BigDecimal totalPaid = schedule.stream()
-        .map(Installment::getInstallment)
-        .reduce(ZERO, BigDecimal::add);
+        .map(Installment::getInstallment).reduce(ZERO, BigDecimal::add);
     assertThat(totalPaid).isGreaterThan(new BigDecimal("100000"));
 }
+```
 
+### BSMV + KKDF efektif maliyet
+
+```java
 @Test
 void shouldComputeEffectiveCostWithBsmvKkdf() {
     BigDecimal ymo = financeService.effectiveAnnualCost(
-        principal: new BigDecimal("100000"),
-        monthlyRate: new BigDecimal("0.025"),
-        months: 60,
-        bsmvRate: new BigDecimal("0.05"),
-        kkdfRate: new BigDecimal("0.10"));
-    
-    assertThat(ymo).isGreaterThan(new BigDecimal("30"));   // %30+ effective
+        new BigDecimal("100000"),   // principal
+        new BigDecimal("0.025"),    // monthlyRate
+        60,                         // months
+        new BigDecimal("0.05"),     // bsmvRate
+        new BigDecimal("0.10"));    // kkdfRate
+
+    assertThat(ymo).isGreaterThan(new BigDecimal("30"));   // %30+ efektif
+}
+```
+
+### FX bid/ask + cross rate
+
+```java
+@Test
+void shouldUseAskRateForCustomerBuyingForeign() {
+    fxRateRepo.save(new FxRate("USD", "TRY",
+        new BigDecimal("32.40"), new BigDecimal("32.60")));
+
+    BigDecimal tryToPay = fxService.convertCustomerBuysForeign(
+        new BigDecimal("1000"), "USD");
+
+    assertThat(tryToPay).isEqualByComparingTo("32600.00");   // ask kullanıldı
 }
 
 @Test
-void shouldUseAskRateForCustomerBuyingForeign() {
-    fxRateRepo.save(new FxRate("USD", "TRY", new BigDecimal("32.40"), new BigDecimal("32.60")));
-    
-    BigDecimal tryToPay = fxService.convertCustomerBuysForeign(
-        new BigDecimal("1000"), "USD");
-    
-    assertThat(tryToPay).isEqualByComparingTo("32600.00");
+void shouldComputeCrossRate() {
+    BigDecimal eurTry = fxService.crossRate(
+        new BigDecimal("1.08"), new BigDecimal("32.50"));
+    assertThat(eurTry).isEqualByComparingTo("35.10");
 }
+```
 
+### Daily interest accrual idempotency
+
+```java
 @Test
 void dailyInterestAccrualShouldBeIdempotent() {
     LoanAccount loan = createLoan(new BigDecimal("100000"), new BigDecimal("0.15"));
-    
+
     interestService.accrueDailyInterest();
-    interestService.accrueDailyInterest();   // Re-run
-    
+    interestService.accrueDailyInterest();   // re-run
+
     BigDecimal accrued = balanceService.balanceOf(loan.getInterestAccount(), "TRY");
     BigDecimal expectedOneDay = new BigDecimal("100000")
         .multiply(new BigDecimal("0.15"))
         .divide(new BigDecimal("365"), 2, RoundingMode.HALF_EVEN);
-    
-    assertThat(accrued).isEqualByComparingTo(expectedOneDay);   // Exactly one day, not two
+
+    assertThat(accrued).isEqualByComparingTo(expectedOneDay);   // tek gün, çift değil
 }
 ```
 
----
+</details>
 
-## Claude-verify prompt
+<details>
+<summary>Claude-verify prompt</summary>
 
 ```
-Finance calculations implementation'ımı banking-grade kriterlere göre değerlendir:
+Finance/FX hesaplama implementasyonumu banking-grade kriterlere göre değerlendir.
+Eksikleri işaretle, kod yazma:
 
 1. Money handling:
-   - BigDecimal everywhere (no double)?
+   - BigDecimal everywhere (double yok)?
    - HALF_EVEN rounding?
    - MathContext explicit?
 
 2. Interest:
    - Simple + compound implementation?
    - Day count conventions enum (ACT/365, ACT/360, ACT/ACT, 30/360)?
-   - Convention switchable per product?
+   - Convention ürün bazında switchable?
 
 3. Amortization:
    - French equal payment?
-   - Eşit anapara variant?
-   - Last installment adjustment (clear residual)?
-   - Schedule table generation?
+   - Eşit anapara varyantı?
+   - Son taksit düzeltmesi (artık temizleme)?
+   - Schedule tablosu üretimi?
 
 4. TR specifics:
-   - BSMV calculation (interest income)?
-   - KKDF calculation (consumer loan)?
-   - YMO (effective annual cost) display?
-   - TBB consumer regulation compliance?
+   - BSMV hesabı (kredi faiz geliri)?
+   - KKDF hesabı (tüketici kredisi)?
+   - Mevduatta stopaj (faizden kesme)?
+   - YMO (efektif yıllık maliyet) gösterimi?
 
 5. APR vs APY:
-   - EAR formula?
-   - Customer display both?
+   - EAR formülü?
+   - Müşteriye ikisi de gösteriliyor mu?
 
 6. FX:
    - Bid/ask spread explicit?
-   - Customer buys → ask?
-   - Customer sells → bid?
-   - Rate refresh strategy?
-   - Forward CIP calculation?
+   - Müşteri alır → ask, satar → bid?
+   - Cross rate ortak para üzerinden + spread birikmesi?
+   - Rate refresh / expiry stratejisi?
+   - Forward CIP hesabı?
 
 7. Accrual:
    - Daily accrual scheduled job?
    - Ledger posting (Topic 10.1)?
-   - Idempotency per (loan, date)?
-   - Time zone (Europe/Istanbul)?
+   - (loan, date) idempotency?
+   - Europe/Istanbul zaman dilimi?
 
 8. Edge cases:
-   - Leap year handling?
-   - Pre-mature payoff calculation?
+   - Artık yıl handling?
+   - Erken kapama (pre-mature payoff) hesabı?
    - Floating rate (TLREF) update?
-   - Holiday day skip vs accrue?
+   - Tatil günü skip vs accrue?
 
 9. Compliance:
-   - YMO customer display?
-   - BDDK consumer loan tebliği?
+   - YMO müşteri gösterimi?
+   - BDDK tüketici kredisi tebliği?
    - TBB sözleşme template?
 
 10. Anti-pattern:
     - double money YOK?
-    - Hardcoded 365 days YOK?
-    - BSMV/KKDF skip YOK?
-    - APR/APY confusion YOK?
+    - Hardcoded 365 YOK?
+    - BSMV/KKDF/stopaj skip YOK?
+    - APR/APY karışıklığı YOK?
     - Mid-rate FX YOK?
-    - Time zone error YOK?
-    - Idempotency yok accrual YOK?
+    - Zaman dilimi hatası YOK?
+    - Accrual'da idempotency eksikliği YOK?
 
-Her madde için PASS / FAIL / EKSIK işaretle.
+Her madde için PASS / FAIL / EKSIK işaretle, kanıt göster, kod yazma.
 ```
 
----
-
-## Tamamlama kriterleri
-
-- [ ] Simple + compound interest BigDecimal
-- [ ] Day count conventions (4 enum)
-- [ ] Amortization French + eşit anapara
-- [ ] BSMV + KKDF + YMO calculation
-- [ ] APR ↔ APY conversion
-- [ ] FX bid/ask service
-- [ ] FX forward CIP
-- [ ] Daily interest accrual job + ledger + idempotency
-- [ ] Pre-mature payoff calculator
-- [ ] TR consumer loan calculator API
-- [ ] 10+ integration test
-
----
-
-## Defter notları (10 madde)
-
-1. "Simple vs compound interest banking products (vadeli vs kredi): ____."
-2. "Day count conventions (ACT/365, ACT/360, ACT/ACT, 30/360) product map: ____."
-3. "French amortization formula + interest portion decreasing pattern: ____."
-4. "BSMV + KKDF TR vergi banking customer cost impact: ____."
-5. "APR (BKO) vs APY/EAR (YMO/NKO) banking regulation transparency: ____."
-6. "FX bid/ask spread + customer buy → ask + sell → bid: ____."
-7. "FX forward CIP formula + TRY high rate scenario: ____."
-8. "Daily interest accrual + ledger (Topic 10.1) + idempotency: ____."
-9. "Time zone Europe/Istanbul + leap year + holiday accrual karar: ____."
-10. "TBB + BDDK consumer regulation YMO + sözleşme uyumu: ____."
+</details>

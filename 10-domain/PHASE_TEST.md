@@ -1,6 +1,10 @@
 # Faz 10 — PHASE TEST
 
-Faz 11'e geçmeden önce kendini sına.
+```admonish question title="Bu test ne işe yarar?"
+Faz 11'e geçmeden önce kendini sına. Bu bir sınav değil, **dürüstlük kontrolü**:
+işaretleyemediğin her madde, hangi topic'e geri döneceğini gösterir.
+Hepsine "evet" diyebiliyorsan hazırsın.
+```
 
 ## Pratik test
 
@@ -164,4 +168,8 @@ Phase 10 = **banking domain genuine knowledge**. Sırf teknik (Phase 1-9) yeters
 
 TR bankalarında engineer **iş bağlamında** çalışırken bu domain knowledge **günlük decision-making'i** yönlendirir. Phase 11 (DevOps) ve Phase 12 (Testing) operasyonel + quality dimension ekleyecek.
 
-Senior banking engineer için Phase 10 **necessary but not sufficient** — Phase 11-12 ile birlikte **complete profile**.
+```admonish success title="Sonraki durak: Faz 11"
+Senior banking engineer için Phase 10 gerekli ama tek başına yeterli değil —
+Phase 11-12 ile birlikte **tam profil** oluşuyor.
+→ [Faz 11 — DevOps](../11-devops/index.md)
+```
