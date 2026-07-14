@@ -1,17 +1,25 @@
 # Topic 12.6 — Mutation Testing: PIT
 
+```admonish info title="Bu bölümde"
+- Neden %85 line coverage'ın "iyi test" anlamına gelmediği ve mutation testing'in bunu nasıl kanıtladığı
+- Killed vs survived mutant, mutation score ve banking için CI threshold gate mantığı
+- PIT (Pitest) kurulumu: Maven plugin, JUnit 5, mutator tipleri (DEFAULTS vs STRONGER, banking için BIG_DECIMAL)
+- Banking-critical sınıflarda (Interest, IBAN, Fraud) mutation'ı yakalayan güçlü test tasarımı
+- Performans (incremental + git diff), equivalent mutant analizi ve 10 klasik anti-pattern
+```
+
 ## Hedef
 
-Mutation testing ile **test kalitesini** ölçmek: coverage %85 ama mutation %50 = test'ler aslında zayıf. PIT (Pitest) banking için yaygın, Spring Boot/Maven entegrasyonu, mutator types, mutation score, banking critical class hedef, CI integration, performance, false positive analizi.
+Mutation testing ile **test kalitesini** ölçmeyi öğrenmek: line coverage %85 olabilir ama mutation %50 ise test'ler aslında davranışı doğrulamıyordur. PIT'i banking projesine kurmak, mutator tiplerini ve mutation score'u okumak, kritik sınıflar için hedef belirlemek, CI gate ve performans ayarını yapmak, false positive'leri (equivalent mutant) analiz etmek.
 
 ## Süre
 
-Okuma: 1.5 saat • Mini task: 2.5 saat • Test: 1 saat • Toplam: ~5 saat
+Okuma: 1.5 saat • Kendini Sına: 30 dk • Pratik (opsiyonel): 2-3 saat • Toplam: ~2 saat (+ pratik)
 
 ## Önbilgi
 
-- JUnit 5 + Mockito (Topic 12.1, 12.2) bitti
-- Code coverage Jacoco yetersizliğini biliyor
+- JUnit 5 + Mockito (Topic 12.1, 12.2) bitti — test yazmak rahat
+- Jacoco line coverage'ı gördün ve "coverage yüksek ama emin değilim" hissini tanıyorsun
 
 ---
 
@@ -19,7 +27,9 @@ Okuma: 1.5 saat • Mini task: 2.5 saat • Test: 1 saat • Toplam: ~5 saat
 
 ### 1. Mutation testing — niye?
 
-**Code coverage:** "Kod satırı çalıştı." Anlamı sınırlı.
+Test suite'in kendisini kim test ediyor? Line coverage bu soruya cevap veremez; mutation testing tam olarak bunun için var.
+
+**Code coverage** sana "bu satır çalıştı" der, fazlasını değil. Aşağıdaki test coverage'ı %100'e taşır ama tek bir şey bile doğrulamaz:
 
 ```java
 public int divide(int a, int b) {
@@ -28,18 +38,31 @@ public int divide(int a, int b) {
 
 @Test
 void test() {
-    divide(10, 2);   // Coverage: %100. Assertion yok!
+    divide(10, 2);   // Coverage %100, assertion YOK
 }
 ```
 
-Coverage **execution**, not **verification**.
+<mark>Coverage kodun çalıştığını ölçer, doğrulandığını değil</mark> — execution, not verification. İşte boşluk burada.
 
-**Mutation testing:**
+**Mutation testing** bu boşluğu doldurur: production kodunu kasıtlı olarak bozar (bir **mutant** üretir) ve test suite'in bunu fark edip etmediğine bakar. Mantık dört adımda döner:
 
-1. Production code'a değişiklik yap (mutant)
-2. Test suite run
-3. Mutant **caught** (test fail) → good (mutant killed)
-4. Mutant **survives** (test pass) → bad (test does NOT verify behavior)
+1. Production kodda küçük bir değişiklik yap (mutant)
+2. Test suite'i çalıştır
+3. Test fail ederse mutant **killed** — test davranışı gerçekten doğruluyor, iyi
+4. Test yeşil kalırsa mutant **survived** — test o değişikliği görmedi, davranışı doğrulamıyor, kötü
+
+```mermaid
+flowchart LR
+    A["Production kodu"] --> B["Mutant uret"]
+    B --> C["Test suite calistir"]
+    C --> D{"Test fail etti mi"}
+    D -->|"Evet"| E["Mutant killed"]
+    D -->|"Hayir"| F["Mutant survived"]
+    E --> G["Test davranisi dogruluyor"]
+    F --> H["Test zayif"]
+```
+
+Yukarıdaki `divide` örneğine PIT birkaç mutant uygular ve zayıf test hepsini hayatta bırakır:
 
 ```
 Original: return a / b;
@@ -48,15 +71,39 @@ Mutant 2: return a + b;
 Mutant 3: return a - b;
 Mutant 4: return 0;
 
-If test was: assertEquals(5, divide(10, 2)) → mutants 1,2,3,4 all killed.
-If test was: divide(10, 2) (no assert) → 0 mutants killed.
+Test: assertEquals(5, divide(10, 2)) → mutant 1,2,3,4 killed.
+Test: divide(10, 2) (assert yok)     → 0 mutant killed.
 
 Mutation score = killed / total = 0/4 = %0
 ```
 
-**Mutation score** = test quality metric.
+Line coverage ile mutation coverage aynı şeyi ölçmez; biri satırın çalışmasına, diğeri testin bozulmayı yakalamasına bakar:
 
-### 2. PIT (Pitest) — banking yaygın
+```mermaid
+flowchart LR
+    subgraph LC["Line coverage"]
+        A["Satir calisti mi"] --> B["Execution"]
+    end
+    subgraph MC["Mutation coverage"]
+        C["Test bozulmayi yakaladi mi"] --> D["Verification"]
+    end
+```
+
+```admonish warning title="Coverage'a güvenmek yanıltıcıdır"
+%85 line coverage ≠ %85 test kalitesi. Assertion'ı zayıf veya hiç olmayan test'ler coverage'ı şişirir ama hiçbir mutant'ı öldürmez. Banking'de "coverage yüksek, demek ki güvendeyiz" cümlesi production'da yanlış hesaplanmış faiz olarak geri döner.
+```
+
+### 2. Mutation score — test kalitesinin metriği
+
+Tek bir sayıya bakıp test suite'in ne kadar "gerçek" olduğunu görmek istiyorsun; bu sayı mutation score'dur.
+
+<mark>Mutation score = killed mutant / total mutant</mark>. %100 tüm bozmaların yakalandığı, %0 hiçbirinin yakalanmadığı anlamına gelir. **Survival rate** ise tersidir: hayatta kalan mutant oranı, doğrudan test suite'indeki kör noktalara işaret eder.
+
+Banking'de bu skor sadece raporlanmaz, bir **mutation threshold** olarak CI'da zorlanır — skor eşiğin altına düşerse build kırılır.
+
+### 3. PIT (Pitest) — kurulum
+
+PIT (Pitest) JVM ekosisteminde mutation testing'in fiili standardıdır; banking projelerinde Maven + JUnit 5 ile yaygın. Plugin'i ve JUnit 5 köprüsünü ekleyerek başlarsın:
 
 ```xml
 <plugin>
@@ -70,6 +117,11 @@ Mutation score = killed / total = 0/4 = %0
             <version>1.2.1</version>
         </dependency>
     </dependencies>
+```
+
+Ardından hangi sınıfların mutasyona uğrayacağını, hangi test'lerin koşacağını ve gate eşiklerini tanımlarsın. `mutationThreshold` banking gate'idir; altına düşerse build fail:
+
+```xml
     <configuration>
         <targetClasses>
             <param>com.bank.transfer.domain.*</param>
@@ -92,23 +144,15 @@ Mutation score = killed / total = 0/4 = %0
 </plugin>
 ```
 
-Run:
+Çalıştırmak tek komut:
+
 ```bash
 mvn org.pitest:pitest-maven:mutationCoverage
 ```
 
-Output:
-```
-================================================================================
-- Mutators
-================================================================================
-> org.pitest.mutationtest.engine.gregor.mutators.ConditionalsBoundaryMutator
-> org.pitest.mutationtest.engine.gregor.mutators.IncrementsMutator
-> org.pitest.mutationtest.engine.gregor.mutators.MathMutator
-> org.pitest.mutationtest.engine.gregor.mutators.NegateConditionalsMutator
-> org.pitest.mutationtest.engine.gregor.mutators.ReturnValsMutator
-...
+Çıktının kalbi Statistics bloğudur — üretilen mutant sayısı, killed oranı ve threshold karşısındaki PASS/FAIL:
 
+```
 ================================================================================
 - Statistics
 ================================================================================
@@ -117,28 +161,51 @@ Output:
 >> Mutation score: 85% (threshold 80) PASS
 ```
 
-HTML report: `target/pit-reports/index.html`.
+Detaylı, satır satır renklendirilmiş HTML rapor `target/pit-reports/index.html` altında; survived mutant'ları burada tek tek görürsün.
 
-### 3. Mutator types
+PIT motorunun içeride yaptığı iş şu akışa oturur:
 
-**Default mutators (PIT standard):**
+```mermaid
+flowchart LR
+    A["Bytecode analiz"] --> B["Line coverage topla"]
+    B --> C["Mutant uret"]
+    C --> D["Ilgili testleri sec"]
+    D --> E["Her mutant icin test kos"]
+    E --> F["Mutation score rapor"]
+```
+
+Önce coverage toplaması, PIT'in her mutant için sadece o satırı çalıştıran test'leri koşmasını sağlar — bütün suite'i her mutant için baştan çalıştırmaz.
+
+### 4. Mutator types
+
+Mutant'ları üreten kurallara **mutator** denir; hangi mutator setini seçtiğin, test'inin ne kadar zorlanacağını doğrudan belirler. PIT'in standart (DEFAULTS) seti en yaygın bug sınıflarını hedefler:
 
 | Mutator | Anlam |
 |---|---|
 | `CONDITIONALS_BOUNDARY` | `<` ↔ `<=` |
 | `INCREMENTS` | `i++` ↔ `i--` |
 | `INVERT_NEGS` | `-i` ↔ `i` |
-| `MATH` | `+` ↔ `-`, `*` ↔ `/`, etc. |
+| `MATH` | `+` ↔ `-`, `*` ↔ `/`, vb. |
 | `NEGATE_CONDITIONALS` | `==` ↔ `!=`, `>` ↔ `<=` |
-| `RETURN_VALS` | `return true` ↔ `return false`, etc. |
-| `VOID_METHOD_CALLS` | Remove void method calls |
+| `RETURN_VALS` | `return true` ↔ `return false`, vb. |
+| `VOID_METHOD_CALLS` | void method çağrısını sil |
 | `EMPTY_RETURNS` | `return ""` ↔ `return null` |
 | `FALSE_RETURNS` | `return false` ↔ `return true` |
-| `TRUE_RETURNS` | Same flip |
+| `TRUE_RETURNS` | ters çevir |
 | `NULL_RETURNS` | `return null` |
-| `PRIMITIVE_RETURNS` | `return 0`, `return 1.0`, etc. |
+| `PRIMITIVE_RETURNS` | `return 0`, `return 1.0`, vb. |
 
-**STRONGER mutators (banking için recommended):**
+Birkaç mutator'ün nasıl davrandığını gözde canlandırmak faydalı:
+
+```mermaid
+flowchart LR
+    A["MATH"] --> A1["arti eksiye"]
+    B["NEGATE_CONDITIONALS"] --> B1["esittir esit degile"]
+    C["CONDITIONALS_BOUNDARY"] --> C1["kucuk kucuk esite"]
+    D["BIG_DECIMAL"] --> D1["HALF_EVEN HALF_UP"]
+```
+
+Banking için DEFAULTS yetmez; **STRONGER** seti daha agresif mutant'lar üretir:
 
 ```xml
 <mutators>
@@ -146,45 +213,38 @@ HTML report: `target/pit-reports/index.html`.
 </mutators>
 ```
 
-Includes additional:
-- `EXPERIMENTAL_REMOVE_INCREMENTS`
-- `REMOVE_CONDITIONALS`
-- `EXPERIMENTAL_BIG_DECIMAL`
-- `EXPERIMENTAL_BIG_INTEGER`
+STRONGER, DEFAULTS'a şunları ekler: `EXPERIMENTAL_REMOVE_INCREMENTS`, `REMOVE_CONDITIONALS`, `EXPERIMENTAL_BIG_DECIMAL`, `EXPERIMENTAL_BIG_INTEGER`.
 
-**Banking için BIG_DECIMAL mutator özellikle değerli:**
-- `BigDecimal.add()` → `BigDecimal.subtract()`
-- `setScale(2, HALF_EVEN)` → `setScale(2, HALF_UP)` (different rounding!)
+Bunlardan **BIG_DECIMAL** mutator banking için özellikle değerlidir çünkü para hesaplarının kalbini hedef alır: `BigDecimal.add()` → `subtract()`, veya `setScale(2, HALF_EVEN)` → `setScale(2, HALF_UP)` gibi rounding değişiklikleri. Zayıf test bu farkı görmez, güçlü test yakalar.
 
-### 4. Banking-critical class analysis
+```admonish tip title="Banking'de STRONGER + BIG_DECIMAL kullan"
+Para, faiz ve yuvarlama hesabı yapan modüllerde DEFAULTS ile yetinme. BIG_DECIMAL mutator HALF_EVEN → HALF_UP ve add → subtract gibi kuruş farkı yaratan bozmaları üretir; bunlar production'da regülatör bulgusu olabilecek hatalardır. STRONGER seti bu mutant'ları masaya koyar.
+```
 
-**High-priority for mutation:**
+### 5. Banking-critical class analizi
+
+Her sınıfa aynı mutation hedefini koymak gerçekçi değildir; iş kritikliğine göre önceliklendirirsin. Business logic taşıyan sınıflar yüksek çıtaya oturur:
+
 - `LedgerService` (Topic 10.1)
 - `InterestCalculator` (Topic 10.5)
 - `FraudDetectionRule` (Topic 10.6)
 - `AmortizationService`
 - `IbanValidator` (Topic 10.4)
-- `MaskingService` (PII)
-- `EncryptionService`
+- `MaskingService` (PII), `EncryptionService`
 
-These functions have business-critical logic. Mutation score **>= 90%** target.
+<mark>Bu kritik hesaplama sınıflarında mutation score hedefi >= 90 olmalı</mark> — bir mutant'ın hayatta kalması burada gerçek para hatası riski demektir.
 
-**Lower-priority:**
-- DTO mapping
-- Configuration
-- Logging
+Buna karşılık DTO mapping, configuration ve logging gibi düşük riskli kod için %60-70 mutation kabul edilebilir; bunları %95'e zorlamak zaman israfıdır. Doğru mühendislik, çıtayı riske göre ayarlamaktır.
 
-Mutation %60-70 OK.
+### 6. Target class selection
 
-### 5. Target class selection
+PIT'in neyi mutasyona uğratıp neyi dışarıda bırakacağını `targetClasses` ile bilinçli belirlersin — DTO ve config'i dışlamak hem hızı hem anlamlılığı artırır:
 
 ```xml
 <targetClasses>
-    <!-- Banking core -->
     <param>com.bank.transfer.domain.*</param>
     <param>com.bank.transfer.application.service.*</param>
-    
-    <!-- Exclude DTO, config -->
+
     <excludedClasses>
         <param>*Dto</param>
         <param>*Config</param>
@@ -193,9 +253,9 @@ Mutation %60-70 OK.
 </targetClasses>
 ```
 
-### 6. PIT incremental analysis
+### 7. Incremental analysis — performans
 
-Full mutation slow (10+ min banking projeleri).
+Full mutation run banking projelerinde 10-30 dakika sürer; her CI koşusunda bunu çalıştırmak boğar. PIT'in history dosyası, değişmeyen sınıfları atlayarak bunu çözer:
 
 ```xml
 <configuration>
@@ -205,9 +265,7 @@ Full mutation slow (10+ min banking projeleri).
 </configuration>
 ```
 
-Subsequent runs skip unchanged classes.
-
-**Pull request mode (PIT 1.15+):**
+Daha da agresifi, PR'da sadece **değişen kodu** mutasyona uğratmaktır (PIT 1.15+):
 
 ```xml
 <features>
@@ -215,18 +273,23 @@ Subsequent runs skip unchanged classes.
 </features>
 ```
 
-Only mutate **changed code** in PR → fast.
+CI'da history cache ile birlikte:
 
-CI:
 ```bash
 mvn pitest:mutationCoverage -DwithHistory -DhistoryInputFile=cache/pit-history.bin
 ```
 
-### 7. Banking mutation example
+```admonish tip title="Incremental + git diff ikilisi"
+Full mutation'ı nightly build'e, PR'lara ise `+GIT(from=origin/main)` ile diff-only + history cache koy. Böylece geliştirici her PR'da sadece kendi değişikliğinin mutation skorunu saniyeler içinde alır; tüm proje her seferinde yeniden mutasyona uğramaz.
+```
+
+### 8. Banking mutation örneği — kodu bozup test'i sınamak
+
+Teoriyi somuta bağlayalım: gerçek bir faiz hesaplayıcı ve onu PIT gözüyle nasıl bozacağımız. İşte hedef kod:
 
 ```java
 public class InterestCalculator {
-    
+
     public BigDecimal computeInterest(BigDecimal principal, BigDecimal rate, int days) {
         return principal
             .multiply(rate)
@@ -236,16 +299,15 @@ public class InterestCalculator {
 }
 ```
 
-**Mutations:**
-1. `multiply(rate)` → `divide(rate)` — Test catches?
-2. `multiply(days)` → `multiply(days+1)` — Edge case test?
-3. `BigDecimal.valueOf(365)` → `BigDecimal.valueOf(360)` — ACT/360 vs ACT/365 test?
-4. `RoundingMode.HALF_EVEN` → `RoundingMode.HALF_UP` — Rounding test?
-5. `setScale(2, ...)` → `setScale(4, ...)` — Precision test?
+PIT bu dört satıra farklı mutant'lar uygular; her biri farklı bir test zaafını ortaya çıkarır:
 
-Strong test suite kills all 5. Weak suite kills 2-3.
+1. `multiply(rate)` → `divide(rate)` — test yakalıyor mu?
+2. `multiply(days)` → `multiply(days+1)` — edge case var mı?
+3. `valueOf(365)` → `valueOf(360)` — ACT/360 vs ACT/365 test'i var mı?
+4. `RoundingMode.HALF_EVEN` → `HALF_UP` — rounding test'i var mı?
+5. `setScale(2, ...)` → `setScale(4, ...)` — precision test'i var mı?
 
-**Test impact:**
+Güçlü bir test suite beşini de öldürür; zayıf suite 2-3'ünü öldürür, gerisi survived kalır. Tek değere bakan bir test yetersizdir:
 
 ```java
 @Test
@@ -254,46 +316,48 @@ void shouldCalculateInterest() {
         new BigDecimal("100000"),
         new BigDecimal("0.05"),
         365);
-    
+
     assertThat(result).isEqualByComparingTo("5000.00");
 }
 ```
 
-Kills mutation 2 (days+1 yields 5013.70). Doesn't kill mutation 3 (multiply vs divide if test only checks one value).
-
-**Better:**
+Bu test mutant 2'yi (days+1 → 5013.70) öldürür ama tek bir noktayı kontrol ettiği için mutant 3'ü (multiply vs divide) öldüremeyebilir. Çözüm, çok senaryolu parametrize test + rounding'i özel hedefleyen bir test:
 
 ```java
 @ParameterizedTest
 @CsvSource({
-    "100000, 0.05, 365, 5000.00",     // Full year
-    "100000, 0.05, 90, 1232.88",      // 90 days
-    "100000, 0.05, 0, 0.00",          // Zero days
-    "100000, 0.10, 365, 10000.00",    // Different rate
-    "0,      0.05, 365, 0.00"          // Zero principal
+    "100000, 0.05, 365, 5000.00",     // tam yıl
+    "100000, 0.05, 90,  1232.88",     // 90 gün
+    "100000, 0.05, 0,   0.00",        // sıfır gün
+    "100000, 0.10, 365, 10000.00",    // farklı oran
+    "0,      0.05, 365, 0.00"         // sıfır anapara
 })
 void shouldCalculateInterestForVariousScenarios(...) {
     BigDecimal result = calc.computeInterest(...);
     assertThat(result).isEqualByComparingTo(expected);
 }
+```
 
+Rounding mutant'ını (HALF_EVEN → HALF_UP) öldürmek için değeri özellikle 5'te biten bir senaryo seçersin:
+
+```java
 @Test
 void shouldUseHalfEvenRounding() {
+    // 100000 * 0.05 * 100 / 365 = 1369.86301...
+    // HALF_EVEN → 1369.86 (5, çifte yuvarlar)
+    // HALF_UP   → 1369.87 (mutant)
     BigDecimal result = calc.computeInterest(
-        new BigDecimal("100000"),
-        new BigDecimal("0.05"),
-        100);
-    
-    // 100000 * 0.05 * 100 / 365 = 1369.86301... 
-    // HALF_EVEN rounds 1369.86 (5 → even)
-    // HALF_UP rounds 1369.87
+        new BigDecimal("100000"), new BigDecimal("0.05"), 100);
+
     assertThat(result).isEqualByComparingTo("1369.86");
 }
 ```
 
-Now kills mutators 3, 4, 5 too. Mutation score climbs.
+Artık mutant 3, 4 ve 5 de killed — mutation score tırmanır. Buradaki ders: mutant'ları öldürmek için test'i davranışa (day count convention, rounding mode) göre çeşitlendirirsin.
 
-### 8. PIT CI integration
+### 9. PIT CI integration
+
+Mutation raporu ancak build'i kırdığında değer üretir; aksi halde kimse bakmaz. CI adımı PIT'i history cache ile koşar ve raporu artifact olarak yükler:
 
 ```yaml
 - name: Mutation Testing
@@ -302,14 +366,18 @@ Now kills mutators 3, 4, 5 too. Mutation score climbs.
       -DwithHistory \
       -DhistoryInputFile=cache/pit-history.bin \
       -DhistoryOutputFile=cache/pit-history.bin
-  
+
 - name: Upload PIT report
   if: always()
   uses: actions/upload-artifact@v4
   with:
     name: pit-report
     path: target/pit-reports/
-  
+```
+
+Eşik zorlaması için ya PIT'in kendi `mutationThreshold`'una güvenirsin (config'de tanımlıysa build otomatik fail olur) ya da XML'den skoru okuyup açıkça kontrol edersin:
+
+```yaml
 - name: Check mutation threshold
   run: |
     SCORE=$(xmllint --xpath "string(//mutationCoverage/totals/percentageMutationCoverage)" \
@@ -321,9 +389,11 @@ Now kills mutators 3, 4, 5 too. Mutation score climbs.
     fi
 ```
 
-PIT fails build if `mutationThreshold` not met (config).
+<mark>Threshold gate olmadan mutation raporu sadece dekordur</mark> — skor görünür ama kimseyi bağlamaz. Banking'de eşik CI'da zorlanmalı.
 
-### 9. False positives — equivalent mutants
+### 10. False positives — equivalent mutants
+
+Bazı mutant'lar hiçbir test tarafından öldürülemez, çünkü orijinalle davranışsal olarak aynıdırlar; bunlara **equivalent mutant** denir. Klasik örnek:
 
 ```java
 public int absoluteValue(int n) {
@@ -331,107 +401,181 @@ public int absoluteValue(int n) {
     return n;
 }
 
-Mutant: if (n <= 0) return -n;
+// Mutant: if (n <= 0) return -n;
 ```
 
-For `n=0`: original returns `0`, mutant returns `-0 = 0`. Behavior **same** → no test can kill this mutant.
+`n=0` için orijinal `0`, mutant `-0 = 0` döner — davranış aynı, hiçbir test bu mutant'ı öldüremez. PIT bunu genelde survived gösterir; bu bir false positive'dir, test zaafı değil.
 
-PIT marks as **equivalent**. Banking için: review report, accept some equivalent mutants.
+```admonish warning title="Equivalent mutant'ları körü körüne kovalama"
+Her survived mutant test zaafı değildir. Equivalent mutant'ları %100 skora ulaşmak için öldürmeye çalışmak imkânsız ve zaman kaybıdır. Doğrusu: raporu incele, equivalent olanları tespit et, PIT config'inde suppress et ve gerekçesini dokümante et. %100 mutation score gerçekçi bir hedef değildir.
+```
 
-### 10. Banking — mutation testing anti-pattern'leri
+### 11. Banking anti-pattern'leri
 
-**Anti-pattern 1: Coverage'a güvenmek**
-- %85 coverage ≠ %85 quality. Mutation kanıt.
+Mutation testing'i yanlış kullanmanın on klasik yolu; mülakatta "bu yaklaşımda ne yanlış?" cephaneliği burasıdır:
 
-**Anti-pattern 2: Mutation all-or-nothing**
-- All classes %95+ unrealistic. Critical class %90+, others %60+.
+1. **Coverage'a güvenmek** — %85 coverage ≠ %85 quality. Mutation kanıttır.
+2. **All-or-nothing hedef** — tüm sınıflar %95+ gerçekçi değil. Kritik %90+, diğerleri %60+.
+3. **Her CI koşusunda full mutation** — 10-30 dk. Incremental + git diff kullan.
+4. **Equivalent mutant'ları görmezden gelmek** — false positive'leri incele, config'de suppress et.
+5. **Test'i sırf mutant öldürmek için refactor etmek** — mutation-driven test bir smell'dir; test davranıştan doğmalı.
+6. **Banking'de sadece default mutator** — BIG_DECIMAL kritik. STRONGER kullan.
+7. **Getter/setter için PIT** — trivial kod, düşük değer. Exclude et.
+8. **Threshold gate olmaması** — skor raporlanıp enforce edilmiyorsa boştur.
+9. **İyi test olmadan mutation** — mutation test kalitesini ölçer; test hazır değilse rapor anlamsız.
+10. **Mutation'ın diğer test'lerin yerine geçmesi** — mutation white-box'tır; integration / contract / e2e'nin yerini tutmaz.
 
-**Anti-pattern 3: PIT every CI run (slow)**
-- Full mutation 10-30 dk. Incremental + git diff.
-
-**Anti-pattern 4: Ignore equivalent mutants**
-- Review false positives. Suppress via PIT config.
-
-**Anti-pattern 5: Refactor test to kill mutants**
-- Test driven by mutation = mutation test smell. Test driven by behavior.
-
-**Anti-pattern 6: Default mutators only banking için**
-- BIG_DECIMAL mutator banking için kritik. STRONGER mutators.
-
-**Anti-pattern 7: PIT for getters/setters**
-- Trivial code, low value. Exclude.
-
-**Anti-pattern 8: No threshold gate**
-- Score reported ama enforce edilmiyor. Banking için CI gate.
-
-**Anti-pattern 9: Mutation testing without good test**
-- Mutation = test quality measure. Test isn't ready → mutation report meaningless.
-
-**Anti-pattern 10: Mutation testing replacing other testing**
-- Mutation = white-box. Doesn't replace integration / contract / e2e.
+```admonish warning title="Anti-pattern 5 en sinsisi"
+Bir mutant survived kaldı diye test'e o mutant'ı öldürecek yapay bir assertion eklemek (örneğin bir ara değeri kontrol etmek) test kalitesini gerçekten artırmaz — test'i implementasyona bağlar, kırılgan yapar. Önce sor: "Bu mutant gerçek bir davranış farkı mı yaratıyor?" Evetse test'i davranış üzerinden güçlendir; hayırsa (equivalent) suppress et.
+```
 
 ---
 
 ## Önemli olabilecek araştırma kaynakları
 
-- PIT documentation
-- "Mutation Testing for Java" — academic papers
-- pitest.org blog
+- PIT documentation — pitest.org
+- "Mutation Testing for Java" — akademik makaleler
+- pitest.org blog — mutator internals ve incremental analysis yazıları
 
 ---
 
-## Mini task'ler
+## Kendini Sına
 
-### Task 12.6.1 — PIT setup + first run (30 dk)
+Aşağıdaki soruları önce **cevaba bakmadan** kendi cümlelerinle yanıtlamayı dene — hepsi test kalitesi ve mutation testing üzerine mülakatlarda çıkabilecek tarzda. Takıldığın soruda ilgili Kavramlar başlığına dön, sonra tekrar dene.
 
-Maven plugin. Simple class + test. Mutation score baseline.
+**S1. Line coverage %85 olan bir modülün test'leri neden hâlâ zayıf olabilir? Mutation testing bu zaafı nasıl ortaya çıkarır?**
 
-### Task 12.6.2 — Banking InterestCalculator strong test (60 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-Yukarıdaki örnek. Mutators kill, score >= 90.
+Line coverage sadece "satır çalıştı mı" der; assertion olup olmadığını umursamaz. Assertion'ı zayıf veya hiç olmayan test'ler kodu çalıştırıp coverage'ı %85'e taşır ama davranışı doğrulamaz — execution var, verification yok.
 
-### Task 12.6.3 — STRONGER mutators (30 dk)
+Mutation testing production kodunu kasıtlı bozar (mutant üretir) ve test'in bunu fark edip etmediğine bakar. Zayıf test mutant'ı yakalayamaz (survived), güçlü test fail eder (killed). Böylece coverage'ın gizlediği kör noktalar sayısal olarak ortaya çıkar: %85 coverage + %50 mutation score = test'lerin yarısı davranışı doğrulamıyor demektir.
 
-BIG_DECIMAL + REMOVE_CONDITIONALS etc. Banking için.
+</details>
 
-### Task 12.6.4 — Incremental + git diff (30 dk)
+**S2. Killed mutant ile survived mutant arasındaki fark nedir? Survived bir mutant sana ne söyler?**
 
-History file + `+GIT(from=origin/main)`. PR-only mutation.
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 12.6.5 — Exclude DTO/Config (30 dk)
+Mutant, production kodundaki küçük kasıtlı bir değişikliktir. Test suite mutant'lı kodda fail ederse mutant **killed** — test o davranış değişikliğini yakaladı, iyi. Test yeşil kalırsa mutant **survived** — test o bozmayı görmedi.
 
-Target class config. Critical banking classes only.
+Survived bir mutant iki şeyden birini anlatır: ya test suite'inde bir kör nokta var (o davranışı doğrulayan assertion yok, test'i güçlendir), ya da mutant equivalent'tır (orijinalle aynı davranıyor, hiçbir test öldüremez, suppress et). İlk adım her survived mutant için "bu gerçek bir davranış farkı mı?" diye sormaktır.
 
-### Task 12.6.6 — IBAN validator mutation (45 dk)
+</details>
 
-MOD-97 algorithm. Mutate boundaries. Test kills all.
+**S3. Mutation score nasıl hesaplanır ve banking'de CI'da nasıl kullanılır?**
 
-### Task 12.6.7 — Fraud rule mutation (60 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-Smurfing detection threshold. Mutate count/amount. Test kills.
+Mutation score = killed mutant / total mutant. %100 tüm bozmaların yakalandığı, %0 hiçbirinin yakalanmadığı anlamına gelir; survival rate ise tersidir (hayatta kalan oran). Skor, test suite'in gerçekten ne kadar doğrulama yaptığının tek sayılık ölçüsüdür.
 
-### Task 12.6.8 — Rounding mode mutation (45 dk)
+Banking'de bu skor sadece raporlanmaz, `mutationThreshold` olarak CI'da zorlanır. Skor eşiğin (örneğin 80) altına düşerse PIT build'i kırar; ya PIT'in kendi threshold'una güvenirsin ya da XML raporundan skoru okuyup `exit 1` ile gate kurarsın. Gate olmadan skor sadece dekordur.
 
-BigDecimal HALF_EVEN. Mutate to HALF_UP. Test detect.
+</details>
 
-### Task 12.6.9 — CI integration + threshold (30 dk)
+**S4. PIT mutator tipleri nelerdir? DEFAULTS ile STRONGER farkı ve banking için BIG_DECIMAL neden kritik?**
 
-CI fail < 80%. Upload report artifact.
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 12.6.10 — Equivalent mutant analysis (30 dk)
+Mutator, mutant üreten kuraldır. DEFAULTS seti en yaygın bug sınıflarını hedefler: `MATH` (+↔-, *↔/), `NEGATE_CONDITIONALS` (==↔!=), `CONDITIONALS_BOUNDARY` (<↔<=), `RETURN_VALS`, `INCREMENTS` gibi. STRONGER bunlara daha agresif mutator'lar ekler: `REMOVE_CONDITIONALS`, `EXPERIMENTAL_BIG_DECIMAL`, `EXPERIMENTAL_BIG_INTEGER`.
 
-Identify 2 equivalent mutants. Suppress via PIT config.
+Banking için **BIG_DECIMAL** özellikle değerlidir çünkü para hesabının kalbini hedefler: `add()` → `subtract()`, `setScale(2, HALF_EVEN)` → `setScale(2, HALF_UP)` gibi kuruş farkı yaratan bozmalar. DEFAULTS bunları üretmez; zayıf test bu farkı görmez. Faiz, yuvarlama ve para modüllerinde STRONGER + BIG_DECIMAL kullanmak, production'da regülatör bulgusu olabilecek hataları test'e taşır.
+
+</details>
+
+**S5. Banking'de tüm sınıflar için aynı mutation hedefini koymak neden yanlış? Nasıl önceliklendirirsin?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Çünkü tüm sınıfları %95'e zorlamak gerçekçi değil ve zaman israfıdır (anti-pattern: all-or-nothing). Hedef iş kritikliğine göre ayarlanmalı.
+
+Business logic taşıyan sınıflar yüksek çıtaya oturur: `LedgerService`, `InterestCalculator`, `FraudDetectionRule`, `IbanValidator`, `EncryptionService` gibi — bunlarda mutation score hedefi >= 90, çünkü hayatta kalan bir mutant gerçek para/güvenlik hatası riski demektir. Buna karşılık DTO mapping, configuration ve logging için %60-70 kabul edilebilir; hatta trivial getter/setter'ları PIT hedefinden tümüyle dışlamak (excludedClasses) doğrudur.
+
+</details>
+
+**S6. Equivalent mutant nedir? Neden %100 mutation score gerçekçi bir hedef değildir?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Equivalent mutant, koda uygulandığında davranışı hiç değiştirmeyen mutant'tır — orijinalle aynı çıktıyı üretir, dolayısıyla hiçbir test onu öldüremez. Klasik örnek: `if (n < 0) return -n;` mutasyonu `if (n <= 0) return -n;` olduğunda `n=0` için ikisi de `0` döner.
+
+PIT bunu survived gösterir ama bu bir test zaafı değil, false positive'dir. %100 mutation score, tüm equivalent mutant'ları da öldürmeyi gerektirir ki bu imkânsızdır. Doğru yaklaşım: raporu incele, equivalent olanları tespit et, PIT config'inde suppress et ve gerekçesini dokümante et. Bunları kovalamak yerine gerçek davranış farkı yaratan survived mutant'lara odaklanılır.
+
+</details>
+
+**S7. Full mutation run 20 dakika sürüyor ve her CI koşusunu yavaşlatıyor. Nasıl hızlandırırsın?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+İki mekanizma birleştirilir. Birincisi **incremental analysis**: `withHistory` ile PIT bir history dosyası tutar ve sonraki koşularda değişmeyen sınıfları atlar. İkincisi **git diff (PR-only)**: `+GIT(from=origin/main)` feature'ı ile PIT sadece PR'da değişen kodu mutasyona uğratır.
+
+Pratik kurulum: full mutation'ı nightly build'e koy; PR'larda ise diff-only + history cache kullan. Böylece geliştirici her PR'da sadece kendi değişikliğinin skorunu saniyeler içinde alır, tüm proje her seferinde yeniden mutasyona uğramaz. Ayrıca DTO/config'i `excludedClasses` ile dışlamak ve getter/setter'ları hedeflememek de süreyi kısaltır.
+
+</details>
 
 ---
 
-## Test yazma rehberi
+## Tamamlama kriterleri
+
+- [ ] Line coverage ile mutation coverage farkını (execution vs verification) 2 dakikada anlatabilirim
+- [ ] Killed vs survived mutant ve mutation score hesabını açıklayabiliyorum
+- [ ] PIT Maven plugin'i JUnit 5 + HTML/XML output ile kurabilirim
+- [ ] DEFAULTS vs STRONGER farkını ve banking için BIG_DECIMAL'in önemini biliyorum
+- [ ] Banking-critical sınıf listesini ve %90+ vs %60+ hedef ayrımını sayabiliyorum
+- [ ] `mutationThreshold` CI gate'ini ve build fail mantığını açıklayabiliyorum
+- [ ] Incremental + git diff (PR-only) ile performans optimizasyonunu kurabilirim
+- [ ] Equivalent mutant'ın ne olduğunu ve neden suppress edildiğini biliyorum
+- [ ] HALF_EVEN vs HALF_UP ve ACT/360 vs ACT/365 mutant'larını öldüren test tasarlayabilirim
+- [ ] (Opsiyonel) "Pratik yapmak istersen" bölümündeki testleri yazdım ve Claude-verify prompt'uyla doğrulattım
+
+---
+
+## Defter notları
+
+1. "Coverage vs mutation score — execution vs verification, banking sebebi: ____."
+2. "Killed vs survived mutant + survival rate ne anlatır: ____."
+3. "Mutation score hesabı + CI threshold gate: ____."
+4. "DEFAULTS vs STRONGER + BIG_DECIMAL banking için neden kritik: ____."
+5. "Banking critical class hedefi (Ledger, Interest, Fraud, IBAN) %90+ vs DTO %60+: ____."
+6. "HALF_EVEN vs HALF_UP rounding mutant'ını öldüren test: ____."
+7. "ACT/360 vs ACT/365 day count mutant'ını öldüren test: ____."
+8. "Incremental + git diff (PR-only) PIT performansı: ____."
+9. "Equivalent mutant false positive — tespit + suppress + dokümante: ____."
+10. "Mutation = test quality metric, integration/e2e yerine geçmez: ____."
+
+```admonish success title="Bölüm Özeti"
+- Line coverage kodun çalıştığını, mutation testing test'in bozmayı yakaladığını ölçer — execution vs verification; %85 coverage %50 mutation olabilir
+- Mutation score = killed / total mutant; survived mutant ya test kör noktasıdır ya equivalent'tır — CI'da `mutationThreshold` ile gate kurulur, gate yoksa skor dekordur
+- PIT banking'in fiili standardı: Maven plugin + JUnit 5 + HTML/XML rapor; banking için STRONGER + BIG_DECIMAL mutator (HALF_EVEN→HALF_UP, add→subtract) kritik
+- Hedef riske göre ayarlanır: Interest/Ledger/Fraud/IBAN gibi kritik sınıflar %90+, DTO/config %60+ veya excluded
+- Performans için incremental (withHistory) + git diff (PR-only); full mutation nightly, PR'da diff-only
+- Equivalent mutant'ları kovalama (suppress + dokümante); test'i sırf mutant öldürmek için refactor etme; mutation white-box'tır, integration/contract/e2e yerine geçmez
+```
+
+---
+
+## Pratik yapmak istersen
+
+Kavramları koda dökmek istersen aşağıdaki iki ek hazır: test yazma rehberi `InterestCalculator` için mutation'ı yakalayan güçlü bir test sınıfı içerir; Claude-verify prompt'u ile kurduğun mutation testing setup'ını banking-grade perspektiften denetletebilirsin.
+
+<details>
+<summary>Test yazma rehberi — mutation-strong InterestCalculatorTest</summary>
+
+Aşağıdaki test sınıfı, Bölüm 8'deki beş mutant'ı (multiply/divide, days+1, ACT/360 vs 365, HALF_EVEN vs HALF_UP, precision) sistematik olarak öldürmek için tasarlandı. Önce parametrize senaryo matrisi:
 
 ```java
 @DisplayName("InterestCalculator mutation-strong tests")
 class InterestCalculatorTest {
-    
+
     InterestCalculator calc = new InterestCalculator();
-    
+
     @ParameterizedTest(name = "P={0} R={1} days={2} → I={3}")
     @CsvSource({
         "100000.00, 0.05, 365,  5000.00",
@@ -441,149 +585,179 @@ class InterestCalculatorTest {
         "0,         0.05, 365,  0.00",
         "100000.00, 0,    365,  0.00",
         "100000.00, 0.10, 365,  10000.00",
-        "100000.00, 0.05, 366,  5013.70",   // catches days+1 mutation
+        "100000.00, 0.05, 366,  5013.70",   // days+1 mutant'ını öldürür
         "100000.00, 0.05, 730,  10000.00"
     })
     void shouldCalculateInterest(BigDecimal p, BigDecimal r, int d, BigDecimal expected) {
         BigDecimal actual = calc.compute(p, r, d);
         assertThat(actual).isEqualByComparingTo(expected);
     }
-    
+```
+
+Sonra rounding, day count ve boundary'yi ayrı ayrı hedefleyen test'ler — her biri belirli bir mutant sınıfını öldürür:
+
+```java
     @Test
-    @DisplayName("Uses HALF_EVEN rounding (banker's rounding)")
+    @DisplayName("HALF_EVEN rounding kullanır — banker's rounding")
     void shouldRoundHalfEven() {
         // 100000 * 0.05 * 100 / 365 = 1369.86301...
-        // HALF_EVEN: 1369.86 (last even)
-        // HALF_UP: 1369.87 (mutation)
+        // HALF_EVEN → 1369.86, HALF_UP → 1369.87 (mutant)
         BigDecimal result = calc.compute(
             new BigDecimal("100000.00"), new BigDecimal("0.05"), 100);
-        
         assertThat(result).isEqualByComparingTo("1369.86");
     }
-    
+
     @Test
-    @DisplayName("Uses ACT/365 day count (not ACT/360)")
+    @DisplayName("ACT/365 day count kullanır — ACT/360 değil")
     void shouldUse365DaysInYear() {
-        // 100000 * 0.05 * 90 / 365 = 1232.88
-        // ACT/360: 1250.00 (mutation)
+        // 100000 * 0.05 * 90 / 365 = 1232.88, ACT/360 → 1250.00 (mutant)
         BigDecimal result = calc.compute(
             new BigDecimal("100000.00"), new BigDecimal("0.05"), 90);
-        
         assertThat(result).isEqualByComparingTo("1232.88");
     }
-    
+
     @Test
-    @DisplayName("Negative days handled — input validation")
+    @DisplayName("Negatif gün reddedilir — input validation")
     void shouldRejectNegativeDays() {
         assertThatThrownBy(() -> calc.compute(
             new BigDecimal("100000"), new BigDecimal("0.05"), -1))
             .isInstanceOf(IllegalArgumentException.class);
     }
-    
+}
+```
+
+Bu sınıf için beklenen PIT skoru: **%95+**. Anahtar fikir, her test'in belirli bir davranış boyutunu (day count, rounding, boundary, validation) hedeflemesi — böylece ilgili mutant kaçamaz.
+
+<details>
+<summary>Tam kod: InterestCalculatorTest (~62 satır)</summary>
+
+```java
+@DisplayName("InterestCalculator mutation-strong tests")
+class InterestCalculatorTest {
+
+    InterestCalculator calc = new InterestCalculator();
+
+    @ParameterizedTest(name = "P={0} R={1} days={2} → I={3}")
+    @CsvSource({
+        "100000.00, 0.05, 365,  5000.00",
+        "100000.00, 0.05, 90,   1232.88",
+        "100000.00, 0.05, 1,    13.70",
+        "100000.00, 0.05, 0,    0.00",
+        "0,         0.05, 365,  0.00",
+        "100000.00, 0,    365,  0.00",
+        "100000.00, 0.10, 365,  10000.00",
+        "100000.00, 0.05, 366,  5013.70",   // days+1 mutant
+        "100000.00, 0.05, 730,  10000.00"
+    })
+    void shouldCalculateInterest(BigDecimal p, BigDecimal r, int d, BigDecimal expected) {
+        BigDecimal actual = calc.compute(p, r, d);
+        assertThat(actual).isEqualByComparingTo(expected);
+    }
+
     @Test
-    @DisplayName("Boundary at 1 day")
+    @DisplayName("HALF_EVEN rounding kullanır — banker's rounding")
+    void shouldRoundHalfEven() {
+        // 100000 * 0.05 * 100 / 365 = 1369.86301...
+        // HALF_EVEN → 1369.86 (son basamak çift)
+        // HALF_UP   → 1369.87 (mutant)
+        BigDecimal result = calc.compute(
+            new BigDecimal("100000.00"), new BigDecimal("0.05"), 100);
+        assertThat(result).isEqualByComparingTo("1369.86");
+    }
+
+    @Test
+    @DisplayName("ACT/365 day count kullanır — ACT/360 değil")
+    void shouldUse365DaysInYear() {
+        // 100000 * 0.05 * 90 / 365 = 1232.88
+        // ACT/360 → 1250.00 (mutant)
+        BigDecimal result = calc.compute(
+            new BigDecimal("100000.00"), new BigDecimal("0.05"), 90);
+        assertThat(result).isEqualByComparingTo("1232.88");
+    }
+
+    @Test
+    @DisplayName("Negatif gün reddedilir — input validation")
+    void shouldRejectNegativeDays() {
+        assertThatThrownBy(() -> calc.compute(
+            new BigDecimal("100000"), new BigDecimal("0.05"), -1))
+            .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    @DisplayName("1 gün boundary")
     void shouldHandleOneDayBoundary() {
         BigDecimal result = calc.compute(
             new BigDecimal("100000"), new BigDecimal("0.05"), 1);
-        
         assertThat(result).isEqualByComparingTo("13.70");
     }
 }
 ```
 
-Expected PIT score for this test class: **95%+**.
+</details>
 
----
+</details>
 
-## Claude-verify prompt
+<details>
+<summary>Claude-verify prompt</summary>
 
 ```
-Mutation testing setup'ımı banking-grade kriterlere göre değerlendir:
+Mutation testing setup'ımı banking-grade kriterlere göre değerlendir.
+Her madde için PASS / FAIL / EKSIK işaretle, kanıt göster, kod yazma:
 
 1. PIT setup:
-   - Maven plugin?
-   - JUnit 5 plugin?
-   - HTML + XML output?
+   - Maven plugin ekli mi?
+   - JUnit 5 plugin ekli mi?
+   - HTML + XML output tanımlı mı?
 
 2. Mutators:
-   - DEFAULTS or STRONGER?
-   - BIG_DECIMAL banking için?
-   - REMOVE_CONDITIONALS?
+   - DEFAULTS mi STRONGER mı?
+   - BIG_DECIMAL banking modülleri için aktif mi?
+   - REMOVE_CONDITIONALS var mı?
 
 3. Target selection:
-   - Banking critical classes (Ledger, Interest, Fraud, IBAN)?
-   - Exclude DTO/Config/Application?
-   - High vs medium priority by domain?
+   - Banking critical sınıflar hedefte mi (Ledger, Interest, Fraud, IBAN)?
+   - DTO / Config / Application excluded mı?
+   - Domain'e göre high vs medium öncelik ayrımı var mı?
 
 4. Thresholds:
-   - mutationThreshold (80+ recommended)?
-   - coverageThreshold (85+)?
-   - CI gate fail below?
+   - mutationThreshold (80+ önerilir) tanımlı mı?
+   - coverageThreshold (85+) tanımlı mı?
+   - Eşik altında CI gate fail ediyor mu?
 
-5. Performance:
-   - withHistory incremental?
-   - Git diff (PR-only)?
-   - PIT cache in CI?
+5. Performans:
+   - withHistory incremental aktif mi?
+   - Git diff (PR-only) kullanılıyor mu?
+   - CI'da PIT cache var mı?
 
 6. Banking-strong tests:
-   - InterestCalculator parametrize multiple scenarios?
-   - Day count convention test kills 360 vs 365?
-   - Rounding mode test (HALF_EVEN vs HALF_UP)?
-   - IBAN check digit boundary?
-   - Fraud rule thresholds?
+   - InterestCalculator çok senaryolu parametrize mı?
+   - Day count testi ACT/360 vs 365 mutant'ını öldürüyor mu?
+   - Rounding testi HALF_EVEN vs HALF_UP mutant'ını öldürüyor mu?
+   - IBAN check digit boundary testi var mı?
+   - Fraud rule threshold testi var mı?
 
 7. CI integration:
-   - PIT run in CI?
-   - Report artifact upload?
-   - Threshold enforce?
-   - PR comment mutation score?
+   - PIT CI'da koşuyor mu?
+   - Rapor artifact olarak yükleniyor mu?
+   - Eşik enforce ediliyor mu?
+   - PR yorumu olarak mutation score paylaşılıyor mu?
 
 8. False positives:
-   - Equivalent mutant review?
-   - Suppress documented?
+   - Equivalent mutant'lar review edilmiş mi?
+   - Suppress kararları dokümante mi?
 
-9. Banking critical %:
-   - Ledger 95%+?
-   - Interest calc 95%+?
-   - Fraud rule 90%+?
-   - DTO 60%+ (or excluded)?
+9. Banking critical yüzdeler:
+   - Ledger %95+?
+   - Interest calc %95+?
+   - Fraud rule %90+?
+   - DTO %60+ veya excluded?
 
 10. Anti-pattern:
-    - Coverage trust (mutation skip) YOK?
-    - Full mutation every CI run YOK?
-    - Refactor test just to kill mutant YOK?
-    - Mutation for getters/setters YOK?
-    - No threshold gate YOK?
-
-Her madde için PASS / FAIL / EKSIK işaretle.
+    - Coverage'a güvenip mutation atlama YOK mu?
+    - Her CI koşusunda full mutation YOK mu?
+    - Sırf mutant öldürmek için test refactor YOK mu?
+    - Getter/setter için PIT YOK mu?
+    - Threshold gate eksikliği YOK mu?
 ```
 
----
-
-## Tamamlama kriterleri
-
-- [ ] PIT Maven plugin setup
-- [ ] STRONGER mutators including BIG_DECIMAL
-- [ ] Banking critical class target list
-- [ ] Mutation threshold gate
-- [ ] Incremental + git diff
-- [ ] Banking-strong test (InterestCalculator)
-- [ ] HALF_EVEN rounding test
-- [ ] Day count convention test
-- [ ] CI integration + threshold enforce
-- [ ] Equivalent mutant suppression
-
----
-
-## Defter notları (10 madde)
-
-1. "Coverage vs Mutation score — execution vs verification banking sebebi: ____."
-2. "PIT mutator types (DEFAULT vs STRONGER + BIG_DECIMAL banking): ____."
-3. "Banking critical class hedef (Ledger, Interest, Fraud, IBAN, Encryption): ____."
-4. "Mutation %90+ critical class + %60+ DTO trade-off: ____."
-5. "Incremental + git diff PR-only PIT performance: ____."
-6. "HALF_EVEN vs HALF_UP rounding mutation banking detect: ____."
-7. "ACT/360 vs ACT/365 day count mutation banking detect: ____."
-8. "CI gate mutation threshold + PR comment score: ____."
-9. "Equivalent mutants false positive review + suppress: ____."
-10. "Mutation = test quality metric + don't replace integration/e2e: ____."
+</details>

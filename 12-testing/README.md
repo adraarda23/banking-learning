@@ -1,4 +1,35 @@
+<div class="phase-cover-kicker">On İkinci Bölüm — Final</div>
+
 # Phase 12 — Testing Mastery (FINAL PHASE)
+
+<div class="phase-cover-meta">
+<div><strong>Süre</strong> 3-4 hafta</div>
+<div><strong>Topic</strong> 7 konu + mini proje</div>
+<div><strong>Çıktı</strong> Master test disiplini</div>
+<div><strong>Ön koşul</strong> Faz 1-11 tamamlandı</div>
+</div>
+
+```admonish info title="Bu fazda ne öğreneceksin?"
+Test disiplinini **master seviyeye** çıkaracaksın — test yazmak değil, doğru test pyramid'ini
+kurmak, testleri canlı dokümantasyon olarak kullanmak ve CI'da gate olarak çalıştırmak.
+JUnit 5 advanced, Mockito deep, TestContainers, ArchUnit, contract testing, mutation testing (PIT)
+ve performance test CI entegrasyonu. Bu **son faz** — bitince 12 fazlık track tamamlanıyor.
+```
+
+## Fazın haritası
+
+```mermaid
+flowchart TD
+    subgraph Temel["Hafta 1 — Test Araçları"]
+        direction LR
+        A["12.1 JUnit 5 Advanced"] --> B["12.2 Mockito Deep"] --> C["12.3 TestContainers"]
+    end
+    subgraph Ileri["Hafta 2-3 — Kalite ve Mimari"]
+        direction LR
+        D["12.4 ArchUnit"] --> E["12.5 Contract Testing"] --> F["12.6 Mutation Testing"] --> G["12.7 Performance CI"]
+    end
+    Temel --> Ileri --> MP(["Mini Proje: Full Test Suite + Faz Testi"])
+```
 
 ## Hedef
 
@@ -35,18 +66,15 @@ Toplam: ~3-4 hafta (günde 2-3 saat çalışma). Her topic ortalama 1.5-2 gün.
 
 ## Test Pyramid — neden bu kadar önemli?
 
+```mermaid
+flowchart TD
+    E2E["E2E — 10-20 tane<br/>yavaş, kırılgan, tüm stack"]
+    INT["Integration — 50-200 tane<br/>gerçek bağımlılıklar, TestContainers"]
+    UNIT["Unit — 1000+ tane<br/>hızlı, izole, deterministik"]
+    E2E --> INT --> UNIT
 ```
-                    /\
-                   /  \
-                  / E2E\          ← çok az (10-20 tane), yavaş, kırılgan
-                 /------\
-                /        \
-               /Integration\       ← orta (50-200 tane), gerçek bağımlılıklarla
-              /------------\
-             /              \
-            /     Unit       \    ← çok (1000+ tane), hızlı, izole
-           /------------------\
-```
+
+Piramit yukarı çıktıkça test sayısı azalır, hız düşer, kırılganlık artar. Sağlıklı bir suite tabanı (unit) geniş, tepesi (E2E) dar tutar.
 
 **Banking realitesi:**
 
@@ -192,4 +220,8 @@ Faz boyunca defterine şu soruların cevaplarını yaz:
 
 ---
 
-İyi şanslar. Bu son faz — disiplini en yüksek tutman gereken faz. Banking'de test kalitesi, kod kalitesinin **birinci ölçütü**dür.
+```admonish success title="Başla — ve kitabı tamamla"
+İlk durak: [Topic 12.1 — JUnit 5 Advanced](01-junit5-advanced/index.md).
+Bu son faz — disiplini en yüksek tutman gereken faz. Banking'de test kalitesi, kod kalitesinin
+**birinci ölçütü**dür. Bu fazı bitirdiğinde 12 fazlık banking learning track'i tamamlanmış olacak.
+```

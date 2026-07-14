@@ -1,12 +1,20 @@
 # Topic 12.4 — ArchUnit: Architecture Tests
 
+```admonish info title="Bu bölümde"
+- Mimari kuralları **JUnit testi** olarak enforce etmek: code review'in gözden kaçırdığını CI otomatik yakalar
+- Hexagonal dependency direction — domain katmanı neden ne infrastructure'a ne de Spring'e bağlanabilir
+- Naming conventions + banking-specific kurallar: money `BigDecimal`, PII `@Convert`, ledger erişim kısıtı, PAN sınırı
+- Cyclic dependency, module boundary ve custom predicate + condition ile kendi mimari kuralını yazmak
+- ArchUnit anti-pattern'leri: `DoNotIncludeTests` eksikliği, hardcoded class isimleri, tek mega test class
+```
+
 ## Hedef
 
-ArchUnit ile architecture rules **JUnit test olarak** enforce etmek. Hexagonal architecture layers, naming conventions, dependency direction, package structure, banking-specific rules (no direct DB UPDATE for balance, no PAN in DTO, KVKK PII boundary). Banking için "compile-time'da yakalanmayan code review issue"larını automated yakalama.
+ArchUnit ile architecture rules'ı **JUnit test olarak** enforce etmek. Hexagonal layers, naming conventions, dependency direction, package structure ve banking-specific kurallar (balance için direct DB UPDATE yok, DTO'da PAN yok, KVKK PII sınırı). Amaç: compile-time'da yakalanmayan, code review'a kalan mimari ihlallerini otomatik yakalamak.
 
 ## Süre
 
-Okuma: 1.5 saat • Mini task: 2.5 saat • Test: 1 saat • Toplam: ~5 saat
+Okuma: 1.5 saat • Kendini Sına: 30 dk • Pratik (opsiyonel): 3-4 saat • Toplam: ~2 saat (+ pratik)
 
 ## Önbilgi
 
@@ -18,19 +26,30 @@ Okuma: 1.5 saat • Mini task: 2.5 saat • Test: 1 saat • Toplam: ~5 saat
 
 ## Kavramlar
 
-### 1. ArchUnit — niye?
+### 1. ArchUnit — mimari kuralı kim korur?
 
-Code review = bireysel + zaman alıcı + insan hatasına açık.
+Her mimaride yazılı olmayan kurallar vardır: "domain infrastructure'a bağlanmaz", "controller repository'ye doğrudan gitmez". Bu kuralları bugün ekipteki herkes bilir; altı ay sonra yeni gelen bilmez, code review'da gözden kaçar, mimari sessizce çürür.
 
-**Architecture rules:**
-- "Domain layer'dan infrastructure'a bağımlılık olmaz"
-- "Controller'lar Repository'lere doğrudan ulaşmaz, Service üzerinden"
-- "Adapter sınıfları `Adapter` ile bitsin"
-- "Domain'de Spring annotation kullanılmasın"
+**ArchUnit**, bu kuralları **JUnit testi** olarak yazmanı sağlayan bir kütüphanedir. Kuralı bir kez `ArchRule` olarak tanımlarsın; bir sonraki ihlalde build kırmızı olur. Böylece kural insan hafızasına değil, bytecode analizine dayanır.
 
-Bunlar **kuralları** unutulur, eski code'da gevşer. **ArchUnit = JUnit-style enforcement.**
+Code review manuel enforcement'ın zayıf halkasıdır: bireysel, zaman alıcı ve insan hatasına açık. ArchUnit ise deterministik, tekrarlanabilir ve CI'da otomatiktir.
+
+```mermaid
+flowchart LR
+    A["Bytecode import"] --> B["ArchRule tanımi"]
+    B --> C["Kural denetimi"]
+    C --> D{"Ihlal var mi"}
+    D -->|"evet"| E["Test FAIL"]
+    D -->|"hayir"| F["Test PASS"]
+```
+
+```admonish tip title="ArchUnit ne değildir"
+ArchUnit **statik yapısal** analiz yapar: paket, bağımlılık, isim, annotation. "Method X şunu yapmalı" gibi davranışsal kuralları buraya sokma — o iş unit/integration testinin. ArchUnit mimarinin şeklini korur, davranışını değil.
+```
 
 ### 2. Setup
+
+ArchUnit'in JUnit 5 entegrasyonu tek dependency ile gelir:
 
 ```xml
 <dependency>
@@ -41,17 +60,77 @@ Bunlar **kuralları** unutulur, eski code'da gevşer. **ArchUnit = JUnit-style e
 </dependency>
 ```
 
+Kuralları taşıyan class'ı `@AnalyzeClasses` ile işaretlersin; `DoNotIncludeTests` test class'larını analiz dışında bırakır:
+
 ```java
 @AnalyzeClasses(packages = "com.bank", importOptions = ImportOption.DoNotIncludeTests.class)
 public class BankingArchitectureTest { ... }
 ```
 
-### 3. Hexagonal architecture rules
+### 3. Hexagonal architecture rules — dependency direction
+
+Hexagonal mimarinin kalbi **bağımlılık yönüdür**: dış katmanlar içe bağlanabilir, iç katman dışa asla. <mark>Domain katmanı ne infrastructure'a ne de framework'e bağlanabilir</mark> — saf iş kuralı olarak kalmalı.
+
+```mermaid
+flowchart LR
+    A["Adapter"] --> B["Application"]
+    B --> C["Domain"]
+    C -.->|"yasak"| B
+    C -.->|"yasak"| A
+```
+
+Kural 1 — domain, infrastructure ve adapter paketlerine bağlanamaz:
+
+```java
+@ArchTest
+static final ArchRule domainShouldNotDependOnInfrastructure =
+    noClasses().that().resideInAPackage("..domain..")
+        .should().dependOnClassesThat().resideInAnyPackage(
+            "..infrastructure..", "..adapter..", "..persistence..", "..rest..", "..kafka..");
+```
+
+Kural 2 — domain framework'e (Spring, JPA, Servlet) bağlanamaz. Bu, domain'i test edilebilir ve teknolojiden bağımsız tutar:
+
+```java
+@ArchTest
+static final ArchRule domainShouldNotDependOnSpring =
+    noClasses().that().resideInAPackage("..domain..")
+        .should().dependOnClassesThat().resideInAnyPackage(
+            "org.springframework..", "jakarta.persistence..", "jakarta.servlet..", "org.hibernate..");
+```
+
+Kural 3 — application katmanı adapter'ları görmez; port'lar üzerinden konuşur:
+
+```java
+@ArchTest
+static final ArchRule applicationShouldNotDependOnAdapters =
+    noClasses().that().resideInAPackage("..application..")
+        .should().dependOnClassesThat().resideInAnyPackage(
+            "..adapter.in..", "..adapter.out..", "..rest..", "..persistence..");
+```
+
+Tek tek `noClasses()` kuralları yerine tüm katman ilişkisini `layeredArchitecture()` DSL'iyle bir yerde tanımlayabilirsin — hangi katmana kimin erişebileceğini deklaratif olarak yazar:
+
+```java
+@ArchTest
+static final ArchRule layeredArchitecture = layeredArchitecture()
+    .consideringAllDependencies()
+    .layer("Domain").definedBy("..domain..")
+    .layer("Application").definedBy("..application..")
+    .layer("Adapter").definedBy("..adapter..")
+    .layer("Infrastructure").definedBy("..infrastructure..")
+    .whereLayer("Adapter").mayOnlyBeAccessedByLayers("Infrastructure")
+    .whereLayer("Application").mayOnlyBeAccessedByLayers("Adapter", "Infrastructure")
+    .whereLayer("Domain").mayOnlyBeAccessedByLayers("Application", "Adapter", "Infrastructure");
+```
+
+<details>
+<summary>Tam kod: TransferHexagonalArchTest (~46 satır)</summary>
 
 ```java
 @AnalyzeClasses(packages = "com.bank.transfer", importOptions = DoNotIncludeTests.class)
 class TransferHexagonalArchTest {
-    
+
     @ArchTest
     static final ArchRule domainShouldNotDependOnInfrastructure =
         noClasses().that().resideInAPackage("..domain..")
@@ -62,7 +141,7 @@ class TransferHexagonalArchTest {
                 "..rest..",
                 "..kafka.."
             );
-    
+
     @ArchTest
     static final ArchRule domainShouldNotDependOnSpring =
         noClasses().that().resideInAPackage("..domain..")
@@ -72,7 +151,7 @@ class TransferHexagonalArchTest {
                 "jakarta.servlet..",
                 "org.hibernate.."
             );
-    
+
     @ArchTest
     static final ArchRule applicationShouldNotDependOnAdapters =
         noClasses().that().resideInAPackage("..application..")
@@ -82,7 +161,7 @@ class TransferHexagonalArchTest {
                 "..rest..",
                 "..persistence.."
             );
-    
+
     @ArchTest
     static final ArchRule layeredArchitecture = layeredArchitecture()
         .consideringAllDependencies()
@@ -96,7 +175,11 @@ class TransferHexagonalArchTest {
 }
 ```
 
+</details>
+
 ### 4. Naming conventions
+
+İsim kuralları hem okunabilirliği hem de diğer ArchUnit kurallarının paket/annotation eşleşmesini sağlamlaştırır. Controller/Repository/Service suffix'leri deterministik olsun:
 
 ```java
 @ArchTest
@@ -115,7 +198,11 @@ static final ArchRule repositoriesShouldBeNamedXxxRepository =
 static final ArchRule servicesShouldBeNamedXxxService =
     classes().that().resideInAPackage("..application.service..")
         .should().haveSimpleNameEndingWith("Service");
+```
 
+Hexagonal'a özgü iki isim kuralı: port interface'leri `Port`/`UseCase`, domain event'leri `Event` ile bitmeli:
+
+```java
 @ArchTest
 static final ArchRule portInterfacesShouldEndWithPort =
     classes().that().resideInAPackage("..application.port..")
@@ -131,6 +218,73 @@ static final ArchRule eventsShouldEndWithEvent =
 ```
 
 ### 5. Banking-specific rules
+
+Generic hexagonal kurallar iyidir; ama asıl değeri **banking-domain kuralları** yaratır — çünkü bunlar para ve regülasyon hatalarını compile öncesi yakalar.
+
+En kritiği para tipi: <mark>banking'de para alanları her zaman `BigDecimal` olmalı, `double` veya `float` asla</mark>. Float aritmetiği kuruş kaybettirir.
+
+```java
+@ArchTest
+static final ArchRule moneyMustBeBigDecimal =
+    fields().that().haveNameMatching(".*[aA]mount.*|.*[bB]alance.*|.*[fF]ee.*")
+        .and().areDeclaredInClassesThat().resideInAPackage("..domain..")
+        .should().haveRawType(BigDecimal.class)
+        .as("Money fields MUST be BigDecimal (Phase 1)");
+
+@ArchTest
+static final ArchRule noDoubleForMoney =
+    noFields().that().haveNameMatching(".*[aA]mount.*|.*[bB]alance.*|.*[fF]ee.*")
+        .should().haveRawType(double.class)
+        .orShould().haveRawType(Double.class)
+        .orShould().haveRawType(float.class);
+```
+
+Ledger bütünlüğü ve PII sınırları: balance değişimi yalnız `LedgerService` üzerinden geçmeli, journal repository'ye erişim kısıtlı olmalı, PAN yalnız card modülünde bulunmalı:
+
+```java
+@ArchTest
+static final ArchRule noDirectBalanceUpdate =
+    noClasses().should().callMethod(JdbcTemplate.class, "update")
+        .orShould().callMethod(EntityManager.class, "createNativeQuery")
+        .as("All balance changes must go through LedgerService (Topic 10.1)");
+
+@ArchTest
+static final ArchRule onlyLedgerServiceCanInsertJournalEntry =
+    classes().that().haveSimpleName("JournalEntryRepository")
+        .should().onlyBeAccessed().byClassesThat()
+            .haveSimpleName("LedgerService")
+            .or().haveSimpleName("LedgerEntryListener");
+
+@ArchTest
+static final ArchRule noPanInDtoExceptCardService =
+    noClasses().that().resideInAPackage("..adapter.in.rest.dto..")
+        .and().resideOutsideOfPackage("..card.adapter.in.rest.dto..")
+        .should().haveSimpleNameContaining("Pan")
+        .orShould().haveSimpleNameContaining("CardNumber");
+```
+
+REST katmanı ve audit için yapısal kurallar da eklenir — controller'lar `ResponseEntity`/`ProblemDetail` döndürmeli, audit `@Immutable` olmalı, transfer endpoint'i idempotency taşımalı:
+
+```java
+@ArchTest
+static final ArchRule restControllersMustReturnResponseEntity =
+    methods().that().areAnnotatedWith(GetMapping.class)
+        .or().areAnnotatedWith(PostMapping.class)
+        .or().areAnnotatedWith(PutMapping.class)
+        .or().areAnnotatedWith(DeleteMapping.class)
+        .and().areDeclaredInClassesThat().areAnnotatedWith(RestController.class)
+        .should().haveRawReturnType(ResponseEntity.class)
+        .orShould().haveRawReturnType(ProblemDetail.class);
+
+@ArchTest
+static final ArchRule auditLogShouldBeImmutable =
+    classes().that().haveSimpleName("AuditEvent")
+        .should().beAnnotatedWith(Immutable.class)
+        .as("Audit log immutable (Topic 8.7)");
+```
+
+<details>
+<summary>Tam kod: banking-specific rules (~65 satır)</summary>
 
 ```java
 @ArchTest
@@ -199,7 +353,11 @@ static final ArchRule transferShouldUseIdempotency =
         });
 ```
 
+</details>
+
 ### 6. KVKK + PCI-DSS rules
+
+Regülasyon kuralları da yapısaldır: PII alanları (`tcKimlik`, `email`, `phone`) entity'lerde `@Convert` ile şifrelenmeli, log'lara sensitive veri yazan çağrılar yasak olmalı, PAN tokenize edilmeli. Bu kurallar KVKK/PCI-DSS uyumunu code review'a bırakmaz.
 
 ```java
 @ArchTest
@@ -227,6 +385,8 @@ static final ArchRule cardServiceMustUseTokenization =
 
 ### 7. Package structure rules
 
+Paket yapısı kuralları modülerliği korur. Cyclic dependency, kod tabanının en sinsi çürümesidir — `slices()` ile döngüsüzlüğü, ayrıca modüller-arası servis çağrısı yasağını enforce et:
+
 ```java
 @ArchTest
 static final ArchRule noCyclicDependencies =
@@ -242,7 +402,11 @@ static final ArchRule serviceLayersShouldNotCallEachOther =
             "com.bank.loan.application.."
         )
         .as("Service-to-service via REST/event only");
+```
 
+Modül sınırlarını `layeredArchitecture()` ile de tanımlayıp her modülün diğerine erişimini kapatabilirsin (modüller yalnız REST/event ile konuşur):
+
+```java
 @ArchTest
 static final ArchRule moduleBoundaryRespect =
     layeredArchitecture()
@@ -258,6 +422,8 @@ static final ArchRule moduleBoundaryRespect =
 
 ### 8. Spring Boot specific
 
+Spring anti-pattern'lerini de yapısal olarak yakalayabilirsin. Controller repository'ye doğrudan gitmemeli, `@Transactional` service katmanında olmalı:
+
 ```java
 @ArchTest
 static final ArchRule controllersShouldNotUseRepositoriesDirect =
@@ -270,7 +436,11 @@ static final ArchRule transactionalOnServicesNotRepositories =
     classes().that().areAnnotatedWith(Transactional.class)
         .should().beAnnotatedWith(Service.class)
         .orShould().resideInAPackage("..application.service..");
+```
 
+Field injection ve yetkisiz endpoint iki klasik güvenlik/kalite tuzağıdır — constructor injection zorunlu, sensitive endpoint'ler `@PreAuthorize` taşımalı:
+
+```java
 @ArchTest
 static final ArchRule noFieldInjection =
     noFields().should().beAnnotatedWith(Autowired.class)
@@ -286,11 +456,22 @@ static final ArchRule preAuthorizeOnSensitiveEndpoints =
         .as("All sensitive endpoints have explicit authorization");
 ```
 
+Controller'ın repository'yi bypass etme ihlali tam olarak şuna benzer — ArchUnit kesikli oku yakalar:
+
+```mermaid
+flowchart LR
+    C["Controller"] --> S["Service"]
+    S --> R["Repository"]
+    C -.->|"ArchUnit ihlal"| R
+```
+
 ### 9. Custom predicate + condition
+
+Hazır DSL yetmediğinde kendi `DescribedPredicate` ve `ArchCondition`'ını yazarsın. Aşağıda "public banking endpoint'leri `@Audited` olmalı" kuralı — predicate hedefi seçer, condition doğrular:
 
 ```java
 @ArchTest
-static final ArchRule customPredicate = 
+static final ArchRule customPredicate =
     methods().that(new DescribedPredicate<JavaMethod>("are public banking endpoints") {
         @Override
         public boolean test(JavaMethod method) {
@@ -313,45 +494,36 @@ static final ArchRule customPredicate =
 
 ### 10. Banking — ArchUnit anti-pattern'leri
 
-**Anti-pattern 1: Tests in src/main rule check**
-```java
-@AnalyzeClasses(packages = "com.bank")   // includes tests
-```
-`DoNotIncludeTests.class` import option.
+ArchUnit'i yanlış kullanmak, kural yokmuş kadar tehlikelidir. On klasik hata:
 
-**Anti-pattern 2: Hardcoded class names**
-```java
-.haveSimpleName("AccountService")   // breaks on rename
-```
-Use predicates / annotations.
+**Anti-pattern 1 — Test class'larını analize dahil etmek.** `@AnalyzeClasses(packages = "com.bank")` test'leri de kapsar; `DoNotIncludeTests.class` import option'ı şart. <mark>`DoNotIncludeTests` olmadan test class'ları da kurala girer</mark> ve yanlış ihlaller üretir.
 
-**Anti-pattern 3: Rule disabled with @Ignore**
-Violation found → temporarily ignore. Comment with TODO + ticket reference.
+**Anti-pattern 2 — Hardcoded class isimleri.** `.haveSimpleName("AccountService")` rename'de kırılır; predicate veya annotation ile eşle.
 
-**Anti-pattern 4: All-or-nothing rules**
-Migrating legacy code → rule too strict, all tests fail. Phased rollout:
+**Anti-pattern 3 — Kuralı `@Ignore` ile susturmak.** İhlal bulununca geçici ignore edilir ve unutulur; ignore'a TODO + ticket referansı yaz.
+
+**Anti-pattern 4 — All-or-nothing kurallar.** Legacy kod migrate ederken çok katı kural tüm testleri kırar. Phased rollout kullan:
+
 ```java
 .allowEmptyShould(true)
 .ignoreDependencyByExclusion("com.bank.legacy..")
 ```
 
-**Anti-pattern 5: No banking-domain rules**
-Generic hexagonal rules OK. Banking-specific (no double for money, audit immutable, PII converter) **more valuable**.
+**Anti-pattern 5 — Banking-domain kuralı olmaması.** Generic hexagonal kurallar iyidir; ama no-double-for-money, audit immutable, PII converter gibi banking kuralları çok daha değerlidir.
 
-**Anti-pattern 6: Architecture test out of CI**
-ArchUnit test must be in CI. Otherwise drift.
+**Anti-pattern 6 — Testi CI dışında bırakmak.** ArchUnit testi CI'da çalışmıyorsa mimari kaçınılmaz olarak drift eder.
 
-**Anti-pattern 7: Test failure not actionable**
-Rule failure → "rule X violated" generic message. `.as("...")` clear explanation + fix direction.
+**Anti-pattern 7 — Actionable olmayan hata mesajı.** İhlal generic "rule X violated" der. `.as("...")` ile net açıklama + düzeltme yönü ver.
 
-**Anti-pattern 8: Reflection rule check**
-Slow. ArchUnit static bytecode analysis.
+**Anti-pattern 8 — Reflection ile kural yazmak.** Yavaştır; ArchUnit zaten statik bytecode analizi yapar, onu kullan.
 
-**Anti-pattern 9: Rule writes business logic**
-Rule = static structural. "Method X must call Y" — questionable. Architecture not behavior.
+**Anti-pattern 9 — Kuralın business logic yazması.** "Method X, Y'yi çağırmalı" tartışmalıdır — mimari yapısaldır, davranış değil.
 
-**Anti-pattern 10: One mega test class**
-Categorize: Hexagonal, Naming, Banking-Domain, Security, KVKK separate test classes.
+**Anti-pattern 10 — Tek mega test class.** Kuralları kategorize et: Hexagonal, Naming, Banking-Domain, Security, KVKK ayrı test class'ları.
+
+```admonish warning title="En sık iki hata"
+`DoNotIncludeTests` eksikliği ve `.as()` olmayan hata mesajı, sahada en çok görülen ikilidir. Birincisi false-positive üretir ve ekibin ArchUnit'e güvenini kırar; ikincisi ihlali bulur ama nasıl düzeltileceğini söylemez. İkisini de baştan doğru yap.
+```
 
 ---
 
@@ -364,51 +536,135 @@ Categorize: Hexagonal, Naming, Banking-Domain, Security, KVKK separate test clas
 
 ---
 
-## Mini task'ler
+## Kendini Sına
 
-### Task 12.4.1 — Setup + first rule (30 dk)
+Aşağıdaki soruları önce **cevaba bakmadan** kendi cümlelerinle yanıtlamayı dene — hepsi mimari enforcement üzerine mülakatlarda karşına çıkabilecek tarzda. Takıldığın soru olursa ilgili Kavramlar başlığına dön, sonra tekrar dene.
 
-ArchUnit dependency. Package structure rule first.
+**S1. ArchUnit tam olarak neyi enforce eder ve code review'dan farkı nedir?**
 
-### Task 12.4.2 — Hexagonal layer rules (60 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-Domain isolation, application not depend adapters.
+ArchUnit mimarinin **statik yapısal** kurallarını enforce eder: paket bağımlılıkları, dependency yönü, isim konvansiyonları, annotation kullanımı ve erişim kısıtları. Kuralı bir kez `ArchRule` olarak yazarsın, JUnit testi gibi çalışır, ihlalde build kırılır.
 
-### Task 12.4.3 — Naming conventions (45 dk)
+Code review manuel ve zayıftır: bireysel, zaman alıcı, insan hatasına açık ve gözden kaçabilir. ArchUnit deterministik, tekrarlanabilir ve CI'da otomatiktir; kural bir kez yazıldığında sonsuza dek korur. ArchUnit davranışı değil, mimarinin şeklini test eder.
 
-Controller/Repository/Service/Port suffix.
+</details>
 
-### Task 12.4.4 — Money BigDecimal rule (45 dk)
+**S2. Domain katmanı neden ne infrastructure'a ne de Spring'e bağlanabilir? Bunu hangi kurallarla enforce edersin?**
 
-Fields amount/balance/fee → BigDecimal only.
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 12.4.5 — PII converter rule (45 dk)
+Hexagonal'ın kalbi bağımlılık yönüdür: dış katmanlar içe bağlanır, iç katman dışa asla. Domain saf iş kuralıdır; infrastructure'a (persistence, rest, kafka) veya framework'e (Spring, JPA, Hibernate) bağlanırsa teknolojiyle çakılır, test edilemez ve değiştirilemez hale gelir.
 
-tcKimlik/email/phone → @Convert annotated.
+İki kuralla enforce edilir: `domainShouldNotDependOnInfrastructure` (`..infrastructure..`, `..adapter..`, `..persistence..` gibi paketleri yasaklar) ve `domainShouldNotDependOnSpring` (`org.springframework..`, `jakarta.persistence..`, `org.hibernate..` yasaklar). İkisini birden `layeredArchitecture()` DSL'iyle `whereLayer("Domain").mayOnlyBeAccessedByLayers(...)` şeklinde de yazabilirsin.
 
-### Task 12.4.6 — No direct balance update (60 dk)
+</details>
 
-Only LedgerService accesses JournalEntryRepository.
+**S3. `layeredArchitecture()` DSL'i ile tek tek `noClasses()` kuralları arasındaki fark nedir? Bir banking projesinde hangi mimari kurallar mutlaka olmalı?**
 
-### Task 12.4.7 — No PAN in DTO except card (45 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-PII boundary rule.
+`noClasses()` tek bir bağımlılık yasağını noktasal olarak ifade eder; okuması kolaydır ama çok sayıda katman ilişkisini ayrı ayrı yazmak gerekir. `layeredArchitecture()` ise tüm katmanları ve kimin kime erişebileceğini tek deklaratif blokta tanımlar — bütünsel ve bakımı kolaydır.
 
-### Task 12.4.8 — Cyclic dependencies (30 dk)
+Mutlaka olması gerekenler: domain isolation (infrastructure + framework yok), application → adapter yasağı, layered access kuralı, cyclic dependency check (`slices().beFreeOfCycles()`), module boundary respect, ve banking-domain kuralları (money BigDecimal, PII @Convert, ledger erişim kısıtı).
 
-Slices().beFreeOfCycles().
+</details>
 
-### Task 12.4.9 — Custom predicate + condition (60 dk)
+**S4. Banking'de para alanları için hangi ArchUnit kuralları şart? Neden `double` bu kadar tehlikeli?**
 
-Sensitive endpoint @Audited check.
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 12.4.10 — CI integration + actionable failures (30 dk)
+İki kural şart: `moneyMustBeBigDecimal` (domain'deki `amount`/`balance`/`fee` alanları `BigDecimal` olmalı) ve `noDoubleForMoney` (aynı isim kalıbında `double`/`Double`/`float` yasak). İsim eşleşmesi regex ile yapılır, tip kontrolü `haveRawType` ile.
 
-ArchUnit tests in CI. Failure message clear.
+`double` binary floating-point'tir; `0.1 + 0.2` gibi ondalıklar tam temsil edilemez ve her işlemde kuruş kayması birikir. Bankada bu, mutabakat farkları ve regülatör cezası demektir. `BigDecimal` ondalığı tam tutar. Bu kural code review'a bırakılamayacak kadar kritiktir, o yüzden ArchUnit'e yazılır.
+
+</details>
+
+**S5. Ledger/journal entry erişimini ve PAN'i ArchUnit ile nasıl sınırlarsın? KVKK/PCI-DSS için hangi kurallar var?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Ledger için: `onlyLedgerServiceCanInsertJournalEntry` kuralı `JournalEntryRepository`'ye yalnız `LedgerService` ve `LedgerEntryListener`'ın erişmesine izin verir (`onlyBeAccessed().byClassesThat()`). Ayrıca `noDirectBalanceUpdate` ile `JdbcTemplate.update` ve native query üzerinden direkt balance değişimi yasaklanır — tüm hareketler ledger üzerinden geçer.
+
+PAN için `noPanInDtoExceptCardService` DTO paketlerinde `Pan`/`CardNumber` içeren isimleri yasaklar, yalnız card modülüne izin verir. KVKK için `piiFieldsShouldUseEncryptedConverter` (`tcKimlik`/`email`/`phone` entity alanları `@Convert` taşımalı), sensitive log yasağı ve `cardServiceMustUseTokenization` (PAN `@Tokenized` olmalı) kuralları vardır.
+
+</details>
+
+**S6. `@AnalyzeClasses`'ta `DoNotIncludeTests` neden şarttır ve hardcoded class ismi neden anti-pattern?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+`DoNotIncludeTests` olmadan ArchUnit test class'larını da analize dahil eder. Test'ler doğal olarak birçok katmana ve framework'e bağlanır; bu kurallara girince false-positive ihlaller üretir ve ekibin ArchUnit'e güveni kırılır. Import option olarak `ImportOption.DoNotIncludeTests.class` verilir.
+
+Hardcoded class ismi (`.haveSimpleName("AccountService")`) rename edildiği anda sessizce kırılır veya kuralı boşa düşürür. Bunun yerine annotation (`areAnnotatedWith(Service.class)`) veya paket/predicate ile eşleme yapılır — böylece kural yeniden adlandırmaya dayanıklı olur.
+
+</details>
+
+**S7. ArchUnit testleri neden CI'da olmalı ve `.as()` neden önemli?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+ArchUnit testi CI'da çalışmıyorsa mimari zamanla kaçınılmaz olarak drift eder: kurallar yerel makinede atlanır, ihlaller merge olur, mimari çürür. Kuralın değeri ancak her PR'da otomatik çalışıp ihlalde build'i kırmasıyla ortaya çıkar; `mvn test` içinde olmalı ve ihlal PR'ı bloklamalı.
+
+`.as("...")` ihlal mesajını actionable yapar. Onsuz ArchUnit generic "rule X violated" der; geliştirici neyi neden düzelteceğini bilemez. `.as("All balance changes must go through LedgerService")` gibi net açıklama hem kuralın niyetini hem düzeltme yönünü verir.
+
+</details>
 
 ---
 
-## Test yazma rehberi
+## Tamamlama kriterleri
+
+- [ ] Hexagonal layer kurallarını (domain isolation + dependency direction) yazabiliyorum
+- [ ] Naming convention kurallarını (Controller/Repository/Service/Port suffix) açıklayabiliyorum
+- [ ] Banking domain kurallarını (money BigDecimal, no double, PII @Convert, ledger erişim) sayabiliyorum
+- [ ] Security kurallarını (@PreAuthorize, no field injection, audit immutable) biliyorum
+- [ ] Cyclic dependency check ve module boundary kuralını yazabiliyorum
+- [ ] En az 1 custom predicate + condition tanımlayabiliyorum
+- [ ] ArchUnit'i CI'a entegre etmenin ve `.as()` ile actionable mesajın önemini anlatabiliyorum
+- [ ] 10 anti-pattern'den en az DoNotIncludeTests, hardcoded name ve mega test class tuzağını açıklayabiliyorum
+- [ ] (Opsiyonel) "Pratik yapmak istersen" bölümündeki testleri yazdım ve Claude-verify prompt'uyla doğrulattım
+
+---
+
+## Defter notları
+
+1. "ArchUnit code review automation + architecture rule enforcement, code review'dan farkı: ____."
+2. "Hexagonal layer kuralları (domain isolation + dependency direction): ____."
+3. "Naming convention kuralları (Controller/Repository/Service/Port suffix): ____."
+4. "Banking money BigDecimal kuralı ve double neden yasak: ____."
+5. "PII @Convert + ledger erişim kısıtı (onlyBeAccessed) banking: ____."
+6. "Cyclic dependency check (slices beFreeOfCycles) + module boundary: ____."
+7. "Custom predicate + condition banking-domain specific ne zaman gerekir: ____."
+8. "Test kategorizasyonu (Hexagonal/Naming/Domain/Security/KVKK ayrı class): ____."
+9. "Actionable failure mesajı `.as()` clear fix direction: ____."
+10. "CI integration + DoNotIncludeTests + PR block on violation: ____."
+
+```admonish success title="Bölüm Özeti"
+- ArchUnit mimari kuralları JUnit testi olarak enforce eder: kural bir kez yazılır, her ihlalde build kırılır — code review'in unuttuğunu CI yakalar
+- Hexagonal'ın kalbi bağımlılık yönü: domain ne infrastructure'a ne Spring'e bağlanır, application adapter'ları görmez, port üzerinden konuşur
+- Banking-specific kurallar generic kurallardan daha değerli: money BigDecimal + no double, PII @Convert, ledger erişim kısıtı, PAN yalnız card modülünde
+- Cyclic dependency (`slices().beFreeOfCycles()`), module boundary ve custom predicate/condition ile yapısal kuralları tamamlarsın
+- Anti-pattern'lerden kaç: `DoNotIncludeTests` şart, hardcoded isim yerine annotation/predicate, `.as()` ile actionable mesaj, tek mega class yerine kategorize et
+- ArchUnit testi CI'da çalışmalı; olmazsa mimari zamanla kaçınılmaz olarak drift eder
+```
+
+---
+
+## Pratik yapmak istersen
+
+Kavramları koda dökmek istersen aşağıdaki iki ek hazır: test yazma rehberi banking-grade bir mimari test class'ının iskeletini içerir; Claude-verify prompt'u ile yazdığın ArchUnit kurallarını banking kriterlerine göre denetletebilirsin.
+
+<details>
+<summary>Test yazma rehberi</summary>
+
+Aşağıdaki class, en kritik banking kurallarını tek bir kategorize edilebilir örnekte toplar. Gerçek projede bunu Hexagonal / Naming / Banking-Domain / Security / KVKK olarak ayrı class'lara böl (Anti-pattern 10). `DoNotIncludeTests` ve `.as()` kullanımına dikkat et:
 
 ```java
 @AnalyzeClasses(
@@ -416,30 +672,30 @@ ArchUnit tests in CI. Failure message clear.
     importOptions = {ImportOption.DoNotIncludeTests.class, ImportOption.DoNotIncludeJars.class}
 )
 class BankingArchitectureTest {
-    
+
     @ArchTest
     static final ArchRule domainIsIsolated = noClasses()
         .that().resideInAPackage("..domain..")
         .should().dependOnClassesThat()
-            .resideInAnyPackage("..infrastructure..", "..adapter..", "..rest..", "..persistence..", 
+            .resideInAnyPackage("..infrastructure..", "..adapter..", "..rest..", "..persistence..",
                               "org.springframework..", "jakarta.persistence..")
         .as("Domain layer must be infrastructure-agnostic");
-    
+
     @ArchTest
     static final ArchRule moneyIsBigDecimal = fields()
         .that().haveNameMatching(".*[aA]mount.*|.*[bB]alance.*|.*[fF]ee.*")
         .and().areDeclaredInClassesThat().resideInAPackage("..domain..")
         .should().haveRawType(BigDecimal.class)
         .as("Banking money fields MUST be BigDecimal");
-    
+
     @ArchTest
     static final ArchRule noDirectBalanceMutation = noClasses()
         .that().resideOutsideOfPackage("..ledger..")
-        .should().callMethodWhere(target -> 
+        .should().callMethodWhere(target ->
             target.getOwner().getName().endsWith("JournalEntryRepository")
             && target.getName().startsWith("save"))
         .as("Only ledger module may persist journal entries (audit + invariant safety)");
-    
+
     @ArchTest
     static final ArchRule piiFieldsEncrypted = fields()
         .that().haveName("tcKimlik").or().haveName("phone").or().haveName("email")
@@ -449,9 +705,12 @@ class BankingArchitectureTest {
 }
 ```
 
----
+> Tamamlama için hedef: hexagonal + naming + banking-domain (money, PII, ledger) + security + cyclic + module boundary kuralları, en az 1 custom predicate/condition ve toplamda 15+ kural. Kuralları kategoriye göre ayrı class'lara böl ve `mvn test` ile CI'da çalıştır.
 
-## Claude-verify prompt
+</details>
+
+<details>
+<summary>Claude-verify prompt</summary>
 
 ```
 ArchUnit rules'larımı banking-grade kriterlere göre değerlendir:
@@ -488,7 +747,7 @@ ArchUnit rules'larımı banking-grade kriterlere göre değerlendir:
 
 7. Custom rules:
    - Banking-domain custom predicate?
-   - Actionable failure messages?
+   - Actionable failure messages (.as)?
 
 8. Test categorization:
    - Hexagonal / Naming / Domain / Security / KVKK separate?
@@ -498,41 +757,13 @@ ArchUnit rules'larımı banking-grade kriterlere göre değerlendir:
    - Fail PR on violation?
 
 10. Anti-pattern:
-    - DoNotIncludeTests yok YOK?
-    - Hardcoded class names YOK?
-    - All-or-nothing strict legacy YOK?
-    - Behavioral rules (not structural) YOK?
-    - One mega test class YOK?
+    - DoNotIncludeTests VAR mı?
+    - Hardcoded class names YOK mu?
+    - All-or-nothing strict legacy YOK mu?
+    - Behavioral rules (not structural) YOK mu?
+    - One mega test class YOK mu?
 
-Her madde için PASS / FAIL / EKSIK işaretle.
+Her madde için PASS / FAIL / EKSIK işaretle, kanıt göster, kod yazma.
 ```
 
----
-
-## Tamamlama kriterleri
-
-- [ ] Hexagonal layer rules
-- [ ] Naming convention rules
-- [ ] Banking domain rules (money, PII, ledger access)
-- [ ] Security rules (@PreAuthorize, audit)
-- [ ] Spring-specific rules
-- [ ] Cyclic dependency check
-- [ ] Module boundary
-- [ ] 1 custom predicate + condition
-- [ ] CI integrated
-- [ ] 15+ rule total
-
----
-
-## Defter notları (10 madde)
-
-1. "ArchUnit code review automation + architecture rule enforcement banking: ____."
-2. "Hexagonal layer rules (domain isolation + dependency direction): ____."
-3. "Naming convention rules (Controller/Repository/Service/Port suffix): ____."
-4. "Banking money BigDecimal rule (no double anywhere): ____."
-5. "PII @Convert rule + ledger access restriction banking: ____."
-6. "Cyclic dependency check + module boundary respect: ____."
-7. "Custom predicate + condition banking-domain specific: ____."
-8. "Test categorization (Hexagonal/Naming/Domain/Security/KVKK): ____."
-9. "Actionable failure messages `.as()` clear fix direction: ____."
-10. "CI integration + PR block on architecture violation: ____."
+</details>

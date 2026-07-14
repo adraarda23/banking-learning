@@ -1,6 +1,10 @@
 # Faz 12 — PHASE TEST (FINAL)
 
-12 phase roadmap'i tamamlamadan önce kendini sına. Bu son sınav — TR banka **mid+/senior backend engineer** profili kontrol.
+```admonish question title="Son dürüstlük kontrolü"
+12 fazlık roadmap'i tamamlamadan önce kendini sına. Bu son test — TR banka
+**mid+/senior backend engineer** profili kontrolü. İşaretleyemediğin her madde,
+hangi topic'e son bir kez döneceğini gösterir.
+```
 
 ## Pratik test
 
@@ -242,6 +246,11 @@ Banking için **complete profile**:
 - Domain expertise (Phase 10)
 - Quality assurance (Phase 12)
 
-TR banka sektöründe **mid+/senior rolü** için competitive edge sağlandı.
+TR banka sektöründe **mid+/senior rolü** için rekabet avantajı sağlandı.
 
+```admonish success title="Kitap tamamlandı 🎯"
+12 fazın hepsini bitirdin. Artık "Java backend bilen junior" değil,
+"Java backend + banking domain bilen, test/DevOps/security disiplinine sahip" bir developer'sın.
+`core-banking` projeni CV'ne koy, TR mid-level banking backend mülakatlarına güvenle gir.
 İyi çalışmalar — başarıyla yol al.
+```

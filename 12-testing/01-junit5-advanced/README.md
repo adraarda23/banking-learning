@@ -1,18 +1,26 @@
 # Topic 12.1 — JUnit 5 Advanced
 
+```admonish info title="Bu bölümde"
+- Parametric test'in beş kaynağı (`@ValueSource` / `@CsvSource` / `@CsvFileSource` / `@MethodSource` / `@ArgumentsSource`) ve hangisinin ne zaman doğru olduğu
+- `@TestFactory` ile runtime'da üretilen dynamic test'ler — kayıtlı her banka, aktif her currency
+- `@Nested` + `@DisplayName` ile okunabilir test ağacı ve `@DisplayNameGeneration`
+- Lifecycle sırası (`@BeforeAll` → `@BeforeEach` → test → `@AfterEach` → `@AfterAll`) ve PER_CLASS vs PER_METHOD kararı
+- AssertJ + custom domain assertion, parallel execution, tagging ve TR bank ortamında JUnit anti-pattern'leri
+```
+
 ## Hedef
 
-JUnit 5 (Jupiter) framework'ünü banking-grade kullanım derinliğine getirmek: parametric tests (CsvSource, MethodSource, ArgumentsProvider), dynamic tests, @Nested organization, lifecycle (@BeforeAll/@BeforeEach + per-class), execution order + parallel, extensions (custom), assumptions, conditional tests, banking domain examples (IBAN validation matrix, day count convention matrix, MASAK rule scenarios), assertion strategies (AssertJ, JsonPath, custom matchers).
+JUnit 5 (Jupiter) framework'ünü banking-grade kullanım derinliğine getirmek: parametric tests (`@CsvSource`, `@MethodSource`, `ArgumentsProvider`), dynamic tests, `@Nested` organizasyon, lifecycle (`@BeforeAll`/`@BeforeEach` + per-class), execution order + parallel, custom extensions, assumptions, conditional tests. Hepsini banking domain örnekleriyle bağlayacağız: IBAN validation matrisi, day count convention matrisi, MASAK smurfing senaryoları, ledger invariant'ları. Assertion tarafında AssertJ ve custom domain assertion'ları standart hale getireceğiz.
 
 ## Süre
 
-Okuma: 2 saat • Mini task: 3 saat • Test: 1 saat • Toplam: ~6 saat
+Okuma: 2 saat • Kendini Sına: 45 dk • Pratik (opsiyonel): 3-4 saat • Toplam: ~2.5 saat (+ pratik)
 
 ## Önbilgi
 
-- JUnit 4 → 5 farkını duy
-- AssertJ kullandın
-- Basic test yazıyorsun
+- JUnit 4 → 5 farkını duydun
+- AssertJ ile basit assertion yazdın
+- Temel `@Test` method'ları yazabiliyorsun
 
 ---
 
@@ -20,15 +28,21 @@ Okuma: 2 saat • Mini task: 3 saat • Test: 1 saat • Toplam: ~6 saat
 
 ### 1. JUnit 5 architecture
 
-```
-JUnit 5 = JUnit Platform + Jupiter (API) + Vintage (JUnit 4 bridge)
+Framework'ün üç parçalı olduğunu bilmek, "hangi bağımlılığı neden ekliyorum" sorusunu netleştirir. JUnit 5 tek bir jar değil, üç modülün toplamıdır: **JUnit Platform** (test launcher, IDE/build entegrasyonu), **Jupiter** (yeni test API — `@Test`, `@ParameterizedTest`), ve **Vintage** (eski JUnit 4 testlerini aynı platformda koşturan köprü).
 
-JUnit Platform: test launcher, IDE/build integration
-Jupiter: new test API (@Test, @ParameterizedTest, etc.)
-Vintage: run old JUnit 4 tests on Jupiter platform
+```mermaid
+flowchart LR
+    L["JUnit Platform: launcher, IDE ve build entegrasyonu"]
+    subgraph Engines["Test Engines"]
+        J["Jupiter: yeni test API"]
+        V["Vintage: JUnit 4 köprüsü"]
+    end
+    L --> J
+    L --> V
 ```
 
-Maven:
+Pratikte tek bir aggregator dependency yeter; AssertJ'i de fluent assertion için ekliyoruz:
+
 ```xml
 <dependency>
     <groupId>org.junit.jupiter</groupId>
@@ -46,50 +60,85 @@ Maven:
 
 ### 2. Lifecycle annotations
 
+Test'in setup ve cleanup adımlarının ne zaman koştuğunu bilmek, sızan state kaynaklı flaky testlerin önünü keser. Dört lifecycle hook var: `@BeforeAll`/`@AfterAll` sınıf başına bir kez, `@BeforeEach`/`@AfterEach` her test için tekrar çalışır.
+
 ```java
 class BankingServiceTest {
-    
+
     @BeforeAll
     static void setupAll() {
-        // Once per class — heavy setup (DB schema, etc.)
+        // Sınıf başına bir kez — ağır setup (DB schema, container)
     }
-    
+
     @BeforeEach
     void setUp() {
-        // Before every test — fresh state
+        // Her test öncesi — taze state
     }
-    
+
     @Test
     void singleTest() { ... }
-    
+
     @AfterEach
     void tearDown() { ... }
-    
+
     @AfterAll
     static void tearDownAll() { ... }
 }
 ```
 
-**Per-class lifecycle:**
+Akışı görselleştirince sıra netleşir — her test için `@BeforeEach`/`@AfterEach` tekrarlanır, `@BeforeAll`/`@AfterAll` uçlarda birer kez:
+
+```mermaid
+flowchart LR
+    A["@BeforeAll bir kez"] --> B["@BeforeEach"]
+    B --> C["@Test"]
+    C --> D["@AfterEach"]
+    D --> E{"Başka test var mı"}
+    E -->|"evet"| B
+    E -->|"hayır"| F["@AfterAll bir kez"]
+```
+
+Default'ta `@BeforeAll`/`@AfterAll` **static** olmak zorundadır, çünkü JUnit her test method'u için sınıftan yeni bir instance yaratır (PER_METHOD lifecycle). `@TestInstance(PER_CLASS)` verirsen tek instance kullanılır ve bu metodlar non-static olabilir:
 
 ```java
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class BankingServiceTest {
-    
+
     @BeforeAll
-    void setupAll() {   // Non-static OK
-        // Shared instance across tests
+    void setupAll() {   // static değil — PER_CLASS sayesinde OK
+        // Testler arası paylaşılan instance
     }
 }
 ```
 
-Banking pratiği: PER_METHOD default (fresh state); PER_CLASS for expensive setup.
+Banking pratiği: default PER_METHOD kalsın (her test taze state ile başlar, izolasyon kuvvetli); sadece pahalı setup'ı (Testcontainers, büyük fixture) paylaşmak istediğinde PER_CLASS'a geç.
 
-### 3. Parameterized tests — high leverage
+### 3. Parameterized tests — yüksek kaldıraç
 
-Aynı test logic, multiple input — banking için **kritik**.
+Aynı test mantığını onlarca farklı input ile koşturmak banking'de en çok işe yarayan tekniktir; IBAN, fee, day count gibi kural tabloları doğal olarak matris halindedir. <mark>Bir kuralı bir kez yaz, girdileri veri olarak besle</mark> — kod tekrarı sıfıra iner, yeni bir edge case eklemek tek satırdır.
 
-#### @ValueSource
+Beş kaynağı, en basitten en programatiğe doğru gruplayalım:
+
+```mermaid
+flowchart LR
+    P["@ParameterizedTest"]
+    subgraph Inline["Satır içi kaynaklar"]
+        VS["@ValueSource tek argüman"]
+        CS["@CsvSource çok argüman"]
+        ES["@EnumSource enum sabitleri"]
+    end
+    subgraph External["Dış ve programatik"]
+        CF["@CsvFileSource CSV dosyası"]
+        MS["@MethodSource Stream Arguments"]
+        AS["@ArgumentsSource özel provider"]
+    end
+    P --> Inline
+    P --> External
+```
+
+#### @ValueSource — tek argüman
+
+En basit hali: tek tip değerlerin listesi. Geçerli TR IBAN'ları tek tek besleyip hepsinin valide olduğunu doğrula.
 
 ```java
 @ParameterizedTest
@@ -103,12 +152,13 @@ void shouldValidateTrIban(String iban) {
 }
 ```
 
-#### @CsvSource — multi-arg
+#### @CsvSource — çok argüman
+
+Girdi + beklenen çıktı birlikte gerektiğinde CSV satırları kullan; `name` template'i ile her satır okunur bir isim alır.
 
 ```java
 @ParameterizedTest(name = "IBAN {0} → bank code {1}")
 @CsvSource({
-    "TR320010009999987654321098, 00100",
     "TR320010009999987654321098, 00100",
     "TR430000209999987654321097, 00002"
 })
@@ -117,9 +167,11 @@ void shouldExtractBankCode(String iban, String expectedBank) {
 }
 ```
 
-#### @CsvFileSource — file-based
+#### @CsvFileSource — dosya bazlı
 
-```java
+Vaka sayısı büyüyünce (50+ transfer senaryosu) satırları koda değil resources altındaki CSV'ye taşı; `numLinesToSkip` başlık satırını atlar.
+
+```
 // resources/test-data/transfer-scenarios.csv
 // fromAccount,toAccount,amount,currency,expectedStatus,expectedFee
 ACC001,ACC002,100,TRY,SUCCESS,5.00
@@ -136,13 +188,15 @@ void shouldExecuteTransferScenarios(
 ) {
     TransferRequest req = new TransferRequest(from, to, amount, currency);
     TransferResult result = transferService.execute(req);
-    
+
     assertThat(result.status()).isEqualTo(expectedStatus);
     assertThat(result.fee()).isEqualByComparingTo(expectedFee);
 }
 ```
 
-#### @MethodSource — programmatic
+#### @MethodSource — programatik
+
+String'e sığmayan zengin tipler (`LocalDate`, `BigDecimal`, enum) gerektiğinde argümanları bir method üretsin; her satır bir `Arguments.of(...)`. Test metodu argümanları alır:
 
 ```java
 @ParameterizedTest(name = "[{index}] {0}")
@@ -157,7 +211,11 @@ void shouldComputeDayCountFraction(
     BigDecimal actual = convention.fraction(from, to);
     assertThat(actual).isEqualByComparingTo(expectedFraction);
 }
+```
 
+Kaynak method `static` bir `Stream<Arguments>` döner; day count convention matrisi tam da bu kalıba oturur — leap year ve month-end edge case'leri açıkça isimlendirilir:
+
+```java
 static Stream<Arguments> dayCountFractionScenarios() {
     return Stream.of(
         Arguments.of("90 days ACT/365",
@@ -176,7 +234,9 @@ static Stream<Arguments> dayCountFractionScenarios() {
 }
 ```
 
-#### @EnumSource
+#### @EnumSource — enum sabitleri
+
+Bir enum'un tümünü veya seçili sabitlerini gezmek için; her transfer tipinin ücreti olduğunu doğrula.
 
 ```java
 @ParameterizedTest
@@ -186,7 +246,9 @@ void shouldHaveFee(TransferType type) {
 }
 ```
 
-#### @ArgumentsSource — custom provider
+#### @ArgumentsSource — özel provider
+
+Senaryoların üretimi mantık gerektirdiğinde (rastgele transaction üret, threshold'un altında dizi kur) `ArgumentsProvider` implement et. Kullanımı sade — provider sınıfını gösterirsin:
 
 ```java
 @ParameterizedTest
@@ -195,36 +257,38 @@ void shouldDetectSmurfingScenarios(SmurfingScenario scenario) {
     boolean detected = monitoringService.detectSmurfing(scenario.transactions());
     assertThat(detected).isEqualTo(scenario.expectedDetection());
 }
+```
 
+Provider, MASAK smurfing (yapılandırma) senaryolarını üretir: 10k eşiğinin hemen altında 5 işlem = şüpheli, rastgele tutarlar = temiz. Her senaryo beklenen tespit sonucuyla eşlenir:
+
+```java
 public class MasakSmurfingScenarioProvider implements ArgumentsProvider {
-    
+
     @Override
     public Stream<? extends Arguments> provideArguments(ExtensionContext context) {
         return Stream.of(
-            Arguments.of(scenario("5 tx just below 10k threshold", 
-                generateTransactions(5, 9500, ofHours(1)),
-                true)),
+            Arguments.of(scenario("5 tx just below 10k threshold",
+                generateTransactions(5, 9500, ofHours(1)), true)),
             Arguments.of(scenario("Random amounts, no pattern",
-                generateRandomTransactions(10),
-                false)),
+                generateRandomTransactions(10), false)),
             Arguments.of(scenario("Single large legitimate transfer",
-                List.of(new Tx(150000)),
-                false)),
+                List.of(new Tx(150000)), false)),
             Arguments.of(scenario("3 tx below threshold (less than 5)",
-                generateTransactions(3, 9500, ofMinutes(30)),
-                false))
+                generateTransactions(3, 9500, ofMinutes(30)), false))
         );
     }
 }
 ```
 
-### 4. Dynamic tests — runtime-generated
+### 4. Dynamic tests — runtime'da üretilen
+
+Test setleri derleme anında sabit değilse (kaç banka kayıtlı, kaç currency aktif) `@TestFactory` devreye girer; parametric test'in aksine test sayısı ve içeriği çalışma anında belirlenir. Bir `Stream<DynamicTest>` dönersin, her eleman bir isim + çalıştırılabilir bloktur:
 
 ```java
 @TestFactory
 Stream<DynamicTest> shouldValidateAllRegisteredBanks() {
     List<BankCode> registered = bankCodeRepo.findAll();
-    
+
     return registered.stream()
         .map(bank -> dynamicTest(
             "Validate " + bank.getName() + " (" + bank.getCode() + ")",
@@ -235,7 +299,11 @@ Stream<DynamicTest> shouldValidateAllRegisteredBanks() {
                     .isTrue();
             }));
 }
+```
 
+`dynamicContainer` ile hiyerarşi de kurabilirsin — currency başına bir container, her birinde debit=credit invariant'ı:
+
+```java
 @TestFactory
 Collection<DynamicNode> ledgerInvariants() {
     return List.of(
@@ -257,74 +325,116 @@ Collection<DynamicNode> ledgerInvariants() {
 }
 ```
 
-**Banking use:** Runtime-discovered test scenarios (every registered bank, every active currency, every active customer segment).
+```admonish tip title="Dynamic test ne zaman şart"
+Test kümesi veriden türüyorsa dynamic test kaçınılmazdır: "kayıtlı her banka", "aktif her currency", "her müşteri segmenti" gibi. Girdiler sabit ve elle sayılabilirse `@ParameterizedTest` daha okunur; küme runtime'da keşfediliyorsa `@TestFactory` kullan.
+```
 
-### 5. @Nested — test organization
+### 5. @Nested — test organizasyonu
+
+Bir servisin onlarca testi düz bir listede boğulur; `@Nested` ile testleri iç sınıflara gruplayıp IDE'de ağaç şeklinde görürsün. Dış sınıf servisi, iç sınıflar senaryo ailelerini, daha derin iç sınıflar da alt-durumları temsil eder:
 
 ```java
 class TransferServiceTest {
-    
+
     @Nested
     @DisplayName("Same-bank transfers (havale)")
     class HavaleTests {
-        
+
         @Test
         void shouldDebitSourceAndCreditDestination() { ... }
-        
-        @Test
-        void shouldSucceedWith24x7Availability() { ... }
-        
+
         @Nested
         @DisplayName("with insufficient balance")
         class InsufficientBalance {
-            
             @Test
             void shouldThrowAndNotModifyLedger() { ... }
-            
+        }
+    }
+}
+```
+
+Yapı, senaryoyu üç seviyeli bir ağaç olarak okutur: transfer tipi → başarı/başarısızlık → sebep.
+
+```mermaid
+flowchart TD
+    R["TransferServiceTest"]
+    R --> H["Havale testleri"]
+    R --> E["EFT testleri"]
+    R --> F["FAST testleri"]
+    H --> HB["Yetersiz bakiye alt grubu"]
+```
+
+Her `@Nested` sınıfının kendi `@BeforeEach`'i olabilir; alt grubun ortak setup'ını oraya koyarsın. Tam yapı üç transfer tipini ve iç senaryoları içerir:
+
+<details>
+<summary>Tam kod: @Nested üç seviyeli organizasyon (~50 satır)</summary>
+
+```java
+class TransferServiceTest {
+
+    @Nested
+    @DisplayName("Same-bank transfers (havale)")
+    class HavaleTests {
+
+        @Test
+        void shouldDebitSourceAndCreditDestination() { ... }
+
+        @Test
+        void shouldSucceedWith24x7Availability() { ... }
+
+        @Nested
+        @DisplayName("with insufficient balance")
+        class InsufficientBalance {
+
+            @Test
+            void shouldThrowAndNotModifyLedger() { ... }
+
             @Test
             void shouldAuditFailedAttempt() { ... }
         }
     }
-    
+
     @Nested
     @DisplayName("EFT outgoing")
     class EftTests {
-        
+
         @Test
         void shouldHoldInClearingAccount() { ... }
-        
+
         @Test
         void shouldRejectOutsideWorkingHours() { ... }
-        
+
         @Test
         void shouldApplyBsmv() { ... }
     }
-    
+
     @Nested
     @DisplayName("FAST instant")
     class FastTests {
-        
+
         @Test
         void shouldComplete10Seconds() { ... }
-        
+
         @Test
         void shouldReject70kPlus() { ... }
     }
 }
 ```
 
-IDE'de tree shape görünür, readability artar.
+</details>
 
 ### 6. @DisplayName + @DisplayNameGeneration
+
+Test isimleri raporda ve IDE'de birer cümle gibi okunmalı; camelCase method adları bunu zorlaştırır. `@DisplayName` her teste serbest metin (Türkçe kabul kriteri dahil) verir; `@DisplayNameGeneration` ise tüm sınıfa otomatik dönüşüm uygular.
 
 ```java
 @DisplayNameGeneration(DisplayNameGenerator.ReplaceUnderscores.class)
 class BankingTest {
-    
+
     @Test
     void shouldDebitCustomerOnTransfer() { }
     // Display: "should Debit Customer On Transfer"
-    
+
     @Test
     @DisplayName("Müşteri yetersiz bakiyede transfer reddedilmeli")
     void rejectInsufficientBalance() { }
@@ -332,28 +442,24 @@ class BankingTest {
 }
 ```
 
-Banking: Türkçe display name + acceptance test readability.
+Banking'de acceptance test'lerini Türkçe display name ile yazmak, analistin ve denetçinin de okuyabildiği yaşayan bir spec üretir.
 
 ### 7. Assertions strategy
 
-#### Built-in assertions (yeterli değil banking için)
+Doğru assertion, test başarısız olduğunda "neyin neden yanlış olduğunu" tek bakışta söyler; banking'de bu fark bir defect'i dakikalar yerine saatlerde bulmak demektir. Built-in `assertEquals`/`assertNotNull` yeterli okunabilirliği vermez:
 
 ```java
 assertEquals(expected, actual);
 assertNotNull(obj);
 ```
 
-#### AssertJ — fluent + rich
+**AssertJ** fluent zincir ve zengin matcher sunar — para, koleksiyon, header hepsi tek akışta doğrulanır. Banking'de AssertJ artık standarttır:
 
 ```java
 assertThat(transfer.amount())
     .isPositive()
     .isLessThanOrEqualTo(new BigDecimal("100000"))
     .isEqualByComparingTo(expectedAmount);
-
-assertThat(transfer)
-    .extracting(Transfer::status, Transfer::currency)
-    .containsExactly("COMPLETED", "TRY");
 
 assertThat(ledgerEntries)
     .hasSize(2)
@@ -365,21 +471,45 @@ assertThat(response.headers())
     .containsEntry("Content-Type", "application/json");
 ```
 
-Banking için AssertJ **standard**.
+Domain kuralları (ledger dengeli mi, fee doğru mu, işlem idempotent mi) tekrar tekrar assert ediliyorsa **custom assertion** yaz; `AbstractAssert` extend edip anlamlı isimli metodlar eklersin. Çekirdek, hata mesajını domain diliyle veren bir metod:
 
-#### Custom assertions — banking domain
+```java
+public TransferAssert isBalanced() {
+    isNotNull();
+    BigDecimal debits = actual.ledgerEntries().stream()
+        .map(LedgerEntry::debit).reduce(ZERO, BigDecimal::add);
+    BigDecimal credits = actual.ledgerEntries().stream()
+        .map(LedgerEntry::credit).reduce(ZERO, BigDecimal::add);
+    if (debits.compareTo(credits) != 0) {
+        failWithMessage("Expected balanced (D == C) but D=%s, C=%s", debits, credits);
+    }
+    return this;
+}
+```
+
+Kullanımda test neredeyse bir spec gibi okunur — zincirleme domain iddiaları:
+
+```java
+TransferAssert.assertThat(result)
+    .isBalanced()
+    .hasFeeOf(new BigDecimal("5.00"))
+    .wasIdempotent();
+```
+
+<details>
+<summary>Tam kod: TransferAssert custom assertion (~45 satır)</summary>
 
 ```java
 public class TransferAssert extends AbstractAssert<TransferAssert, Transfer> {
-    
+
     public TransferAssert(Transfer actual) {
         super(actual, TransferAssert.class);
     }
-    
+
     public static TransferAssert assertThat(Transfer actual) {
         return new TransferAssert(actual);
     }
-    
+
     public TransferAssert isBalanced() {
         isNotNull();
         BigDecimal debits = actual.ledgerEntries().stream()
@@ -391,7 +521,7 @@ public class TransferAssert extends AbstractAssert<TransferAssert, Transfer> {
         }
         return this;
     }
-    
+
     public TransferAssert hasFeeOf(BigDecimal expected) {
         isNotNull();
         if (actual.fee().compareTo(expected) != 0) {
@@ -399,38 +529,39 @@ public class TransferAssert extends AbstractAssert<TransferAssert, Transfer> {
         }
         return this;
     }
-    
+
     public TransferAssert wasIdempotent() {
-        // Check audit log for duplicate request
+        // Audit log'da duplicate request kontrolü
         ...
         return this;
     }
 }
 
-// Usage
+// Kullanım
 TransferAssert.assertThat(result)
     .isBalanced()
     .hasFeeOf(new BigDecimal("5.00"))
     .wasIdempotent();
 ```
 
-Test reads like spec.
+</details>
 
-### 8. Assumptions — conditional execution
+### 8. Assumptions — koşullu çalışma
+
+Assumption, assertion'dan farklıdır: koşul sağlanmazsa test **fail olmaz, atlanır** (skip). "Bu test sadece DB varsa anlamlı" gibi ortama bağlı durumlarda kullanılır:
 
 ```java
 @Test
 void integrationTestRequiresDatabase() {
     assumeTrue(isDatabaseAvailable(), "Database not available, skipping");
-    
-    // Test that needs DB
+    // DB gerektiren test
     ...
 }
+```
 
-@Test
-@EnabledIf("isBankingHours")
-void onlyRunDuringBankingHours() { ... }
+Conditional annotation'lar ise testi hiç başlatmadan ortama göre etkinleştirir/devre dışı bırakır — işletim sistemi, environment variable veya özel koşula göre:
 
+```java
 @Test
 @DisabledOnOs(OS.WINDOWS)
 void unixOnly() { ... }
@@ -442,31 +573,33 @@ void integrationTest() { ... }
 
 ### 9. @TestMethodOrder + @Order
 
+Testler default'ta deterministik ama kasıtlı olmayan bir sırada koşar; sırayı garantilemek istediğinde `@TestMethodOrder` + `@Order` kullanılır. Tipik meşru kullanım bir happy-path onboarding demosunu adım adım göstermektir:
+
 ```java
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class OnboardingFlowTest {
-    
-    @Test
-    @Order(1)
+
+    @Test @Order(1)
     void shouldCreateCustomer() { ... }
-    
-    @Test
-    @Order(2)
+
+    @Test @Order(2)
     void shouldVerifyMernis() { ... }
-    
-    @Test
-    @Order(3)
+
+    @Test @Order(3)
     void shouldQueryKkb() { ... }
-    
-    @Test
-    @Order(4)
+
+    @Test @Order(4)
     void shouldOpenAccount() { ... }
 }
 ```
 
-**Warning:** Order dependency = anti-pattern usually. Each test should be **independent**. Order only for happy-path acceptance demos.
+```admonish warning title="Order bağımlılığı genelde anti-pattern"
+Bir test diğerinin bıraktığı state'e bağlıysa, biri değişince zincir kırılır ve hata kaynağını bulmak kabusa döner. `@Order`'ı yalnızca bağımsız testlerden oluşan bir akışı okunur sırayla sunmak için kullan; testler arasında veri taşımak için değil.
+```
 
 ### 10. Parallel execution
+
+Test suite'i büyüdükçe seri koşum CI'ı yavaşlatır; JUnit 5 testleri paralel çalıştırabilir. Etkinleştirmek `junit-platform.properties` ile yapılır:
 
 ```properties
 # junit-platform.properties
@@ -477,10 +610,7 @@ junit.jupiter.execution.parallel.config.strategy=dynamic
 junit.jupiter.execution.parallel.config.dynamic.factor=2
 ```
 
-**Banking caveat:**
-- Test isolation şart (DB state, MDC, static state)
-- `@Execution(SAME_THREAD)` mark for non-thread-safe tests
-- Testcontainers per-class shared OK with REUSABLE option
+<mark>Paralel çalışmada test isolation şarttır</mark> — paylaşılan DB state, MDC, static field'lar aynı anda koşan testler arasında sızarsa sonuçlar rastgeleleşir. Thread-safe olmayan testi `SAME_THREAD` ile işaretleyip diğerlerini concurrent bırakabilirsin:
 
 ```java
 @Execution(ExecutionMode.SAME_THREAD)
@@ -490,7 +620,11 @@ class GlobalStateMutatingTest { ... }
 class StatelessTest { ... }
 ```
 
-### 11. Tagging — selective run
+Banking pratiği: Testcontainers'ı sınıflar arası paylaşacaksan REUSABLE option ile; global static mutasyon yapan legacy testleri `SAME_THREAD`'e al, gerisini concurrent koştur.
+
+### 11. Tagging — seçici koşum
+
+Her testi her koşuda çalıştırmak istemezsin: PR başına hızlı unit testler, gece integration ve slow testler. `@Tag` ile testleri etiketleyip build'de seçersin:
 
 ```java
 @Tag("unit")
@@ -504,51 +638,52 @@ class IntegrationTest { }
 class LedgerTest { }
 ```
 
-Maven:
+Maven tarafında Surefire (test fazı, unit) ve Failsafe (verify fazı, integration) etiketlere göre ayrışır:
+
 ```xml
 <plugin>
     <artifactId>maven-surefire-plugin</artifactId>
     <configuration>
-        <groups>unit</groups>           <!-- default test -->
+        <groups>unit</groups>
         <excludedGroups>slow</excludedGroups>
     </configuration>
 </plugin>
 <plugin>
     <artifactId>maven-failsafe-plugin</artifactId>
     <configuration>
-        <groups>integration</groups>    <!-- verify phase -->
+        <groups>integration</groups>
     </configuration>
 </plugin>
 ```
 
 ```bash
-# Unit tests only (fast, CI per PR)
+# Sadece unit (hızlı, PR başına CI)
 mvn test
 
 # Integration (verify, nightly)
 mvn verify -Pintegration
 
-# Specific tag
+# Belirli tag
 mvn test -Dgroups="banking-domain"
 ```
 
 ### 12. Custom extensions
 
-Test-wide cross-cutting concerns (banking):
+Birden çok test sınıfında tekrarlayan cross-cutting davranış (ledger seed'le, invariant doğrula, MDC temizle) için `Extension` yazılır; JUnit 5'in extension model'i JUnit 4 rule'larının yerini alır. Callback interface'lerini implement edip lifecycle'a bağlanırsın:
 
 ```java
-public class BankingLedgerExtension implements 
+public class BankingLedgerExtension implements
     BeforeEachCallback, AfterEachCallback {
-    
+
     @Override
     public void beforeEach(ExtensionContext context) {
-        // Seed COA + clean ledger
+        // COA seed + ledger temizle
         LedgerSeed.cleanAndSeed();
     }
-    
+
     @Override
     public void afterEach(ExtensionContext context) {
-        // Verify ledger invariants
+        // Ledger invariant doğrula
         BigDecimal diff = trialBalance.compute();
         if (diff.compareTo(ZERO) != 0) {
             throw new AssertionError("Trial balance violation after test: " + diff);
@@ -560,81 +695,41 @@ public class BankingLedgerExtension implements
 class TransferServiceTest { ... }
 ```
 
-**Banking domain extensions:**
-- LedgerInvariantExtension (trial balance check)
-- AuditChainExtension (hash chain verify)
-- MdcCleanupExtension (Topic 9.1)
-- TimeFreezeExtension (deterministic dates)
+Banking'de tipik domain extension'ları: `LedgerInvariantExtension` (trial balance kontrolü), `AuditChainExtension` (hash chain doğrulama), `MdcCleanupExtension` (Topic 9.1), `TimeFreezeExtension` (deterministik tarihler).
 
 ### 13. Banking — JUnit anti-pattern'leri
 
-**Anti-pattern 1: Test depends on order**
-```java
-@Test void test1() { customer = create(); }
-@Test void test2() { update(customer); }   // ❌ depends on test1
-```
-Each test independent.
+Mülakatta "bu test kodunda ne yanlış" sorusunun cephaneliği burasıdır; <mark>her test birbirinden bağımsız, tekrarlanabilir ve okunur olmalı</mark>. On klasik tuzak:
 
-**Anti-pattern 2: Shared mutable static state**
+**1 — Test sıraya bağımlı:** `test2`, `test1`'in yarattığı `customer`'a bağlıysa sıra değişince kırılır. Her test kendi state'ini `@BeforeEach`'te kursun.
+
+**2 — Paylaşılan mutable static state:**
 ```java
 static List<Transaction> transactions = new ArrayList<>();
 ```
-Parallel + ordering issues. Use @BeforeEach fresh state.
+Paralel + sıra problemi doğurur; taze state için `@BeforeEach`.
 
-**Anti-pattern 3: Magic numbers**
+**3 — Magic number:** `assertThat(result).isEqualTo(123.45)` — 123.45 ne? İsimli sabit kullan: `EXPECTED_FEE_WITH_BSMV`.
+
+**4 — İlgisiz çoklu assertion:** Tek testte amount + email + balance doğrulamak; failure'da hangisi patladı belirsiz. Odaklı testlere böl.
+
+**5 — Açıklayıcı olmayan isim:** `test1()`, `doStuff()` yerine `shouldXxxWhenYyy` kalıbı.
+
+**6 — Mesajsız `assertTrue`:** `assertTrue(service.isAllowed(req))` fail olunca "expected true got false" der. AssertJ + `.as("...")` kullan.
+
+**7 — Test içinde sleep:**
 ```java
-assertThat(result).isEqualTo(123.45);
+triggerEvent();
+Thread.sleep(5000);   // flaky
+assertThat(...);
 ```
-What is 123.45? Named constant:
-```java
-private static final BigDecimal EXPECTED_FEE_WITH_BSMV = new BigDecimal("123.45");
-```
+Awaitility veya düzgün async bekleme kullan.
 
-**Anti-pattern 4: Multiple assertions checking unrelated things**
-```java
-@Test
-void everything() {
-    assertThat(transfer.amount()).isPositive();
-    assertThat(customer.email()).isNotNull();
-    assertThat(account.balance()).isGreaterThan(0);
-}
-```
-Split into focused tests.
+**8 — `System.out.println` ile debug:** Print yerine logger; çoğu zaman AssertJ mesajı zaten yeter.
 
-**Anti-pattern 5: Test method names not descriptive**
-```java
-@Test void test1() { }
-@Test void doStuff() { }
-```
-`shouldXxxWhenYyy` pattern.
+**9 — Sahibi olmadığın tipi mock'lamak:** `@Mock LocalDate` gibi. Dışarıyı adapter'a sar, adapter'ı mock'la — veya `Clock` inject et.
 
-**Anti-pattern 6: assertTrue without message**
-```java
-assertTrue(transferService.isAllowed(req));
-```
-On failure: "expected true got false". Useless. Use AssertJ with `as("...")`.
-
-**Anti-pattern 7: Sleep in test**
-```java
-@Test void async() {
-    triggerEvent();
-    Thread.sleep(5000);   // ❌
-    assertThat(...);
-}
-```
-Flaky. Use Awaitility or proper async.
-
-**Anti-pattern 8: System.out.println in test**
-Logger usage. Or just AssertJ — no need to print.
-
-**Anti-pattern 9: Mocking what you don't own**
-```java
-@Mock LocalDate fixedDate;   // ❌
-```
-Wrap external in adapter, mock adapter. Or use Clock injected.
-
-**Anti-pattern 10: No banking-specific assertions**
-Banking semantic checks (ledger balance, BSMV correct, MASAK trigger) wrapped as custom assertions.
+**10 — Domain'e özel assertion eksikliği:** Ledger dengesi, BSMV doğruluğu, MASAK tetiği gibi semantik kontrolleri custom assertion'a sar.
 
 ---
 
@@ -644,103 +739,184 @@ Banking semantic checks (ledger balance, BSMV correct, MASAK trigger) wrapped as
 - AssertJ documentation
 - "Effective Software Testing" — Maurício Aniche
 - "Growing Object-Oriented Software, Guided by Tests" — Freeman/Pryce
-- xUnit Patterns — Gerard Meszaros
+- xUnit Test Patterns — Gerard Meszaros
 
 ---
 
-## Mini task'ler
+## Kendini Sına
 
-### Task 12.1.1 — Parameterized test matrix (45 dk)
+Aşağıdaki soruları önce **cevaba bakmadan** kendi cümlelerinle yanıtlamayı dene — hepsi test mühendisliği mülakatlarında karşına çıkabilecek tarzda. Takıldığın yerde ilgili Kavramlar başlığına dön, sonra tekrar dene.
 
-@CsvSource ile IBAN validation matrix (10 valid + 10 invalid case).
+**S1. `@ParameterizedTest` için beş kaynak var: `@ValueSource`, `@CsvSource`, `@CsvFileSource`, `@MethodSource`, `@ArgumentsSource`. Hangisini ne zaman seçersin?**
 
-### Task 12.1.2 — @MethodSource banking (45 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-Day count fraction scenarios. 4 convention x 5 date range.
+`@ValueSource` tek argümanlı basit listeler için (geçerli IBAN'lar). `@CsvSource` girdi + beklenen çıktı birlikte gerektiğinde, satır sayısı az ve kodda tutulabiliyorsa. `@CsvFileSource` vaka sayısı büyüyünce (50+ transfer senaryosu) veriyi resources altındaki CSV'ye taşımak için. `@MethodSource` String'e sığmayan zengin tipler (`LocalDate`, `BigDecimal`, enum) veya hesaplanmış argümanlar gerektiğinde. `@ArgumentsSource` ise senaryo üretimi mantık istiyorsa (rastgele transaction, threshold altı diziler — MASAK smurfing) `ArgumentsProvider` yazarak. Enum'un tüm/seçili sabitlerini gezmek içinse `@EnumSource`.
 
-### Task 12.1.3 — @CsvFileSource transfer scenarios (45 dk)
+</details>
 
-CSV file 50 transfer case. Banking transfer service test.
+**S2. `@Nested` ne işe yarar, ne zaman kullanılır?**
 
-### Task 12.1.4 — @TestFactory dynamic (60 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-Each registered bank → IBAN validation dynamic test.
+`@Nested`, testleri iç sınıflara gruplayarak IDE ve raporda ağaç yapısı üretir; düz bir listede boğulan onlarca testi "transfer tipi → başarı/başarısızlık → sebep" gibi okunur hiyerarşiye dönüştürür. Her iç sınıfın kendi `@BeforeEach`'i olabildiği için ortak setup'ı ilgili gruba yakın tutarsın. `@DisplayName` ile birlikte kullanılınca test raporu neredeyse bir spec dokümanı gibi okunur. Bir servisin çok sayıda senaryosunu organize etmek istediğinde tercih edilir.
 
-### Task 12.1.5 — @Nested organization (60 dk)
+</details>
 
-TransferServiceTest 3 level nested (transfer type → success/failure → reason).
+**S3. Lifecycle hook'larının çalışma sırası nedir? PER_CLASS ile PER_METHOD arasındaki fark ne?**
 
-### Task 12.1.6 — Custom AssertJ extension (60 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-`TransferAssert` + `LedgerAssert` banking-domain.
+Sıra: `@BeforeAll` (sınıf başına bir kez) → her test için [`@BeforeEach` → `@Test` → `@AfterEach`] → `@AfterAll` (bir kez). Default lifecycle PER_METHOD'dur: JUnit her test method'u için sınıftan yeni bir instance yaratır, bu yüzden `@BeforeAll`/`@AfterAll` static olmak zorundadır. `@TestInstance(PER_CLASS)` verirsen tek instance tüm testlerde paylaşılır ve bu metodlar non-static olabilir. Banking'de default PER_METHOD tercih edilir (taze state, kuvvetli izolasyon); yalnızca pahalı setup'ı (Testcontainers, büyük fixture) paylaşmak için PER_CLASS'a geçilir.
 
-### Task 12.1.7 — Custom extension (45 dk)
+</details>
 
-`LedgerInvariantExtension` after each verify trial balance.
+**S4. Dynamic test (`@TestFactory`) ne zaman `@ParameterizedTest` yerine mutlaka gerekir?**
 
-### Task 12.1.8 — Parallel execution config (30 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-junit-platform.properties enable. Race condition reproduce + @Execution SAME_THREAD fix.
+Test kümesi derleme anında bilinmiyor, runtime'da veriden keşfediliyorsa dynamic test şarttır: "kayıtlı her banka", "aktif her currency", "her müşteri segmenti" gibi sayısı ve içeriği çalışma anında belirlenen setler. `@TestFactory` bir `Stream<DynamicTest>` (veya `dynamicContainer` ile hiyerarşi) döner, her eleman bir isim + çalıştırılabilir bloktur. Girdiler sabit ve elle sayılabilirse `@ParameterizedTest` daha okunurdur; küme dinamik olarak keşfediliyorsa dynamic test kullanılır.
 
-### Task 12.1.9 — Tagging + Maven profile (45 dk)
+</details>
 
-@Tag unit/integration/slow/banking. Maven profile selective.
+**S5. Neden built-in assertion yerine AssertJ ve custom domain assertion kullanılır?**
 
-### Task 12.1.10 — ArgumentsProvider MASAK (60 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-MasakSmurfingScenarioProvider with 6+ scenario.
+Built-in `assertTrue`/`assertEquals` fail olduğunda az bilgi verir ("expected true got false"); AssertJ fluent zincir + zengin matcher ile para, koleksiyon, header'ı tek akışta ve `.as(...)` ile anlamlı mesajla doğrular. Domain kuralları tekrar tekrar kontrol ediliyorsa (ledger dengeli mi, fee doğru mu, idempotent mi) `AbstractAssert` extend edip `isBalanced()`, `hasFeeOf(...)` gibi metodlar yazarsın. Böylece test bir spec gibi okunur ve failure mesajı domain diliyle (`D=... C=...`) çıkar, defect'i bulmak hızlanır.
+
+</details>
+
+**S6. Parallel execution'da nelere dikkat edilir? `@Execution(SAME_THREAD)` ne zaman gerekir?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Paralel koşumda test isolation kritiktir: paylaşılan DB state, MDC, static field aynı anda koşan testler arasında sızarsa sonuçlar deterministik olmaktan çıkar (flaky). Paralellik `junit-platform.properties` ile açılır (`parallel.enabled=true`, dynamic strategy). Thread-safe olmayan, global static mutasyon yapan testleri `@Execution(ExecutionMode.SAME_THREAD)` ile serileştirip diğerlerini `CONCURRENT` bırakırsın. Testcontainers'ı sınıflar arası paylaşacaksan REUSABLE option kullanılır.
+
+</details>
+
+**S7. `@Tag` + Maven ile testleri nasıl seçici koşarsın?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Testleri `@Tag("unit")`, `@Tag("integration")`, `@Tag("slow")`, `@Tag("banking-domain")` gibi etiketlersin. Maven'da Surefire (test fazı) unit testleri koşar ve slow'u dışlar (`<groups>`, `<excludedGroups>`); Failsafe (verify fazı) integration testleri koşar. Böylece PR başına hızlı unit testler, gece integration/slow testler çalışır. CLI'dan da `mvn test -Dgroups="banking-domain"` ile belirli etiketi hedefleyebilirsin.
+
+</details>
+
+**S8. Banking test'lerinde en kritik üç anti-pattern hangisi ve neden tehlikeli?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Bir: sıraya bağımlı testler ve paylaşılan mutable static state — biri değişince zincir kırılır, paralel koşumda sonuçlar rastgeleleşir; her test `@BeforeEach`'te kendi taze state'ini kurmalı. İki: test içinde `Thread.sleep` — CI'ı yavaşlatır ve flaky yapar; Awaitility veya düzgün async bekleme kullanılır. Üç: domain'e özel assertion eksikliği ve magic number — ledger dengesi/BSMV/MASAK gibi semantik kontroller custom assertion'a sarılmalı, `123.45` gibi sabitler isimlendirilmeli ki test okunur ve failure mesajı anlamlı olsun.
+
+</details>
 
 ---
 
-## Test yazma rehberi
+## Tamamlama kriterleri
+
+- [ ] "Kendini Sına" bölümündeki tüm soruları cevaba bakmadan açıklayabiliyorum
+- [ ] JUnit 5'in üç parçasını (Platform + Jupiter + Vintage) ve rollerini anlatabilirim
+- [ ] Beş parametric kaynağı ve her birinin doğru kullanım anını sayabiliyorum
+- [ ] `@TestFactory` dynamic test'in `@ParameterizedTest`'ten ne zaman ayrıldığını biliyorum
+- [ ] Lifecycle sırasını ve PER_CLASS vs PER_METHOD kararını gerekçelendirebiliyorum
+- [ ] `@Nested` + `@DisplayName` ile okunur test ağacı kurabilirim
+- [ ] AssertJ fluent + custom domain assertion (TransferAssert, LedgerAssert) yazabilirim
+- [ ] Parallel execution isolation risklerini ve `@Execution(SAME_THREAD)` çözümünü açıklayabiliyorum
+- [ ] `@Tag` + Maven Surefire/Failsafe ile seçici koşumu kurabilirim
+- [ ] On JUnit anti-pattern'ini (order dep, shared static, sleep, magic number) tanıyıp düzeltebiliyorum
+- [ ] (Opsiyonel) "Pratik yapmak istersen" bölümündeki testleri yazdım ve Claude-verify prompt'uyla doğrulattım
+
+---
+
+## Defter notları
+
+1. "JUnit 5 architecture (Platform + Jupiter + Vintage) ve Jupiter API: ____."
+2. "Parametric 5 kaynak (Value/Csv/CsvFile/Method/ArgumentsSource) hangisi ne zaman: ____."
+3. "`@TestFactory` dynamic test runtime-discovered banking senaryosu: ____."
+4. "`@Nested` + `@DisplayName` test organizasyonu ve okunabilirlik: ____."
+5. "AssertJ fluent + custom domain assertion (TransferAssert) pattern: ____."
+6. "`@BeforeAll`/`@BeforeEach` lifecycle sırası + PER_CLASS vs PER_METHOD: ____."
+7. "Custom extension (LedgerInvariant, AuditChain, MdcCleanup) cross-cutting: ____."
+8. "Parallel execution config + `@Execution(SAME_THREAD)` non-thread-safe: ____."
+9. "`@Tag` unit/integration/slow + Maven Surefire/Failsafe seçici koşum: ____."
+10. "Banking test anti-pattern (order dep, sleep, magic number, shared static): ____."
+
+```admonish success title="Bölüm Özeti"
+- JUnit 5 tek jar değil üç parçadır: Platform (launcher), Jupiter (yeni API), Vintage (JUnit 4 köprüsü)
+- Parametric test'in beş kaynağı vardır; seçim veriye göre: `@ValueSource`/`@CsvSource` inline, `@CsvFileSource` büyük CSV, `@MethodSource` zengin tip, `@ArgumentsSource` üretilmiş senaryo
+- Test kümesi runtime'da keşfediliyorsa (her banka, her currency) `@TestFactory` dynamic test; girdiler sabitse `@ParameterizedTest`
+- Lifecycle sırası `@BeforeAll` → [`@BeforeEach` → test → `@AfterEach`] → `@AfterAll`; default PER_METHOD taze state verir, PER_CLASS pahalı setup'ı paylaşır
+- `@Nested` + `@DisplayName` test'i okunur ağaca çevirir; AssertJ + custom domain assertion failure mesajını domain diliyle söyler
+- Paralel koşumda isolation şart; `@Tag` + Surefire/Failsafe seçici koşumu verir; order-dependency, shared static, sleep ve magic number banking'de flaky test üreten anti-pattern'lerdir
+```
+
+---
+
+## Pratik yapmak istersen
+
+Kavramları koda dökmek istersen aşağıdaki iki ek hazır: test yazma rehberi parametric matris, dynamic test, `@Nested` ve custom assertion/extension için iskelet bir banking test sınıfı içerir; Claude-verify prompt'u ile yazdığın JUnit 5 setup'ını banking-grade perspektiften denetletebilirsin.
+
+<details>
+<summary>Test yazma rehberi</summary>
+
+Aşağıdaki `TransferServiceTest` iskeleti bir sınıfta parametric test, custom AssertJ assertion, custom extension, dynamic test ve tagging'i bir arada gösterir; kendi banking servisin için başlangıç noktası olarak kullan.
 
 ```java
 @DisplayName("TransferService — banking transfer scenarios")
 @TestMethodOrder(MethodOrderer.DisplayName.class)
 class TransferServiceTest {
-    
+
     @RegisterExtension
     static BankingLedgerExtension ledger = new BankingLedgerExtension();
-    
+
     static TransferService service;
-    
+
     @BeforeAll
     static void setupOnce() {
         service = new TransferService(...);
     }
-    
+
     @Nested
     @DisplayName("Same-bank havale")
     class HavaleTests {
-        
+
         @ParameterizedTest(name = "{0} TL transfer between same-bank customers")
         @ValueSource(strings = {"100", "1000", "10000", "100000"})
         @DisplayName("Various amount sizes")
         void shouldTransferSameBank(String amountStr) {
             BigDecimal amount = new BigDecimal(amountStr);
             TransferResult result = service.havale(testRequest(amount));
-            
+
             TransferAssert.assertThat(result)
                 .isBalanced()
                 .isCompleted();
         }
-        
+
         @Test
         @DisplayName("Reject when insufficient balance")
         void shouldRejectInsufficient() {
             setupAccountBalance(customerA, new BigDecimal("50.00"));
-            
+
             assertThatThrownBy(() -> service.havale(transferOf(customerA, "100.00")))
                 .isInstanceOf(InsufficientBalanceException.class)
                 .hasMessageContaining("50.00")
                 .hasMessageContaining("100.00");
-            
-            // Ledger should not have been modified
+
+            // Ledger değişmemiş olmalı
             assertThat(balanceService.balanceOf(customerA, "TRY"))
                 .isEqualByComparingTo("50.00");
         }
     }
-    
+
     @TestFactory
     @DisplayName("Day count conventions accuracy")
     Stream<DynamicTest> shouldComputeAllDayCountConventions() {
@@ -756,26 +932,30 @@ class TransferServiceTest {
                         .isBetween(new BigDecimal("0.24"), new BigDecimal("0.26"));
                 }));
     }
-    
+
     @Test
     @Tag("integration")
     @Tag("slow")
     void fullEndToEndWithLedger() {
-        // Comprehensive scenario
+        // Kapsamlı senaryo
     }
 }
 ```
 
----
+> Pratik hedefleri: dört parametric source türünü kullan; `@TestFactory` ile dynamic banking test yaz; `@Nested` 2+ seviye kur; custom AssertJ (TransferAssert, LedgerAssert) ve custom extension (LedgerInvariantExtension) ekle; CSV test data dosyası oluştur; ArgumentsProvider ile MASAK senaryoları üret; parallel config + SAME_THREAD gereken yerde; `@Tag` unit/integration/slow + Maven profile; Türkçe DisplayName. Bunları yazdıysan bu bölümü koda dökmüş sayılırsın.
 
-## Claude-verify prompt
+</details>
+
+<details>
+<summary>Claude-verify prompt</summary>
 
 ```
-JUnit 5 test setup'ımı banking-grade kriterlere göre değerlendir:
+JUnit 5 test setup'ımı banking-grade kriterlere göre değerlendir. Eksikleri 
+işaretle, kod yazma:
 
-1. Parameterized tests:
+1. Parametric tests:
    - @ValueSource / @CsvSource / @MethodSource / @CsvFileSource banking matrix?
-   - @ArgumentsProvider custom banking scenario?
+   - @ArgumentsProvider custom banking scenario (MASAK)?
    - Display name template ({0}, {1}) readable?
 
 2. Dynamic tests:
@@ -783,7 +963,7 @@ JUnit 5 test setup'ımı banking-grade kriterlere göre değerlendir:
    - dynamicContainer hierarchy?
 
 3. Organization:
-   - @Nested logical grouping?
+   - @Nested logical grouping (2+ level)?
    - @DisplayName Türkçe veya readable?
    - @DisplayNameGeneration?
 
@@ -827,36 +1007,7 @@ JUnit 5 test setup'ımı banking-grade kriterlere göre değerlendir:
     - Sleep in test YOK?
     - Mocking what you don't own YOK?
 
-Her madde için PASS / FAIL / EKSIK işaretle.
+Her madde için PASS / FAIL / EKSIK işaretle, kanıt göster, kod yazma.
 ```
 
----
-
-## Tamamlama kriterleri
-
-- [ ] @ParameterizedTest 4 source types kullanım
-- [ ] @TestFactory dynamic banking
-- [ ] @Nested 2+ level
-- [ ] Custom AssertJ (TransferAssert, LedgerAssert)
-- [ ] Custom extension (LedgerInvariantExtension)
-- [ ] Parallel execution config + SAME_THREAD where needed
-- [ ] @Tag unit/integration/slow + Maven profile
-- [ ] CSV test data file
-- [ ] ArgumentsProvider MASAK scenarios
-- [ ] 10+ integration test
-- [ ] DisplayName Turkish banking domain
-
----
-
-## Defter notları (10 madde)
-
-1. "JUnit 5 architecture (Platform + Jupiter + Vintage) + Jupiter API: ____."
-2. "@ParameterizedTest 4 source (Value/Csv/Method/CsvFile) banking matrix: ____."
-3. "@TestFactory dynamic tests runtime-discovered banking: ____."
-4. "@Nested + @DisplayName test organization readability banking: ____."
-5. "AssertJ fluent + custom domain assertions banking pattern: ____."
-6. "@BeforeAll/@BeforeEach lifecycle + PER_CLASS vs PER_METHOD scope: ____."
-7. "Custom extensions (LedgerInvariant, AuditChain, MdcCleanup) cross-cutting: ____."
-8. "Parallel execution config + @Execution SAME_THREAD non-thread-safe: ____."
-9. "@Tag unit/integration/slow + Maven Surefire/Failsafe profile: ____."
-10. "Banking test anti-pattern (order dep, sleep, magic numbers, shared static): ____."
+</details>
