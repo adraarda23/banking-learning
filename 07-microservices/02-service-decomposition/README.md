@@ -1,12 +1,20 @@
 # Topic 7.2 — Service Decomposition
 
+```admonish info title="Bu bölümde"
+- Bir modülü "microservice olarak ayır" mı "monolit içinde birleşik tut" mu — 11 kriterli karar matrisi
+- Banking 4-servis (account, transfer, fraud, notification) ayrımının **why**'ı: her servisin scaling, stability ve coupling gerekçesi
+- Database per service prensibi, data sovereignty ve shared DB anti-pattern'inin neden banking'de yasak olduğu
+- 10 servise bölüp hâlâ monolit acısı çekmek: distributed monolith tuzağı, belirtileri ve çıkış yolu
+- Strangler Fig ile kademeli migration, shared library yönetimi ve aggregate'ı bölmeme kuralı
+```
+
 ## Hedef
 
-Monolit'i microservice'lere bölme **stratejilerini** öğrenmek. Hangi servisi ayır, hangisini birleştir kararını **gerekçeli** verebilmek. Banking 4-servis (account, transfer, fraud, notification) bölüşümünün **why**'ını anlamak. Database per service, shared library yönetimi, distributed monolith anti-pattern.
+Monolit'i microservice'lere bölme **stratejilerini** öğrenmek. Hangi servisi ayır, hangisini birleştir kararını **gerekçeli** verebilmek. Banking 4-servis (account, transfer, fraud, notification) bölüşümünün **why**'ını anlamak. Database per service, shared library yönetimi ve distributed monolith anti-pattern'inden kaçınmayı kavramak.
 
 ## Süre
 
-Okuma: 1.5 saat • Mini task: 1.5 saat • Test: yok • Toplam: ~3 saat
+Okuma: 1.5 saat • Kendini Sına: 30 dk • Pratik (opsiyonel): 2-3 saat • Toplam: ~2.5 saat (+ pratik)
 
 ## Önbilgi
 
@@ -20,7 +28,7 @@ Okuma: 1.5 saat • Mini task: 1.5 saat • Test: yok • Toplam: ~3 saat
 
 ### 1. Decomposition kararı — kriter matrisi
 
-Bir feature/modül microservice mi olsun, monolit içinde mi kalsın?
+Monoliti neye göre böleceğin belirsizse her modülü tek tek "ayrılmayı hak ediyor mu?" diye sınamalısın. **Decomposition kararı** = bir feature/modülün ayrı bir microservice mi olacağı yoksa monolit içinde mi kalacağı sorusu. Cevabı hisle değil, kriter matrisiyle verirsin.
 
 | Kriter | Microservice ayır | Birleşik tut |
 |---|---|---|
@@ -32,141 +40,126 @@ Bir feature/modül microservice mi olsun, monolit içinde mi kalsın?
 | Aynı transaction boundary | — | ✓ |
 | Latency hassas (sync call) | — | ✓ |
 | Farklı tech stack ihtiyacı | ✓ | — |
-| Domain'in **stabil** çekirdek parçası | ? | bağımlı |
+| Domain'in stabil çekirdek parçası | ? | bağımlı |
 | External dependency (vendor) | ✓ (ACL) | — |
 | Düşük volume + basit logic | — | ✓ |
 
-**Karar:**
-- 3+ "✓" → microservice
-- 3+ "Birleşik" → modüler monolit
-- Mixed → tartış, **erkenden ayırma**
+Karar kuralı basit: 3+ "✓" → microservice; 3+ "Birleşik" → modüler monolit; karışıksa tartış ve **erkenden ayırma**.
+
+```admonish tip title="Erken ayırmanın maliyeti"
+Sınırların yanlış çizildiğini ancak domain oturunca anlarsın. Emin değilken monolit içinde modül olarak tut — modülü servise terfi ettirmek, iki servisi geri birleştirmekten çok daha ucuzdur.
+```
 
 ### 2. Banking — neden 4 servis
 
-`core-banking` monolit'inden 4 servise bölme rasyoneli:
+Kriter matrisini `core-banking` monolitine uygulayınca 4 servis çıkar. Her birinin ayrılma gerekçesi farklı; ezberleme, **why**'ını kavra.
 
 #### account-service
 
-**Sorumluluk:**
-- Account aggregate (open, close, balance, status)
-- JournalEntry + JournalLine (double-entry ledger)
-- Balance reconciliation primitive
-- gRPC `debit`, `credit`, `getBalance` internal API
-- REST API `/accounts` CRUD
+Sorumluluğu **Account aggregate** (open, close, balance, status), double-entry ledger (JournalEntry + JournalLine) ve balance reconciliation. Dışa REST `/accounts` CRUD, içe gRPC `debit` / `credit` / `getBalance` verir.
 
-**Neden ayrı:**
-- **Scaling pattern:** Read-heavy (10:1 read:write) — caching, replica
+Neden ayrı:
+- **Scaling pattern:** Read-heavy (10:1 read:write) — caching + replica ister
 - **Stability:** Account domain çok stabil, nadiren değişir
-- **Authority:** Bakiyenin **tek kaynağı**. Cross-service'lerden referans nokta.
-- **Performance critical:** Her transfer çağrı yapacak → düşük latency
+- **Authority:** Bakiyenin tek kaynağı; her servis buraya referans verir
+- **Performance critical:** Her transfer buraya çağrı yapacak → düşük latency şart
 
-**Tech:**
-- Spring Boot + Postgres (Oracle migration sonrası)
-- HikariCP optimized (Phase 2)
-- gRPC for internal calls (performance)
-- REST for external
+Tech: Spring Boot + Postgres, HikariCP optimized (Phase 2), internal gRPC, external REST.
 
 #### transfer-service
 
-**Sorumluluk:**
-- Transfer aggregate (orchestration)
-- Idempotency-Key handling
-- Saga coordinator (cross-bank)
-- account-service'i çağırır
-- fraud-service'i çağırır (pre-check)
-- Outbox event publish (Phase 6)
+Sorumluluğu **Transfer aggregate** orchestration'ı: Idempotency-Key handling, saga coordinator (cross-bank), account ve fraud servislerini çağırma, outbox event publish (Phase 6).
 
-**Neden ayrı:**
+Neden ayrı:
 - **Volatility:** Transfer logic sık değişir (yeni transfer tipleri, regulatory)
-- **Saga state:** Stateful, dedicated
+- **Saga state:** Stateful ve dedicated
 - **Compute heavy:** Multi-step orchestration
-- **Business critical:** Ayrı release & monitoring
+- **Business critical:** Ayrı release & monitoring gerekir
 
-**Tech:**
-- Spring Boot + Postgres
-- Saga orchestrator (Phase 6 Topic 6.7)
-- Kafka producer (outbox)
+Tech: Spring Boot + Postgres, saga orchestrator (Topic 6.7), Kafka producer (outbox).
 
 #### fraud-service
 
-**Sorumluluk:**
-- Fraud rule engine
-- Kafka Streams real-time scoring (Phase 6)
-- transfer-service tarafından sync `scoreTransfer(transfer)` çağrılır
-- async event-based scoring
-- Alert generation
+Sorumluluğu fraud rule engine, Kafka Streams real-time scoring, transfer-service'ten sync `scoreTransfer(...)` çağrısı, async event-based scoring ve alert generation.
 
-**Neden ayrı:**
-- **Different scaling:** CPU-heavy (rule evaluation)
+Neden ayrı:
+- **Different scaling:** CPU-heavy rule evaluation
 - **Different tech:** Kafka Streams stateful
 - **ML potential:** Sonradan ML model eklenebilir, ayrı stack
 - **Compliance:** Fraud team ayrı, ayrı release control
 
-**Tech:**
-- Spring Boot + Kafka Streams
-- Read replica (account info için)
-- Stateful (Kafka Streams state store + RocksDB)
+Tech: Spring Boot + Kafka Streams, read replica (account info), stateful state store (RocksDB).
 
 #### notification-service
 
-**Sorumluluk:**
-- SMS, email, push gateway entegrasyonu
-- Notification queue (Kafka consumer)
-- Idempotent delivery
-- Template management
-- Retry + DLT
+Sorumluluğu SMS/email/push gateway entegrasyonu, Kafka consumer notification queue, idempotent delivery, template management, retry + DLT.
 
-**Neden ayrı:**
-- **External dependency:** SMS gateway (multiple providers)
+Neden ayrı:
+- **External dependency:** Birden çok SMS gateway sağlayıcısı
 - **Independent failure:** SMS gateway down → diğer servisler etkilenmesin
-- **High throughput:** Parallel consumer threads
+- **High throughput:** Parallel consumer thread'ler
 - **Simple domain:** Stateless processing
 
-**Tech:**
-- Spring Boot + Kafka consumer
-- ResilientExternalGateway (Phase 7 Topic 5)
+Tech: Spring Boot + Kafka consumer, ResilientExternalGateway (Topic 7.5).
 
 ### 3. Hangi feature'ları ayırma — banking örnek
 
-#### Ayırma:
-- **Authentication** → auth-service ya da **Keycloak** (vendor)
+Aynı matrisi 4 servisin ötesindeki modüllere uygulayınca bazıları servis, bazıları shared library ya da aggregate içi kalır. Karar netliği için iki listeye ayır.
+
+Ayır:
+- **Authentication** → auth-service ya da Keycloak (vendor, generic subdomain)
 - **Audit** → audit-service (centralized regulatory)
 - **Reporting** → reporting-service (read replica, CQRS)
 - **Customer KYC** → customer-service (compliance ekibi)
 
-#### Birleşik tut:
-- **Money + Currency value objects** → shared library (`banking-commons`)
+Birleşik tut:
+- **Money + Currency** value object'leri → shared library (`banking-commons`)
 - **Account + JournalEntry + JournalLine** → account-service içinde (aggregate boundary)
 - **TransferRequest + Transfer + IdempotencyKey** → transfer-service içinde
 
+Tuzak: "her şey servis olsun" cazip gelir; oysa bir value object'i ya da aggregate'ı bölmek sadece complexity ekler, hiçbir bağımsızlık kazandırmaz.
+
 ### 4. Database per service
 
-**Kural:** Her servis kendi DB schema'sını sahiplenir.
+Servisleri böldün ama hâlâ tek DB'yi paylaşıyorlarsa hiçbir şey kazanmadın. **Database per service** = her servis kendi DB schema'sını sahiplenir, başka servis o schema'ya doğrudan dokunamaz.
 
 ```
-account-service     → account_db   (accounts, journal_entries, journal_lines)
-transfer-service    → transfer_db  (transfers, saga_states, idempotency_keys, outbox_events)
-fraud-service       → fraud_db     (fraud_rules, fraud_scores, fraud_alerts)
-                                    + Kafka Streams state store
-notification-service → notification_db (notification_log, processed_events)
-audit-service       → audit_db     (audit_records — regulatory immutable)
+account-service      → account_db       accounts, journal_entries, journal_lines
+transfer-service     → transfer_db      transfers, saga_states, idempotency_keys, outbox_events
+fraud-service        → fraud_db         fraud_rules, fraud_scores, fraud_alerts + Kafka Streams state
+notification-service → notification_db  notification_log, processed_events
+audit-service        → audit_db         audit_records (regulatory immutable)
 ```
 
-**Faydaları:**
-- **Data sovereignty** — her servis kendi schema'sını migrate eder, evolve eder
-- **Schema değişiklik impact** — sadece o servis
-- **Failure isolation** — bir DB down → bir servis affected
-- **Polyglot persistence** — fraud için Cassandra, audit için BigQuery (eğer gerekirse)
+Bu ayrım **data sovereignty** kazandırır — her servis kendi schema'sını bağımsız migrate ve evolve eder:
+
+```mermaid
+flowchart LR
+    Mono["core-banking monolit"] --> A["account-service"]
+    Mono --> T["transfer-service"]
+    Mono --> F["fraud-service"]
+    Mono --> N["notification-service"]
+    A --> ADB["account_db"]
+    T --> TDB["transfer_db"]
+    F --> FDB["fraud_db"]
+    N --> NDB["notification_db"]
+```
+
+Faydaları dört başlıkta toplanır: her schema değişikliği sadece o servisi etkiler, bir DB down olunca sadece bir servis düşer (failure isolation), ve gerekirse polyglot persistence (fraud için Cassandra, audit için BigQuery) serbest kalır.
+
+<mark>Her servis kendi DB'sini sahiplenir; başka bir servisin tablosuna doğrudan JOIN atmak yasaktır.</mark>
 
 #### Cross-service data access
 
-**Yöntem 1: Sync HTTP/gRPC call**
+Peki bir servis başka servisin verisine ihtiyaç duyunca ne yapar? İki yol var.
+
+Yöntem 1 — sync HTTP/gRPC call: veriyi anlık, network üzerinden iste.
 
 ```java
 @Service
 public class TransferService {
     @Autowired AccountServiceClient accountClient;
-    
+
     public Transfer execute(TransferRequest req) {
         Account from = accountClient.getById(req.fromAccountId());   // network call
         // ...
@@ -174,9 +167,9 @@ public class TransferService {
 }
 ```
 
-**Trade-off:** Latency + failure cascade riski. Resilience4j (Topic 7.5) ile mitigate.
+Trade-off: latency + failure cascade riski. Resilience4j (Topic 7.5) ile mitigate edilir.
 
-**Yöntem 2: Async event + local read model**
+Yöntem 2 — async event + local read model: veriyi event'le dinle, kendi DB'nde tut.
 
 ```java
 // account-service publishes
@@ -187,85 +180,67 @@ kafka.send("banking.accounts.updated", accountUpdatedEvent);
 public void onAccountUpdated(AccountUpdatedEvent event) {
     accountReadModel.upsert(event);   // local DB
 }
-
-// Transfer logic
-public Transfer execute(req) {
-    Account from = accountReadModel.findById(req.fromAccountId());   // local read
-}
 ```
 
-**Trade-off:** Eventual consistency, local read model maintenance.
-
-**Banking pratiği:**
-- **Real-time critical** (debit/credit) → sync gRPC + circuit breaker
-- **Reference data** (account info display) → local read model
-- **Bulk/reporting** → CQRS read replica
+Trade-off: eventual consistency ve local read model bakım maliyeti. Banking pratiğinde seçim ihtiyaca göre: real-time critical (debit/credit) → sync gRPC + circuit breaker; reference data (account info gösterimi) → local read model; bulk/reporting → CQRS read replica.
 
 ### 5. Anti-pattern: Shared database
 
-```
-account-service    →┐
-                    ├→ shared_banking_db (accounts, transfers, audit, vb.)
-transfer-service   →┤
-                    │
-audit-service      →┘
+Database per service'in tam tersi, en yaygın hatadır: birden çok servis tek DB'yi paylaşır.
+
+```mermaid
+flowchart LR
+    A["account-service"] --> S["shared_banking_db"]
+    T["transfer-service"] --> S
+    Au["audit-service"] --> S
 ```
 
-**Sorunlar:**
-- Schema değişikliği **tüm servisleri** etkiler
-- Coordination overhead — release cycle birbirine bağlanır
-- Data sovereignty yok
-- "Distributed monolith" oluşur
+Sorun şu: bir schema değişikliği **tüm** servisleri etkiler, release cycle'lar birbirine kilitlenir, data sovereignty kaybolur ve elinde adı "microservice" olan bir distributed monolith kalır.
 
-**Banking için YASAK.** Her servis kendi DB'si.
+```admonish warning title="Shared DB banking için yasak"
+Tek DB'yi paylaşan servisler bağımsız deploy edilemez — biri schema değiştirdiğinde diğerleri kırılır. Banking'de her servis kendi DB'sine sahiptir; veri paylaşımı sadece API veya event üzerinden yapılır, asla ortak tablo üzerinden.
+```
 
 ### 6. Distributed monolith — büyük tuzak
 
-3 yıl önce **monolit**. Bugün 10 servise böldün. Hâlâ aynı **monolit-like** problemler:
+3 yıl önce monolittin, bugün 10 servise böldün — ama hâlâ aynı acıyı çekiyorsan bir **distributed monolith** ürettin demektir. Bu, microservice'in avantajını (bağımsız deploy) vermeyen ama distributed sistemin tüm complexity'sini getiren en pahalı tuzaktır.
 
-**Belirtileri:**
+Belirtileri:
 - Bir feature için 5+ servis aynı anda deploy
-- Bir servisin fail'i diğer 9'unu etkiliyor
+- Bir servisin fail'i diğer 9'unu düşürüyor
 - Cross-service sync HTTP call zinciri (5+ hop)
 - Shared library version mismatch hell
-- Cross-service transaction (manual orchestration veya 2PC)
+- Cross-service transaction (manuel orchestration veya 2PC)
 
-**Sebepler:**
-- Yanlış decomposition (yanlış sınırlar)
-- Sync HTTP heavy usage
-- Shared DB veya shared mutable state
-- Versioned shared library zorla
+Sebepleri genelde ya yanlış decomposition (yanlış sınırlar), ya sync HTTP'nin aşırı kullanımı, ya shared DB / shared mutable state, ya da zorla dayatılan versioned shared library'dir.
 
-**Çözüm:**
-- Bounded context'leri yeniden çiz (DDD strategic)
-- Sync HTTP → async event (Topic 6.6 outbox)
-- Resilience pattern (Topic 7.5)
-- API versioning + contract testing (Topic 12.5)
+Çözüm: bounded context'leri yeniden çiz (DDD strategic), sync HTTP'yi async event'e taşı (Topic 6.6 outbox), resilience pattern uygula (Topic 7.5) ve API versioning + contract testing (Topic 12.5) ekle.
+
+```admonish warning title="Servis sayısı başarı ölçütü değildir"
+"10 microservice'imiz var" demek mühendislik zaferi değildir. Ölçüt bağımsız deploy edilebilirliktir: bir servisi tek başına deploy edip diğerlerini bozmuyorsan microservice'sin; edemiyorsan distributed monolith.
+```
 
 ### 7. Shared library vs duplication
 
-**Banking shared concepts:** Money, Currency, AccountId, OwnerId, TransferId.
+Money, Currency, AccountId gibi kavramlar her serviste geçer. Bunları paylaşmak (shared library) mı yoksa her serviste kopyalamak (duplication) mı? Yanlış karar ya drift ya version-lock acısı doğurur.
 
-#### Yaklaşım A: Shared library
+Yaklaşım A — **shared library**: ortak kod tek Maven module'de.
 
 ```
 banking-commons (Maven module)
 ├── Money.java
 ├── Currency.java
 ├── AccountId.java
-├── ...
 └── pom.xml (versioned)
 
-account-service depends on banking-commons:1.2.0
-transfer-service depends on banking-commons:1.2.0
-fraud-service depends on banking-commons:1.2.0
+account-service  → banking-commons:1.2.0
+transfer-service → banking-commons:1.2.0
+fraud-service    → banking-commons:1.2.0
 ```
 
-**Avantaj:** Tek kaynak, type safety, no duplication.
+Avantajı tek kaynak + type safety; dezavantajı version coordination — her upgrade tüm servisleri etkiler.
 
-**Dezavantaj:** Version coordination. Her library upgrade tüm servisleri etkiler.
-
-#### Yaklaşım B: Duplication
+Yaklaşım B — **duplication**: her serviste kendi kopyası.
 
 ```
 account-service/Money.java
@@ -273,26 +248,17 @@ transfer-service/Money.java   (kopya)
 fraud-service/Money.java      (kopya)
 ```
 
-**Avantaj:** Servisler bağımsız evolve eder.
+Avantajı servislerin bağımsız evolve edebilmesi; dezavantajı drift riski ve bug fix'in N kez tekrarı.
 
-**Dezavantaj:** Drift riski, bug fix N kez tekrarlanır.
+Pragmatik banking kararı: stable value object'ler (Money, Currency) → shared library; domain entity'ler (Account, Transfer) → her servisin kendi tanımı (DDD bounded context); DTO/event format → published language (Avro schema registry).
 
-#### Pragmatik karar
-
-**Banking:**
-- **Stable value objects** (Money, Currency) → shared library
-- **Domain entities** (Account, Transfer) → her servisin kendi tanımı (DDD bounded context)
-- **DTO / event format** → published language (Avro schema registry)
-
-`banking-commons` minimal: sadece truly stable value object'ler. Domain logic yok.
+<mark>banking-commons minimal kalır: sadece truly stable value object'ler girer, domain logic asla.</mark>
 
 ### 8. Cross-service contract
 
-İki servis arası **kontrat** — değişiklikler ikinci tarafı kırmamalı.
+İki servis konuşuyorsa aralarında bir **contract** vardır — bir tarafın değişikliği diğerini kırmamalıdır. Contract'ın üç tipi banking'de üç farklı yerde kullanılır.
 
-**Tipi:**
-
-#### REST OpenAPI spec
+REST OpenAPI spec — public sync API için, generated client + server stub üretir:
 
 ```yaml
 openapi: 3.0.0
@@ -300,7 +266,6 @@ info: { title: Account Service }
 paths:
   /accounts/{id}:
     get:
-      parameters: [{ name: id, in: path, schema: { type: string } }]
       responses:
         "200":
           content:
@@ -308,9 +273,7 @@ paths:
               schema: { $ref: "#/components/schemas/Account" }
 ```
 
-Generated client + server stubs.
-
-#### gRPC .proto
+gRPC .proto — internal sync call için, type-safe code generation:
 
 ```protobuf
 syntax = "proto3";
@@ -320,118 +283,80 @@ service AccountService {
 }
 ```
 
-Type-safe code generation. Banking için sync inter-service genelde gRPC.
-
-#### Avro/Protobuf event schema
+Avro/Protobuf event schema — async event için, Schema Registry (Phase 6) producer/consumer compatibility'yi denetler:
 
 ```json
 {
   "type": "record",
   "name": "TransferCompleted",
-  "fields": [...]
+  "fields": []
 }
 ```
 
-Schema Registry (Phase 6). Producer + consumer compatibility check.
+Banking pratiği net: internal sync → gRPC, public sync → REST OpenAPI, async event → Avro + Schema Registry.
 
-**Banking pratiği:**
-- Internal sync: gRPC
-- Public sync: REST OpenAPI
-- Async events: Avro + Schema Registry
+### 9. Contract testing
 
-### 9. Contract testing (Phase 12 referansı)
-
-Provider değişimi consumer'ı kırmaz garantisi. Spring Cloud Contract veya Pact (Phase 12 Topic 5).
-
-Banking pratiği: CI'da contract test gate. Provider değişikliği önce.
+Contract'ı yazmak yetmez; provider değişikliğinin consumer'ı kırmadığını **garanti** etmen gerekir. Contract testing bunu CI'da yapar: Spring Cloud Contract veya Pact ile (Phase 12 Topic 5) provider değişikliği önce test gate'inden geçer. Provider consumer'ı sessizce kıramaz.
 
 ### 10. Decomposition strategies
 
-#### Strategy 1: Decompose by Business Capability
+Monoliti hangi eksende böleceğin dört stratejiden birine dayanır; banking pratiği bunları harmanlar.
 
-İş yetkinliği ekseninde. Banking'de:
-- Account management
-- Transfer
-- Card management
-- Loan
-- Customer (KYC)
-- Audit
-- Fraud
-- Notification
+```mermaid
+flowchart LR
+    D["Decomposition ekseni"] --> BC["by Business Capability"]
+    D --> SD["by Subdomain"]
+    D --> AG["by Aggregate"]
+    D --> TM["by Team"]
+    BC --> P["Banking primary"]
+    TM --> R["realistic constraint"]
+```
 
-**En yaygın** ve **DDD bounded context** ile uyumlu.
+**Strategy 1 — by Business Capability:** İş yetkinliği ekseninde böl (account management, transfer, card, loan, KYC, audit, fraud, notification). En yaygın strateji ve DDD bounded context ile birebir uyumlu.
 
-#### Strategy 2: Decompose by Subdomain
+**Strategy 2 — by Subdomain:** Eric Evans DDD ekseni. Core subdomain (lending algorithms, fraud detection) → own implementation; supporting (customer mgmt, KYC) → kendi yapımı veya partial vendor; generic (auth, logging) → vendor (Auth0, Datadog).
 
-Eric Evans DDD:
-- **Core subdomain:** Differentiating value (banking için: lending algorithms, fraud detection)
-- **Supporting subdomain:** Core'u destekleyen ama differentiating değil (customer mgmt, KYC)
-- **Generic subdomain:** Off-the-shelf alınabilir (auth, logging, monitoring)
+**Strategy 3 — by Aggregate:** Her aggregate ayrı servis (1:1). Aşırı granular — micro-microservice'ler, operational nightmare. Kaçın.
 
-Banking strateji:
-- Core → **own implementation** (kompetitif avantaj)
-- Supporting → **kendi yapımı** veya partial vendor
-- Generic → **vendor** (Auth0, Datadog, vb.)
+**Strategy 4 — by Team:** Conway's Law — sistem organizasyon yapısını yansıtır, team başına servis. Banking'de realistic constraint; team size 5-9 (two-pizza rule).
 
-#### Strategy 3: Decompose by Aggregate
-
-Her aggregate ayrı servis (1:1). Aşırı granular — micro-microservices, operational nightmare.
-
-#### Strategy 4: Decompose by Team
-
-Conway's Law: Sistemler organizasyon yapısını yansıtır. Team başına servis.
-
-Banking realistic constraint. Team size 5-9 (two-pizza rule).
-
-**Pragmatik karar:** Business capability primary, team constraint realistic.
+Pragmatik karar: **business capability primary**, team constraint realistic düzeltici olarak devreye girer.
 
 ### 11. Strangler Fig pattern — kademeli migration
 
-Banking gerçeği: monolitten "big bang" rewrite **YASAK** (regulatory, business continuity).
-
-Strangler Fig:
+Banking'de monolitten "big bang" rewrite regulatory ve business continuity nedeniyle imkânsızdır. **Strangler Fig** = eski sistemi bir gecede değil, yeni servisleri etrafına sararak kademeli boğma pattern'i.
 
 ```
-Phase 0: Monolit (legacy core banking system)
-
+Phase 0: Monolit (legacy core banking)
 Phase 1: API Gateway koy, traffic monolit'e route
-         + Yeni feature → microservice yaz, Gateway route
-
-Phase 2: Eski feature'ları **kademeli** migrate
-         Read-only first (CQRS-like)
-         Sonra write paths
-         Monolit'in o özelliği decommission
-
-Phase 3: Monolit küçülür, sonunda decommission
+         + Yeni feature → microservice, Gateway route
+Phase 2: Eski feature'ları kademeli migrate — read-only first (CQRS-like),
+         sonra write path, sonra monolitte o özelliği decommission
+Phase 3: Monolit küçülür, sonunda tamamen decommission
 ```
 
-**Banking örnek:**
+Gerçek bir banking timeline'ı:
 
 ```
 2020: Legacy core banking (COBOL on mainframe)
-2022: API Gateway. Yeni mobile API endpoint'leri → microservice
-      Eski branch terminal → legacy
+2022: API Gateway. Yeni mobile API → microservice, eski branch terminal → legacy
 2024: Account read → microservice. Account write → hâlâ legacy
-2025: Transfer microservice. Legacy decommission timeline 2027
+2025: Transfer microservice. Legacy decommission hedefi 2027
 ```
 
-**Banking için Strangler Fig standart.** Regulatory bunu zorunlu kılar.
+<mark>Banking'de big-bang rewrite yasaktır; Strangler Fig regulatory tarafından fiilen zorunlu kılınır.</mark>
 
-### 12. Service boundaries — ne **birleşik tut**
+### 12. Service boundaries — neyi birleşik tut
 
-Microservice yarış kazanmak değil. Bazı şeyler birleşik kalmalı:
-
-#### Aggregate consistency boundary
-
-Account + JournalEntry + JournalLine **tek aggregate**. Same DB, same transaction:
+Microservice bir yarış değil; bazı şeyler bölünürse zarar görür. En kritik kural aggregate consistency boundary'sidir: **Account + JournalEntry + JournalLine tek aggregate'tir**, aynı DB ve aynı transaction'da kalmalıdır.
 
 ```java
 @Transactional
 public Transfer execute(...) {
     Account from = accountRepo.findByIdAndLock(...);
-    Account to = accountRepo.findByIdAndLock(...);
-    
-    // Same TX:
+    Account to   = accountRepo.findByIdAndLock(...);
+
     journalEntryRepo.save(new JournalEntry(...));
     journalLineRepo.save(new JournalLine(from, DEBIT, amount));
     journalLineRepo.save(new JournalLine(to, CREDIT, amount));
@@ -440,107 +365,76 @@ public Transfer execute(...) {
 }
 ```
 
-İki ayrı servis (`account-service` ve `journal-service`) yapma — distributed transaction'a düşersin.
+Bunu iki servise (`account-service` + `journal-service`) bölersen tek transaction'ı distributed transaction'a çevirirsin — saga, 2PC, tutarlılık acısı. İkinci kural coupling'dir: iki modül her PR'da birlikte değişiyorsa aslında **aynı domain**'dir, birleşik tut.
 
-#### Tight coupling = same service
-
-Module A ve B sürekli birlikte değişiyor (her PR ikisini de modify) → **aslında aynı domain**. Birleşik tut.
+<mark>Aggregate consistency boundary'sini iki servise bölme — atomik double-entry'yi distributed transaction'a düşürürsün.</mark>
 
 ### 13. Service granularity — sweet spot
 
-**Çok büyük (monolit):** Tüm sorunlar, hiçbir avantaj.
+Servis boyutunda iki uç da tehlikelidir. Çok büyük (monolit) tüm sorunları taşır, hiçbir avantaj vermez. Çok küçük (**nano-service**) operational nightmare doğurur: 100 servis = 100 K8s deployment, 100 CI pipeline, 100 monitoring config.
 
-**Çok küçük (nano-service):** Operational nightmare. 100 servis → 100 K8s deployment, 100 CI pipeline, 100 monitoring config.
-
-**Sweet spot (banking):**
+Banking için sweet spot:
 - 4-12 service
-- Her servis 5-9 developer kapsamında
+- Her servis 5-9 developer kapsamında (two-pizza)
 - Her servis 1-2 aggregate
-- Her servis bağımsız deploy edilebilir
-- Her servis kendi DB
+- Her servis bağımsız deploy edilebilir ve kendi DB'sine sahip
+
+```admonish tip title="Doğru boyutu sınama"
+Bir servisi "tek başına anlamlı bir iş yapıyor mu ve tek team sahiplenebiliyor mu?" diye sorgula. `user-name-service` + `user-email-service` + `user-phone-service` üçü tek `customer-service` olmalıdır — attribute başına servis nano-service anti-pattern'idir.
+```
 
 ### 14. Banking örnek — full decomposition map
 
-```
-Internet
-   ↓
-[API Gateway]   ← Spring Cloud Gateway, JWT auth, rate limiting
-   ↓
-┌────────────┬────────────┬────────────┬────────────┐
-│ account    │ transfer   │ fraud      │ notification│
-│ service    │ service    │ service    │ service    │
-└─────┬──────┴─────┬──────┴─────┬──────┴─────┬──────┘
-      ↓            ↓            ↓            ↓
-   account_db  transfer_db  fraud_db   notification_db
-      ↑            ↓            ↓            ↓
-      ↑       Kafka (banking.transfers)
-      ↑            ↓
-      └────────────┘
-        async event flow
+Her şeyi bir araya koyunca resim şudur: API Gateway trafiği 4 servise dağıtır, her servis kendi DB'sine sahiptir, servisler arası async akış Kafka üzerinden gider.
 
-External:
-[Keycloak]    ← OAuth2 / OIDC
-[Schema Registry]
-[Prometheus + Grafana + Jaeger]
-[Kafka Connect + Debezium]   ← Outbox CDC
+```mermaid
+flowchart TD
+    GW["API Gateway"]
+    subgraph Servisler
+        A["account-service"]
+        T["transfer-service"]
+        F["fraud-service"]
+        N["notification-service"]
+    end
+    subgraph Veri
+        ADB["account_db"]
+        TDB["transfer_db"]
+        FDB["fraud_db"]
+        NDB["notification_db"]
+    end
+    K["Kafka"]
+    GW --> A
+    GW --> T
+    GW --> F
+    GW --> N
+    A --> ADB
+    T --> TDB
+    F --> FDB
+    N --> NDB
+    T -.-> K
+    K -.-> F
+    K -.-> N
 ```
+
+Kenarda external bileşenler durur: Keycloak (OAuth2/OIDC), Schema Registry, gözlemlenebilirlik (Prometheus + Grafana + Jaeger) ve outbox CDC için Kafka Connect + Debezium.
 
 ### 15. Banking anti-pattern'leri
 
-**Anti-pattern 1: Shared DB across services**
+"Bu tasarımda ne yanlış?" sorusunun cephaneliği burasıdır. Yedi klasik:
 
-```
-account-service →┐
-                 ├→ shared_db
-transfer-service →┘
-```
+**Anti-pattern 1 — Shared DB across services:** Ortak DB coupling ve deploy interdependence doğurur. Yasak (Bölüm 5).
 
-Coupling, deploy interdependence. **YASAK.**
+**Anti-pattern 2 — Sync HTTP chain (3+ hop):** `Gateway → transfer → account → fraud → KKB` gibi 5 sync call zinciri; bir tanesi fail → tümü fail, round-trip × N. Çözüm: bazı çağrıları async event'e çevir, local read model kullan.
 
-**Anti-pattern 2: Sync HTTP chain (3+ hop)**
+**Anti-pattern 3 — Distributed monolith:** 10 servis ama hepsi aynı release cycle'da, sync HTTP heavy, shared library lock. Microservice avantajı yok, complexity var (Bölüm 6).
 
-```
-Gateway → transfer-service → account-service → fraud-service → KKB
-```
+**Anti-pattern 4 — Nano-service:** `user-name-service`, `user-email-service`, `user-phone-service` gibi attribute başına servis. Çözüm: tek `customer-service`.
 
-5 sync call. Bir tane fail → tümü fail. Network round-trip × N.
+**Anti-pattern 5 — Big-bang decomposition:** Bir gecede monolitten 10 servise. Banking için yasak; Strangler Fig zorunlu (Bölüm 11).
 
-**Çözüm:** Bazı çağrıları async event'e çevir. Local read model.
+**Anti-pattern 6 — Tek developer'ın 5 servisi:** Conway's Law'a aykırı. Servis sınırları team sınırını yansıtmalı.
 
-**Anti-pattern 3: Distributed monolith**
-
-10 servis, ama hepsi aynı release cycle'da, sync HTTP heavy, shared library lock. Microservice avantajı yok, monolit dezavantajı + distributed sistem complexity.
-
-**Anti-pattern 4: Nano-service**
-
-```
-- user-name-service    (sadece user name CRUD)
-- user-email-service   (sadece email)
-- user-phone-service   (sadece phone)
-```
-
-Aşırı granular. Operational nightmare.
-
-**Çözüm:** `customer-service` tek (her customer attribute orada).
-
-**Anti-pattern 5: Big-bang decomposition**
-
-Bir gecede monolitten 10 servise. Banking için **YASAK** (regulatory + business continuity). Strangler fig.
-
-**Anti-pattern 6: Tek developer'ın 5 servisi**
-
-Conway's Law. Servis sınırları team sınırını yansıtsın.
-
-**Anti-pattern 7: Database in service container**
-
-```yaml
-service: account-service
-  containers:
-    - app
-    - postgres   # ❌ DB internal
-```
-
-Stateful service, scale impossible. DB **ayrı** managed (RDS, Cloud SQL).
+**Anti-pattern 7 — DB in service container:** Postgres'i uygulama container'ının içine koymak servisi stateful yapar, scale imkânsızlaşır. DB ayrı managed olmalı (RDS, Cloud SQL).
 
 ---
 
@@ -548,132 +442,171 @@ Stateful service, scale impossible. DB **ayrı** managed (RDS, Cloud SQL).
 
 - "Microservices Patterns" (Chris Richardson) — Chapter 2 (Decomposition)
 - "Building Microservices" (Sam Newman, 2nd Ed)
-- Martin Fowler's microservices articles
-- Eric Evans DDD blue book — strategic design chapter
+- "Monolith to Microservices" (Sam Newman) — Strangler Fig detayları
+- Martin Fowler — microservices makaleleri
+- Eric Evans DDD blue book — strategic design bölümü
 - Vaughn Vernon — Strategic DDD
-- Sam Newman — "Monolith to Microservices" book
-- Netflix tech blog — decomposition stories
+- Netflix tech blog — decomposition hikâyeleri
 
 ---
 
-## Mini task'ler
+## Kendini Sına
 
-### Task 7.2.1 — Decomposition decision matrix (30 dk)
+Aşağıdaki soruları önce **cevaba bakmadan** kendi cümlelerinle yanıtlamayı dene — hepsi TR bank mülakatlarında karşına çıkabilecek tarzda. Takıldığın soru olursa ilgili Kavramlar başlığına dön, sonra tekrar dene.
 
-`core-banking`'in her modülü için tablo:
+**S1. Distributed monolith nedir, belirtileri neler ve nasıl kaçınırsın?**
 
-| Modül | Team | Release cycle | Scaling | Coupling | Karar |
-|---|---|---|---|---|---|
-| Account | A | weekly | read-heavy | low | own service |
-| Transfer | B | weekly | write-heavy | medium | own service |
-| Money | — | stable | — | high | shared library |
-| Audit | C | rare | append-only | low | own service |
-| Customer | D | weekly | mixed | medium | own service |
+<details>
+<summary>Cevabı göster</summary>
 
-10+ modül için karar gerekçeli yaz. **Defterimde** bu tablo.
+Distributed monolith, monoliti servislere böldüğün halde bağımsız deploy edilebilirlik kazanamadığın durumdur — microservice'in avantajını vermez ama distributed sistemin tüm complexity'sini getirir. Belirtileri: bir feature için 5+ servisin aynı anda deploy edilmesi, bir servisin fail'inin diğerlerini düşürmesi, 5+ hop'luk sync HTTP zincirleri, shared library version mismatch ve cross-service transaction.
 
-### Task 7.2.2 — Maven multi-module setup (45 dk)
+Sebepleri yanlış decomposition (yanlış sınırlar), aşırı sync HTTP, shared DB/shared state ve dayatılan versioned shared library'dir. Kaçınmak için bounded context'leri DDD ile yeniden çiz, sync HTTP'yi async event'e (outbox) taşı, resilience pattern ekle ve API versioning + contract testing uygula. Ölçüt tektir: bir servisi diğerlerini bozmadan tek başına deploy edebiliyor musun?
 
-```
-core-banking-parent/
-├── pom.xml (parent)
-├── banking-commons/
-│   ├── pom.xml
-│   └── src/main/java/.../{Money, Currency, AccountId, OwnerId, ...}
-├── account-service/
-│   └── pom.xml (depends on banking-commons)
-├── transfer-service/
-│   └── pom.xml (depends on banking-commons)
-├── fraud-service/
-├── notification-service/
-└── api-gateway/
-```
+</details>
 
-`mvn install` çalışmalı. `account-service` `banking-commons.Money` import edebilmeli.
+**S2. Her microservice neden kendi DB'sine sahip olmalı? Shared DB'nin sakıncası ne?**
 
-### Task 7.2.3 — Database per service migration (45 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-Mevcut tek schema'dan 4 schema'ya bölme:
+Database per service, her servisin kendi schema'sını sahiplenmesi ve başka servisin oraya doğrudan dokunamamasıdır. Bu data sovereignty kazandırır: her servis kendi schema'sını bağımsız migrate ve evolve eder, bir schema değişikliği sadece o servisi etkiler, bir DB down olunca sadece bir servis düşer (failure isolation) ve gerekirse polyglot persistence serbesttir.
 
-```sql
-CREATE SCHEMA account_db;
-CREATE SCHEMA transfer_db;
-CREATE SCHEMA fraud_db;
-CREATE SCHEMA notification_db;
+Shared DB'nin sakıncası şu: tek schema'yı paylaşan servisler bağımsız deploy edilemez — biri tabloyu değiştirince diğerleri kırılır, release cycle'lar birbirine kilitlenir ve elinde bir distributed monolith kalır. Bu yüzden banking'de shared DB yasaktır; veri paylaşımı sadece API veya event üzerinden yapılır, asla ortak tablo üzerinden.
 
--- Account tables → account_db
-ALTER TABLE accounts SET SCHEMA account_db;
-ALTER TABLE journal_entries SET SCHEMA account_db;
-ALTER TABLE journal_lines SET SCHEMA account_db;
+</details>
 
--- Transfer tables → transfer_db
-ALTER TABLE transfers SET SCHEMA transfer_db;
-ALTER TABLE saga_states SET SCHEMA transfer_db;
-ALTER TABLE outbox_events SET SCHEMA transfer_db;
-ALTER TABLE idempotency_keys SET SCHEMA transfer_db;
+**S3. Monolitten microservice'e geçerken neyi MUTLAKA bölmemelisin?**
 
--- vs.
-```
+<details>
+<summary>Cevabı göster</summary>
 
-Flyway migration `V_split_schemas.sql`.
+Aggregate consistency boundary'sini bölmemelisin. Banking'de Account + JournalEntry + JournalLine tek bir aggregate'tir ve double-entry invariant'ı (toplam debit = toplam credit) tek bir atomik transaction'da korunmalıdır. Bunu `account-service` + `journal-service` diye bölersen tek `@Transactional`'ı distributed transaction'a çevirirsin — saga, 2PC ve tutarlılık acısı başlar.
 
-### Task 7.2.4 — Strangler fig planning (30 dk)
+İkinci olarak sürekli birlikte değişen modülleri bölmemelisin: iki modül her PR'da birlikte değişiyorsa aslında aynı domain'dir, yüksek coupling vardır, birleşik tutulmalıdır. Genel kural: aynı transaction boundary'sini, aynı aggregate'ı ve latency-hassas sync bağımlılığı olan parçaları birleşik tut.
 
-`core-banking` monolit'inden 4 servise migration planı:
+</details>
 
-**Sprint 1-2:** API Gateway + transfer-service ayır (yeni feature olduğu için)
-**Sprint 3-4:** notification-service ayır (consumer pattern, basit)
-**Sprint 5-7:** account-service ayır (en kritik, dikkat)
-**Sprint 8-9:** fraud-service ayır (Kafka Streams)
+**S4. Banking'de account, transfer, fraud ve notification neden ayrı servis? Her birinin gerekçesi ne?**
 
-Her sprint için: feature flag, rollback plan, parallel-run pattern.
+<details>
+<summary>Cevabı göster</summary>
 
-**Defterimde** sprint-by-sprint plan.
+account-service ayrıdır çünkü read-heavy (10:1) scaling ister, domain çok stabildir ve bakiyenin tek authority'sidir — her transfer buraya düşük latency'yle çağrı yapar. transfer-service ayrıdır çünkü logic sık değişir (volatility), stateful saga tutar, compute-heavy orchestration yapar ve ayrı release/monitoring ister.
 
-### Task 7.2.5 — Cross-service data access strategy (30 dk)
+fraud-service ayrıdır çünkü CPU-heavy rule evaluation farklı scaling ister, Kafka Streams stateful farklı bir stack'tir, sonradan ML modeli eklenebilir ve compliance ekibi ayrı release control ister. notification-service ayrıdır çünkü external SMS gateway bağımlılığı vardır, o gateway down olunca diğer servisleri etkilememesi gerekir (independent failure), high-throughput parallel processing yapar ve domain'i basit/stateless'tir.
 
-3 senaryo + strategy:
+</details>
 
-1. **Transfer servisi account balance bilmesi gerek:** sync gRPC + circuit breaker?
-2. **Audit servisi account name görmek istiyor (rapor):** async event + local read model?
-3. **Fraud servisi customer KYC status:** read replica veya sync gRPC?
+**S5. Bir servis başka servisin verisine ihtiyaç duyunca hangi stratejileri kullanırsın, ne zaman hangisi?**
 
-Her birinin trade-off'unu **defterimde** yaz.
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 7.2.6 — Distributed monolith risk assessment (30 dk)
+Üç strateji var. Sync HTTP/gRPC call anlık veriyi network üzerinden ister; latency ve failure cascade riski taşır, circuit breaker (Resilience4j) ile mitigate edilir. Async event + local read model, veriyi Kafka event'iyle dinleyip kendi DB'nde tutar; eventual consistency ve read model bakım maliyeti getirir. CQRS read replica, bulk ve reporting için ayrı bir okuma modeli sunar.
 
-Mevcut `core-banking`'i analiz et — distributed monolith'e döner mi?
+Banking'de seçim ihtiyaca göredir: real-time critical işler (debit/credit) → sync gRPC + circuit breaker; reference data gösterimi (account info) → async event + local read model; bulk/reporting → CQRS read replica. Kural: para hareketi kadar kritik olmayan referans veriyi sync çağrıyla çekme, event'le lokal tut.
 
-Checklist:
-- [ ] Bir feature için 3+ servis aynı anda deploy gerekiyor mu?
-- [ ] Sync HTTP chain 3+ hop var mı?
-- [ ] Shared library upgrade tüm servisleri etkileyecek mi?
-- [ ] Cross-service sync transaction'a ihtiyaç var mı?
+</details>
 
-Riskli yerleri **defterimde** mark et.
+**S6. Strangler Fig pattern nedir ve banking'de neden zorunludur?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Strangler Fig, monoliti bir gecede yeniden yazmak yerine yeni servisleri etrafına sararak kademeli boğma pattern'idir. Önce API Gateway konur ve trafik monolite route edilir; yeni feature'lar microservice olarak yazılır; eski feature'lar kademeli migrate edilir (önce read-only/CQRS-like, sonra write path); her migrate edilen özellik monolitten decommission edilir; monolit küçülüp sonunda tamamen kaldırılır.
+
+Banking'de zorunludur çünkü big-bang rewrite regulatory ve business continuity ile çelişir — canlı para sisteminde bir gecede geçiş yapıp riski göze alamazsın. Regulatory parallel-run, rollback ve kademeli geçiş ister; bu da fiilen Strangler Fig demektir. Tipik timeline yıllara yayılır (ör. 2020 legacy, 2022 gateway, 2025 transfer servisi, 2027 legacy decommission).
+
+</details>
+
+**S7. Shared library (banking-commons) yönetiminde neyi paylaşır, neyi paylaşmazsın?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Sadece truly stable value object'leri paylaşırsın: Money, Currency, AccountId gibi nadiren değişen, domain logic içermeyen tipler `banking-commons` module'üne girer. Bu tek kaynak + type safety verir, kopya drift'ini önler. banking-commons'ı minimal tutmak kritiktir — içine domain logic girerse her upgrade tüm servisleri version-lock'a sokar ve distributed monolith'e katkı yapar.
+
+Paylaşmadıkların: domain entity'leri (Account, Transfer) her servisin kendi bounded context'inde ayrı tanımlanır — aynı isim farklı serviste farklı anlam taşıyabilir. DTO/event formatları shared library yerine published language olarak Avro schema registry ile yönetilir. Alternatif duplication yaklaşımı servisleri bağımsız evolve ettirir ama bug fix'i N kez tekrarlatır; bu yüzden sadece stable value object'lerde shared library, gerisinde ayrık tanım tercih edilir.
+
+</details>
+
+**S8. Nano-service anti-pattern'i nedir ve service granularity sweet spot'u nerede?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Nano-service, servisleri gereğinden aşırı küçük parçalamaktır — örneğin `user-name-service`, `user-email-service`, `user-phone-service` gibi attribute başına servis. Sonuç operational nightmare'dir: 100 servis = 100 K8s deployment, 100 CI pipeline, 100 monitoring config; hiçbir servis tek başına anlamlı bir iş yapmaz. Çözüm bunları tek `customer-service`'te toplamaktır.
+
+Sweet spot banking için 4-12 servistir: her servis 5-9 developer kapsamında (two-pizza rule), 1-2 aggregate içerir, bağımsız deploy edilebilir ve kendi DB'sine sahiptir. Doğru boyutu sınamak için sor: bu servis tek başına anlamlı bir iş yapıyor mu ve tek bir team sahiplenebiliyor mu? İki uç da (monolit ve nano-service) kaçınılmalıdır.
+
+</details>
 
 ---
 
-## Test yazma rehberi
+## Tamamlama kriterleri
 
-Bu topic daha çok **architecture decision**. Test'ler ArchUnit (Topic 12.4) ile:
+- [ ] Decomposition kriter matrisini kullanarak bir modülün "ayır vs birleşik tut" kararını gerekçelendirebiliyorum
+- [ ] Banking 4-servis ayrımının her birinin rasyonelini (scaling, stability, coupling) söyleyebiliyorum
+- [ ] Database per service'in 4 avantajını ve shared DB'nin neden yasak olduğunu açıklayabiliyorum
+- [ ] Cross-service data access 3 stratejisini (sync gRPC, async event, CQRS) ne zaman seçeceğimi biliyorum
+- [ ] Distributed monolith'in belirtilerini ve çözümünü sayabiliyorum
+- [ ] Strangler Fig'in neden banking için zorunlu olduğunu anlatabiliyorum
+- [ ] Aggregate consistency boundary'sinin (account + journal) neden bölünmemesi gerektiğini açıklayabiliyorum
+- [ ] Nano-service anti-pattern'ini ve service granularity sweet spot'unu tanımlayabiliyorum
+- [ ] (Opsiyonel) "Pratik yapmak istersen" bölümündeki ArchUnit testlerini yazdım ve Claude-verify prompt'uyla doğrulattım
+
+---
+
+## Defter notları
+
+1. "Service ayır vs birleşik tut karar matrisi (11 kriter): ____."
+2. "Banking 4-servis (account/transfer/fraud/notification) ayrım rasyoneli + her birinin scaling pattern: ____."
+3. "Database per service prensibinin 4 avantajı: ____."
+4. "Cross-service data access stratejileri (sync gRPC, async event, CQRS) ne zaman hangisi: ____."
+5. "Distributed monolith belirtileri ve çözümü: ____."
+6. "Strangler Fig pattern banking regulatory için neden zorunlu: ____."
+7. "Shared library yönetimi — minimal scope kararı (ne paylaşılır, ne paylaşılmaz): ____."
+8. "Decomposition strategy (capability vs subdomain vs aggregate vs team) banking için seçim: ____."
+9. "Nano-service vs right-sized service operational cost: ____."
+10. "Aggregate consistency boundary neden bölünmez (account + journal): ____."
+
+```admonish success title="Bölüm Özeti"
+- Decomposition kararı hisle değil kriter matrisiyle verilir: ayrı team/release/scaling/deploy → ayır; aynı transaction/aggregate + yüksek coupling → birleşik tut
+- Banking 4 servise bölünür (account, transfer, fraud, notification) ve her birinin gerekçesi farklıdır — scaling, stability, volatility, compliance ekseninde
+- Database per service şarttır: her servis kendi schema'sını sahiplenir, data sovereignty + failure isolation kazanır; shared DB banking'de yasaktır
+- Distributed monolith en pahalı tuzaktır — 10 servis ama bağımsız deploy edilemiyorsa microservice değil; çözüm doğru sınır + async event
+- Aggregate consistency boundary (account + journal) bölünmez; big-bang rewrite yerine Strangler Fig kademeli migration zorunludur
+- banking-commons minimal kalır (sadece stable value object), granularity sweet spot 4-12 servistir; nano-service operational nightmare doğurur
+```
+
+---
+
+## Pratik yapmak istersen
+
+Bu topic çoğunlukla **architecture decision** olduğundan pratiği de tasarım denetimi üzerine kuruludur. Aşağıdaki iki ek hazır: test yazma rehberi decomposition kararlarını ArchUnit ile koda döker (cross-service dependency ve cycle detection), Claude-verify prompt'u ise tasarladığın decomposition'ı banking-grade perspektiften denetletir.
+
+<details>
+<summary>Test yazma rehberi</summary>
+
+Decomposition kararları koda dökülünce sınanabilir hale gelir. ArchUnit (Topic 12.4) ile servis sınırlarını CI'da zorlarsın: bir servis izinsiz başka servise bağımlı hale gelirse test kırılır.
 
 ```java
 @AnalyzeClasses(packages = "com.mavibank.banking")
 public class ServiceDecompositionTest {
-    
+
     @ArchTest
     static final ArchRule modules_should_be_independent =
         slices().matching("com.mavibank.banking.(*)..")
             .should().notDependOnEachOther()
             .ignoreDependency(...)
             .check(classes);
-    
+
     @ArchTest
     static final ArchRule no_cycles_between_services =
         slices().matching("com.mavibank.banking.(*)..")
             .should().beFreeOfCycles();
-    
+
     @ArchTest
     static final ArchRule account_service_should_not_depend_on_transfer =
         noClasses().that().resideInAPackage("..account..")
@@ -681,26 +614,31 @@ public class ServiceDecompositionTest {
 }
 ```
 
-CI'da fail → cross-service dependency unintended.
+CI'da bu testlerden biri fail ederse cross-service dependency istemsiz sızmış demektir.
 
----
+> Tamamlanma ölçütü: `slices().notDependOnEachOther()` yeşil (servisler birbirine sızmıyor), `beFreeOfCycles()` yeşil (döngü yok) ve en az bir yönlü kural (ör. account → transfer'e bağımlı olmasın) yazılmış olmalı. Bonus: shared DB'ye erişimi de bir ArchUnit kuralıyla engelle — bir servis başka servisin repository package'ına bağımlı olmamalı.
 
-## Claude-verify prompt
+</details>
+
+<details>
+<summary>Claude-verify prompt</summary>
 
 ```
-Microservice decomposition tasarımımı banking-grade kriterlere göre değerlendir:
+Microservice decomposition tasarımımı banking-grade kriterlere göre değerlendir.
+Eksikleri işaretle, kod yazma:
 
-1. 4 servis ayrımı:
+1. Servis ayrımı:
    - Business capability ekseninde mi?
    - Her servis bir bounded context'i implement ediyor mu?
-   - Aggregate'lar service içinde (split yok)?
+   - Aggregate'lar service içinde mi (split yok)?
 
 2. Database per service:
    - Her servisin kendi schema'sı (veya DB) mı?
    - Shared DB anti-pattern yok mu?
+   - Servis başka servisin tablosuna doğrudan erişiyor mu (olmamalı)?
 
 3. Shared library:
-   - banking-commons minimal (sadece stable value objects)?
+   - banking-commons minimal (sadece stable value object)?
    - Domain logic shared library'de YOK?
    - Version management strategy var mı?
 
@@ -711,7 +649,7 @@ Microservice decomposition tasarımımı banking-grade kriterlere göre değerle
 
 5. Strangler fig:
    - Big-bang migration anti-pattern'inden kaçınılmış mı?
-   - Sprint-by-sprint plan var mı?
+   - Sprint-by-sprint / parallel-run plan var mı?
 
 6. Anti-pattern detection:
    - Distributed monolith risk değerlendirmesi yapıldı mı?
@@ -727,43 +665,15 @@ Microservice decomposition tasarımımı banking-grade kriterlere göre değerle
    - Team size 5-9 (two-pizza)?
 
 9. ArchUnit:
-   - Cross-service dependency tests yazılmış mı?
-   - Cycle detection?
-   - Layered architecture enforcement?
+   - Cross-service dependency test'leri yazılmış mı?
+   - Cycle detection var mı?
 
 10. Banking-specific:
     - Account aggregate consistency boundary (account + journal) korunmuş mu?
     - Audit centralized (regulatory)?
     - Fraud isolated (compliance team)?
 
-Her madde için PASS / FAIL / EKSIK işaretle.
+Her madde için PASS / FAIL / EKSIK işaretle, kanıt göster, kod yazma.
 ```
 
----
-
-## Tamamlama kriterleri
-
-- [ ] 10+ modül için decomposition decision matrix (defterimde)
-- [ ] Maven multi-module setup
-- [ ] banking-commons module (Money, Currency, ID'ler)
-- [ ] 4 service ayrı Maven module
-- [ ] Database per service migration
-- [ ] Strangler fig sprint plan
-- [ ] Cross-service data access strategy (3 senaryo)
-- [ ] Distributed monolith risk assessment
-- [ ] ArchUnit cross-service dependency tests
-
----
-
-## Defter notları (10 madde)
-
-1. "Service ayır vs birleşik tut karar matrisi (10 kriter): ____."
-2. "Banking 4-servis (account/transfer/fraud/notification) ayrım rasyoneli + her birinin scaling pattern: ____."
-3. "Database per service prensibinin 4 avantajı: ____."
-4. "Cross-service data access stratejileri (sync gRPC, async event, CQRS) ne zaman hangisi: ____."
-5. "Distributed monolith 7 belirtisi: ____."
-6. "Strangler fig pattern banking regulatory için neden zorunlu: ____."
-7. "Shared library yönetimi — minimal scope kararı: ____."
-8. "Decomposition strategy (capability vs subdomain vs aggregate vs team) banking için seçim: ____."
-9. "Nano-service vs right-sized service operational cost: ____."
-10. "Conway's Law banking org structure ve servis yapısı uyumu: ____."
+</details>

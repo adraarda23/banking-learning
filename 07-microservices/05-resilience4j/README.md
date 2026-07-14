@@ -1,18 +1,26 @@
 # Topic 7.5 — Resilience4j: Circuit Breaker, Retry, Bulkhead, RateLimiter, TimeLimiter, Fallback
 
+```admonish info title="Bu bölümde"
+- Distributed sistem patolojileri — cascading failure, retry storm, timeout cascade — ve Resilience4j ile nasıl kesildikleri
+- Circuit Breaker 3 state (CLOSED / OPEN / HALF_OPEN), failure threshold ve `ignoreExceptions` ile business hataların ayrılması
+- Retry (exponential backoff + idempotency), Bulkhead (semaphore/threadpool), TimeLimiter, RateLimiter — banking config'leriyle tek tek
+- Composition order: `Retry → CircuitBreaker → TimeLimiter → Bulkhead → call` sırası ve neden bu sırada
+- 4 fallback stratejisi (fail-fast, cached, queue, degraded) ve critical vs non-critical path kararı
+```
+
 ## Hedef
 
-Microservice'ler arası çağrılarda **resilience pattern**'leri uygulamak. Cascading failure, timeout cascade, retry storm gibi distributed sistem patolojilerini Resilience4j ile önlemek. Banking için **transfer-service → account-service** gibi critical path'lerde fail-safe pattern.
+Microservice'ler arası çağrılarda **resilience pattern**'leri uygulamak. Cascading failure, timeout cascade, retry storm gibi distributed sistem patolojilerini Resilience4j ile önlemek. Banking için **transfer-service → account-service** gibi critical path'lerde fail-safe pattern tasarlayabilmek.
 
 ## Süre
 
-Okuma: 2 saat • Mini task: 2 saat • Test: 1 saat • Toplam: ~5 saat
+Okuma: 2 saat • Kendini Sına: 45 dk • Pratik (opsiyonel): 3-4 saat • Toplam: ~2.5 saat (+ pratik)
 
 ## Önbilgi
 
 - Topic 7.1-7.4 bitti (microservice architecture)
-- Phase 3 (concurrency) — bulkhead concept
-- Phase 6 (Kafka) — retry, DLT patterns
+- Phase 3 (concurrency) — bulkhead concept'i görüldü
+- Phase 6 (Kafka) — retry, DLT pattern'leri biliniyor
 
 ---
 
@@ -20,56 +28,52 @@ Okuma: 2 saat • Mini task: 2 saat • Test: 1 saat • Toplam: ~5 saat
 
 ### 1. Neden resilience patterns gerekli
 
-**Distributed sistem patolojileri:**
+Tek bir yavaş servis, önlem yoksa tüm sistemi çökertir — resilience pattern'lerin varlık sebebi bu üç patolojidir.
 
 #### Cascading failure
+
+**Cascading failure**, bir downstream servisin yavaşlamasının upstream'lere zincirleme yayılıp tüm sistemi kilitlemesidir.
 
 ```
 account-service yavaşladı (500ms → 5s)
    ↓
 transfer-service'in thread pool dolu (50 thread × 5s = 250s wait)
    ↓
-gateway timeout (30s timeout)
+gateway timeout (30s)
    ↓
-external client retry
-   ↓
-yeni request'ler thread pool'u daha da doldurur
+external client retry → yeni request'ler pool'u daha da doldurur
    ↓
 TÜM SİSTEM ÇÖKÜYOR
 ```
 
-Bir downstream service yavaşladı → tüm upstream'ler patlar.
+Bir servis yavaşladı diye hepsi patlar; çünkü thread'ler o yavaş çağrıda bloke kalır.
 
 #### Retry storm
 
+**Retry storm**, naive retry'ın zaten zorlanan bir backend'e yükü katlayarak death spiral yaratmasıdır.
+
 ```
 account-service 5xx döndü
-transfer-service: "retry 3 kez"
-3x request load → account-service daha yavaş
-transfer-service: "retry 3 kez" (yeni request'ler)
-9x load → death spiral
+transfer-service: "retry 3 kez" → 3x request load → backend daha yavaş
+yeni request'ler de retry → 9x load → death spiral
 ```
 
-Naive retry hatayı katlar.
+Hatalı servise "daha çok vur" demek onu tamamen düşürür.
 
 #### Timeout cascade
 
-```
-gateway timeout: 30s
-transfer-service timeout: 30s
-account-service timeout: 30s
-DB timeout: 30s
+**Timeout cascade**, her katmanın aynı timeout değerini kullanması yüzünden kimsenin doğru anda pes edememesidir.
 
-Tam 30s'te DB timeout veriyor, ama:
-- account-service hala bekliyor (timeout: 30s, başlangıç önce)
-- transfer-service hala bekliyor
-- gateway hala bekliyor
-- User 30s+ bekliyor, sonra timeout
+```
+gateway 30s • transfer-service 30s • account-service 30s • DB 30s
+DB tam 30s'te timeout verir, ama üstteki herkes hâlâ bekliyor
 ```
 
-Timeout'lar aşağıdan yukarı **azalan** sırada olmalı (bulkhead pattern).
+Çözüm: timeout'lar aşağıdan yukarı **azalan** olmalı (bkz. bölüm 7). <mark>Her timeout seviyesi bir altındakinden uzun olmalı</mark> — aksi halde alt katman pes ederken üst katman hâlâ boşuna bekler.
 
 ### 2. Resilience4j — 6 ana pattern
+
+Resilience4j, bu patolojilerin her birine karşılık gelen altı **pattern**'i annotation ile sunar; her pattern bir savunma katmanıdır.
 
 | Pattern | Amaç |
 |---|---|
@@ -79,6 +83,8 @@ Timeout'lar aşağıdan yukarı **azalan** sırada olmalı (bulkhead pattern).
 | **TimeLimiter** | Max execution time, cancel |
 | **RateLimiter** | Outbound request rate limit |
 | **Fallback** | Failure'da graceful degradation |
+
+Spring Boot 3 için üç bağımlılık yeterli — AOP starter annotation'ları çalıştırır, reactor entegrasyonu `Mono`/`Flux` içindir:
 
 ```xml
 <dependency>
@@ -97,27 +103,26 @@ Timeout'lar aşağıdan yukarı **azalan** sırada olmalı (bulkhead pattern).
 
 ### 3. Circuit Breaker — state machine
 
-```
-       failure rate < threshold
-CLOSED ────────────────────────→ CLOSED
-  │
-  │ failure rate >= threshold
-  ↓
-OPEN (waitDuration)
-  │
-  │ wait duration sona erdi
-  ↓
-HALF_OPEN
-  │
-  ├─ trial request success → CLOSED
-  └─ trial request fail → OPEN
+Elektrik sigortası gibi düşün: backend down'a giderse **Circuit Breaker** devreyi açıp anlık fail eder, böylece hem çağıranı hem düşen backend'i korur.
+
+Üç state ve aralarındaki geçişler şöyle işler:
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> CLOSED
+    CLOSED --> OPEN: failure rate threshold asti
+    OPEN --> HALF_OPEN: waitDuration doldu
+    HALF_OPEN --> CLOSED: trial request success
+    HALF_OPEN --> OPEN: trial request fail
+    CLOSED --> CLOSED: failure rate dusuk
 ```
 
-**State davranışı:**
+- **CLOSED:** Normal. Request'ler geçer, failure rate izlenir.
+- **OPEN:** Threshold aşıldı. Tüm request'ler **anında fail** (`CallNotPermittedException`), backend'e hiç gitmez.
+- **HALF_OPEN:** Wait duration sonrası **sınırlı trial request**. Success → CLOSED, fail → OPEN.
 
-- **CLOSED:** Normal. Request'ler geçer. Failure rate izlenir.
-- **OPEN:** Failure threshold aşıldı. Tüm request'ler **anında fail** (`CallNotPermittedException`). Backend'i koru.
-- **HALF_OPEN:** Wait duration sonrası, **sınırlı trial request**. Success → CLOSED. Fail → OPEN.
+Config'in ilk yarısı sliding window ve threshold'u tanımlar — kaç call'a bakılacağı ve hangi fail oranında OPEN'a geçileceği:
 
 ```yaml
 resilience4j:
@@ -126,10 +131,15 @@ resilience4j:
       default:
         slidingWindowType: COUNT_BASED   # veya TIME_BASED
         slidingWindowSize: 100            # son 100 call'a bak
-        minimumNumberOfCalls: 10          # CB değerlendirmesi için min 10 call
+        minimumNumberOfCalls: 10          # min 10 call sonra değerlendir
         failureRateThreshold: 50          # %50 fail → OPEN
-        slowCallRateThreshold: 100        # disabled
+```
+
+İkinci yarı recovery davranışını ve hangi exception'ların sayılacağını belirler. `automaticTransitionFromOpenToHalfOpenEnabled` olmadan HALF_OPEN'a geçiş için bir çağrı beklenir:
+
+```yaml
         slowCallDurationThreshold: 2s
+        slowCallRateThreshold: 100        # disabled
         waitDurationInOpenState: 30s      # 30s OPEN, sonra HALF_OPEN
         permittedNumberOfCallsInHalfOpenState: 5
         automaticTransitionFromOpenToHalfOpenEnabled: true
@@ -148,18 +158,24 @@ resilience4j:
         failureRateThreshold: 70   # daha gevşek
 ```
 
-**Önemli:** `ignoreExceptions` — **business exception'lar** circuit breaker'ı triggerlamamalı.
+Kritik satır `ignoreExceptions`: <mark>business exception'lar circuit breaker'ı asla tetiklememeli</mark>. `InsufficientFundsException` backend down demek değildir; kullanıcının bakiyesi yetersizdir. CB bunu sayarsa her yetersiz bakiye "backend down" olarak yorumlanır ve sistem gereksiz yere CB-open olur.
 
-`InsufficientFundsException` business hata değil teknik hata. Backend down değil, kullanıcının bakiyesi yetersiz. CB tetiklenirse her insufficient funds → backend down sayılır → sistem CB-open.
+```admonish warning title="recordExceptions vs ignoreExceptions"
+`recordExceptions` = teknik hatalar (5xx, IO, timeout) — CB bunları sayar. `ignoreExceptions` = business hatalar (yetersiz bakiye, hesap bulunamadı) — CB bunları hiç görmez. İkisini karıştırmak, tamamen sağlıklı bir servisi 4xx business hataları yüzünden OPEN'a düşürür.
+```
 
-### 4. Banking örnek — TransferService → AccountService
+### 4. Circuit Breaker banking örneği — critical vs non-critical
+
+Fallback method'u seçerken tek soru var: bu veri yanlış olursa para kaybeder miyim? Cevaba göre critical path fail-fast yapar, non-critical cached değere düşer.
+
+Önce `getBalance` — CB annotation'ı ve fallback pointer'ı ile korunur:
 
 ```java
 @Service
 public class AccountServiceClient {
-    
+
     private final WebClient accountServiceClient;
-    
+
     @CircuitBreaker(name = "accountService", fallbackMethod = "fallbackGetBalance")
     public Mono<Money> getBalance(UUID accountId) {
         return accountServiceClient.get()
@@ -167,15 +183,56 @@ public class AccountServiceClient {
             .retrieve()
             .bodyToMono(Money.class);
     }
-    
+```
+
+Balance **critical**'dır — mock bir değer döndürmek yanlış transfer kararı demektir. Bu yüzden fallback fail-fast yapar:
+
+```java
     public Mono<Money> fallbackGetBalance(UUID accountId, Throwable t) {
         log.warn("Account service unavailable for {}: {}", accountId, t.getMessage());
-        
         // Banking: critical data — fail-fast, mock data DON'T
         return Mono.error(new ServiceUnavailableException(
             "Cannot retrieve balance — account service unavailable. Please retry."));
     }
-    
+```
+
+Display name gibi **non-critical** veride ise stale/cached değer tolere edilir — kullanıcı bir isim yerine cache görse dünya yıkılmaz:
+
+```java
+    // Non-critical: cached value OK
+    public Mono<AccountInfo> fallbackGetAccountInfo(UUID accountId, Throwable t) {
+        return Mono.justOrEmpty(accountInfoCache.get(accountId))
+            .switchIfEmpty(Mono.error(new ServiceUnavailableException("No cached data")));
+    }
+}
+```
+
+Tuzak: kolaylık olsun diye critical path'e mock data koymak. `Money.of("0")` döndüren bir fallback, "bakiye sıfır" diyerek meşru transferleri reddeder veya tersini yapar.
+
+<details>
+<summary>Tam kod: AccountServiceClient CB + fallback (~37 satır)</summary>
+
+```java
+@Service
+public class AccountServiceClient {
+
+    private final WebClient accountServiceClient;
+
+    @CircuitBreaker(name = "accountService", fallbackMethod = "fallbackGetBalance")
+    public Mono<Money> getBalance(UUID accountId) {
+        return accountServiceClient.get()
+            .uri("/accounts/{id}/balance", accountId)
+            .retrieve()
+            .bodyToMono(Money.class);
+    }
+
+    public Mono<Money> fallbackGetBalance(UUID accountId, Throwable t) {
+        log.warn("Account service unavailable for {}: {}", accountId, t.getMessage());
+        // Banking: critical data — fail-fast, mock data DON'T
+        return Mono.error(new ServiceUnavailableException(
+            "Cannot retrieve balance — account service unavailable. Please retry."));
+    }
+
     @CircuitBreaker(name = "accountService", fallbackMethod = "fallbackGetAccountInfo")
     public Mono<AccountInfo> getAccountInfo(UUID accountId) {
         return accountServiceClient.get()
@@ -183,7 +240,7 @@ public class AccountServiceClient {
             .retrieve()
             .bodyToMono(AccountInfo.class);
     }
-    
+
     // Non-critical: cached value OK
     public Mono<AccountInfo> fallbackGetAccountInfo(UUID accountId, Throwable t) {
         log.warn("Falling back to cached account info: {}", accountId);
@@ -193,11 +250,13 @@ public class AccountServiceClient {
 }
 ```
 
-**Banking pratiği:**
-- **Critical path** (balance, debit) → fallback = fail-fast (mock data tehlikeli)
-- **Non-critical** (display name, history) → cached value OK
+</details>
 
 ### 5. Retry — transient hatalar için
+
+**Retry**, geçici (transient) bir hatanın kendiliğinden düzelebileceği durumlar içindir — bir 503 veya network glitch, ikinci denemede geçebilir.
+
+Config'te iki liste kritik: sadece transient hataları retry et, business hatalarını asla:
 
 ```yaml
 resilience4j:
@@ -210,11 +269,9 @@ resilience4j:
         exponentialBackoffMultiplier: 2
         retryExceptions:
           - org.springframework.web.reactive.function.client.WebClientResponseException$ServiceUnavailable
-          - org.springframework.web.reactive.function.client.WebClientResponseException$GatewayTimeout
           - java.net.ConnectException
           - java.util.concurrent.TimeoutException
         ignoreExceptions:
-          - com.mavibank.banking.account.exception.AccountNotFoundException
           - com.mavibank.banking.account.exception.InsufficientFundsException
           - com.mavibank.banking.common.exception.ValidationException
     instances:
@@ -222,32 +279,24 @@ resilience4j:
         baseConfig: default
       fraudService:
         baseConfig: default
-        maxAttempts: 2   # daha az retry (fraud non-blocking)
+        maxAttempts: 2   # fraud non-blocking, daha az retry
 ```
+
+Annotation olarak CB ile birlikte kullanılır (sıra önemli, bkz. bölüm 9):
 
 ```java
-@Service
-public class AccountServiceClient {
-    
-    @CircuitBreaker(name = "accountService", fallbackMethod = "fallbackGetBalance")
-    @Retry(name = "accountService")
-    public Mono<Money> getBalance(UUID accountId) { ... }
-}
+@CircuitBreaker(name = "accountService", fallbackMethod = "fallbackGetBalance")
+@Retry(name = "accountService")
+public Mono<Money> getBalance(UUID accountId) { ... }
 ```
 
-**Retry kuralları:**
-- `retryExceptions`: Sadece transient hatalar (5xx, network)
-- `ignoreExceptions`: Business hatalar (4xx — bug fix değil retry)
-- `enableExponentialBackoff`: 500ms, 1s, 2s — backoff strategy
-- `maxAttempts`: 3-5 typical, banking için. Aşırı retry storm.
+Kurallar net: `retryExceptions` yalnızca 5xx/network; `ignoreExceptions` business hataları (retry sonuçlarını değiştirmez); `enableExponentialBackoff` ile 500ms → 1s → 2s; `maxAttempts` banking için 3-5, fazlası retry storm.
 
 #### Retry only idempotent operations
 
-**GET, HEAD, PUT, DELETE:** Idempotent, retry safe.
+Retry'ın gizli tuzağı yan etkidir: **GET, HEAD, PUT, DELETE idempotent** olduğu için güvenle retry edilir; **POST değildir** — retry duplicate transfer yaratabilir.
 
-**POST:** Idempotent **DEĞİL** — retry duplicate yaratabilir.
-
-Banking pattern: POST retry **sadece** `Idempotency-Key` ile (backend dedup).
+Banking pattern: POST retry **sadece** `Idempotency-Key` ile yapılır, backend bu key ile dedup eder:
 
 ```java
 @Retry(name = "transferService")
@@ -261,15 +310,33 @@ public Mono<Transfer> postTransfer(TransferRequest req) {
 }
 ```
 
+```admonish warning title="POST retry = duplicate riski"
+Idempotency-Key olmadan retry edilen bir POST /transfers, network hatası "geç dönen başarı"yı gizlerse aynı transferi iki kez işler. Müşteri iki kez borçlanır. Kural: POST retry yalnızca backend dedup garantisiyle.
+```
+
 ### 6. Bulkhead — resource isolation
 
-Pattern adı: gemi su geçirmez bölmelerden geliyor. Bir bölme delinse diğerleri ayakta kalır.
+**Bulkhead** adı geminin su geçirmez bölmelerinden gelir: bir bölme delinse gemi batmaz. Amaç, bir yavaş servisin tüm thread'leri tüketip diğer çağrıları da düşürmesini engellemektir.
 
-**Sorun:** Tek thread pool — bir slow service tüm thread'leri tüketir.
+Çözüm servis başına ayrı bir izin havuzu ayırmaktır — biri dolsa diğeri etkilenmez:
 
-**Çözüm:** Service başına ayrı thread pool.
+```mermaid
+graph LR
+    TS["transfer-service"] --> B1
+    TS --> B2
+    subgraph account_iso["account bulkhead"]
+        B1["max 50 concurrent"]
+    end
+    subgraph fraud_iso["fraud bulkhead"]
+        B2["max 20 concurrent"]
+    end
+    B1 --> AS["account-service"]
+    B2 --> FS["fraud-service"]
+```
 
 #### Semaphore Bulkhead — async/reactive için
+
+Reactive kodda **semaphore bulkhead** kullanılır: eşzamanlı çağrı sayısını sayar, limit dolunca kısa bekler, sonra fail eder.
 
 ```yaml
 resilience4j:
@@ -277,7 +344,7 @@ resilience4j:
     instances:
       accountService:
         maxConcurrentCalls: 50      # max 50 concurrent
-        maxWaitDuration: 100ms       # 100ms wait, sonra fail
+        maxWaitDuration: 100ms      # 100ms bekle, sonra fail
       fraudService:
         maxConcurrentCalls: 20
 ```
@@ -288,11 +355,11 @@ resilience4j:
 public Mono<Money> getBalance(UUID id) { ... }
 ```
 
-**Banking örnek:**
-- account-service slow → max 50 concurrent → 51. request hemen fail (`BulkheadFullException`)
-- fraud-service slow → ayrı bulkhead, account-service etkilenmedi
+Sonuç: account-service slow olsa 51. request hemen `BulkheadFullException` alır; fraud-service ayrı bulkhead'de olduğu için hiç etkilenmez.
 
 #### ThreadPool Bulkhead — blocking call için
+
+Blocking (reactive olmayan) çağrılarda **threadpool bulkhead** kullanılır — ayrı bir thread pool + queue tahsis eder:
 
 ```yaml
 resilience4j:
@@ -302,7 +369,6 @@ resilience4j:
         maxThreadPoolSize: 10
         coreThreadPoolSize: 5
         queueCapacity: 20
-        keepAliveDuration: 20ms
 ```
 
 ```java
@@ -310,9 +376,11 @@ resilience4j:
 public CompletableFuture<Response> callLegacy(Request req) { ... }
 ```
 
-Banking için: Legacy CBS (blocking JDBC vs.) için ThreadPool bulkhead.
+Banking için: legacy CBS (blocking JDBC vb.) için threadpool bulkhead; reactive WebClient çağrıları için semaphore.
 
 ### 7. TimeLimiter — max execution time
+
+Fraud-service düşünüp transfer'in sonsuza dek beklememesi için **TimeLimiter** bir çağrıya maksimum süre koyar ve aşınca iptal eder.
 
 ```yaml
 resilience4j:
@@ -331,7 +399,7 @@ public CompletableFuture<Money> getBalance(UUID id) {
 }
 ```
 
-Reactive version (Mono.timeout):
+Reactive kodda annotation yerine doğrudan `Mono.timeout` de kullanılabilir:
 
 ```java
 public Mono<Money> getBalance(UUID id) {
@@ -343,26 +411,26 @@ public Mono<Money> getBalance(UUID id) {
 }
 ```
 
-**Banking timeout hierarchy** (önemli):
+En kritik nokta timeout hiyerarşisidir — her katman bir altındakinden **uzun** olmalı:
 
 ```
-Client → Gateway:           60s (user max wait)
-Gateway → transfer-service: 30s
-transfer-service → account-service: 5s
-account-service → DB:        3s
+Client → Gateway:                   60s (user max wait)
+Gateway → transfer-service:         30s
+transfer-service → account-service:  5s
+account-service → DB:                3s
 ```
 
-Her seviye **aşağıdaki**ndan **uzun**. Aksi halde:
-- DB 4s'te döner, account-service zaten 3s'te timeout vermiş → exception
-- Sonra gateway 30s'te bekler, transfer-service 5s'te döndü ama gateway hala bekliyor
+Aksi halde: DB 4s'te döner ama account-service 3s'te zaten timeout vermiştir → boşa iş; üst katmanlar da yanlış anda pes eder.
 
-Banking SLO'larla **bottom-up timeout** tasarımı.
+```admonish tip title="Bottom-up timeout tasarımı"
+Timeout'ları banking SLO'larından başlayıp aşağıdan yukarı hesapla: önce DB'nin makul üst sınırı, üstüne servis işleme payı, üstüne gateway. Böylece hata her zaman en alttaki katmandan başlar ve yukarı doğru temiz propagate olur.
+```
 
 ### 8. RateLimiter — outbound rate limit
 
-Inbound (gateway) rate limit Topic 7.3'te. **Outbound** rate limit:
+Inbound (gateway) rate limit Topic 7.3'teydi. **RateLimiter** burada **outbound** içindir: dış bir API'nin quota'sını aşıp key'inin suspend olmasını engeller.
 
-Banking örnek: TCMB FX API günde max 1000 request.
+Örnek: TCMB FX API'si dakikada sınırlı çağrı kabul eder.
 
 ```yaml
 resilience4j:
@@ -371,8 +439,10 @@ resilience4j:
       tcmbFxApi:
         limitForPeriod: 100         # 100 call
         limitRefreshPeriod: 60s     # her 60 saniyede
-        timeoutDuration: 500ms      # 500ms wait, sonra fail
+        timeoutDuration: 500ms      # 500ms bekle, sonra fail
 ```
+
+Limit aşılınca cached FX rate'e düşmek makul bir fallback — kur birkaç saniye stale olabilir:
 
 ```java
 @RateLimiter(name = "tcmbFxApi", fallbackMethod = "cachedFxRate")
@@ -386,19 +456,19 @@ public Mono<FxRate> cachedFxRate(Currency from, Currency to, Throwable t) {
 }
 ```
 
-**Banking pratiği:** External API quota'sını koru. Aşma → API key suspend riski.
-
 ### 9. Composition order — kritik
 
-Birden fazla annotation birleştirilince **sıra önemli**:
+Birden fazla pattern birleşince **sıra davranışı belirler** — yanlış sıra CB'yi hiç tetiklenmez hale getirebilir.
 
+```mermaid
+graph LR
+    A["Retry en dista"] --> B["CircuitBreaker"]
+    B --> C["TimeLimiter"]
+    C --> D["Bulkhead"]
+    D --> E["actual call"]
 ```
-[Retry (en dışta)]
-  → [CircuitBreaker]
-    → [TimeLimiter]
-      → [Bulkhead]
-        → [actual call]
-```
+
+Annotation olarak dıştan içe aynı sırayla yazılır:
 
 ```java
 @Retry(name = "x")
@@ -408,23 +478,33 @@ Birden fazla annotation birleştirilince **sıra önemli**:
 public CompletableFuture<Account> getAccount(UUID id) { ... }
 ```
 
-**Neden bu sıra:**
+Neden bu sıra: <mark>Retry her zaman en dışta olmalı</mark>. CB OPEN'ken retry no-op olur (boşuna backend'i dövmez); CB CLOSED'ken bir fail retry'ı tetikler. TimeLimiter bulkhead'in dışında ki timeout'lar CB için sayılabilsin.
 
-- **Retry dışta:** CB OPEN → retry no-op. CB CLOSED → fail → retry.
-- **CB içte Bulkhead'in:** Bulkhead reject → CB sayar mı? Spring resilience4j config'e göre.
-- **TimeLimiter Bulkhead'in dışında:** Timeout sayılmalı CB için.
-
-**Yanlış sıra örnekleri:**
+Yanlış sıranın klasik örneği — CB retry'ın içinde kalırsa CB hiç devreye giremez:
 
 ```java
 @CircuitBreaker
-@Retry           // ❌ CB başlatmadan retry, CB hiç tetiklenmez
+@Retry           // ❌ retry CB'nin içinde, CB tetiklenmeden retry döner
 public ...
 ```
 
 ### 10. Fallback strategies — banking
 
-**Strategy 1: Fail-fast (critical path)**
+Fallback tek tip değildir; verinin kritikliğine göre dört strateji arasından seçim yaparsın. Karar akışı şöyle işler:
+
+```mermaid
+flowchart LR
+    A["Downstream call fail"] --> B{"CB OPEN veya hata"}
+    B --> C["fallback method"]
+    C --> D{"Critical path mi"}
+    D -->|"evet"| E["fail-fast exception"]
+    D -->|"hayir"| F{"Veri tipi"}
+    F -->|"stale OK"| G["cached deger"]
+    F -->|"best effort"| H["queue and retry"]
+    F -->|"kontrol"| I["conservative default"]
+```
+
+**Strategy 1 — Fail-fast (critical path):** Balance, debit gibi yanlış olamayacak verilerde. <mark>Critical path'te mock data fallback yasaktır</mark> — yanlış bakiye yanlış karar demektir.
 
 ```java
 public Mono<Money> fallbackGetBalance(UUID id, Throwable t) {
@@ -432,9 +512,7 @@ public Mono<Money> fallbackGetBalance(UUID id, Throwable t) {
 }
 ```
 
-Banking transfer'da balance bilmek zorunda. Mock data = yanlış kararlar.
-
-**Strategy 2: Cached value (non-critical)**
+**Strategy 2 — Cached value (non-critical):** Display name, geçmiş gibi stale tolere edilen verilerde.
 
 ```java
 public Mono<AccountInfo> fallbackGetAccountInfo(UUID id, Throwable t) {
@@ -443,9 +521,7 @@ public Mono<AccountInfo> fallbackGetAccountInfo(UUID id, Throwable t) {
 }
 ```
 
-Display name için cached value OK. Stale data tolere edilir.
-
-**Strategy 3: Queue and retry later**
+**Strategy 3 — Queue and retry later:** Notification gibi best-effort işlerde; kuyruğa atıp scheduled job ile sonra dene.
 
 ```java
 public Mono<Void> fallbackSendNotification(NotificationRequest req, Throwable t) {
@@ -454,9 +530,7 @@ public Mono<Void> fallbackSendNotification(NotificationRequest req, Throwable t)
 }
 ```
 
-Notification queue'ya at, scheduled job sonradan retry.
-
-**Strategy 4: Degrade functionality**
+**Strategy 4 — Degrade functionality (conservative default):** Fraud service down'da güvenli varsayıma geç. Burası **fail-closed** kararıdır: emin olamıyorsan büyük tutarları riskli say.
 
 ```java
 public Mono<FraudScore> fallbackFraudCheck(TransferRequest req, Throwable t) {
@@ -468,11 +542,13 @@ public Mono<FraudScore> fallbackFraudCheck(TransferRequest req, Throwable t) {
 }
 ```
 
-Banking — fraud service down → büyük amount'ları HIGH_RISK varsay (conservative).
+```admonish tip title="Fail-open mı fail-closed mı?"
+Servis down'ken "geçir" (fail-open) mı "reddet/kısıtla" (fail-closed) mı kararı işin niteliğine bağlıdır. Display name → fail-open (cache/unknown ile devam). Fraud check ve büyük tutar → fail-closed (conservative HIGH_RISK). Banking'de para riski arttıkça terazi fail-closed'a kayar.
+```
 
 ### 11. Bulk operation patterns
 
-Cross-service bulk operations için:
+Cross-service bulk çağrılarda hepsini aynı anda ateşlemek downstream'i ezer; reactive'de `flatMap` concurrency parametresi bunu bounded tutar.
 
 ```java
 public Mono<List<AccountInfo>> getAccountsInfo(List<UUID> accountIds) {
@@ -483,18 +559,65 @@ public Mono<List<AccountInfo>> getAccountsInfo(List<UUID> accountIds) {
 }
 ```
 
-`flatMap(_, concurrency)` — paralel ama bounded. Bulkhead pattern reactive.
+`flatMap(_, concurrency)` paralel ama sınırlı çalışır — bulkhead pattern'in reactive karşılığı.
 
 ### 12. Banking örnek — full TransferService
+
+Şimdi hepsini bir transfer akışında birleştirelim: fraud check, debit, credit, save, best-effort notification. Ana orkestrasyon `Mono` zinciri ile akar:
+
+```java
+@Transactional
+public Mono<Transfer> execute(TransferRequest req, UUID userId) {
+    return validateRequest(req)
+        .flatMap(v -> fraudClient.scoreTransfer(req, userId))
+        .filter(score -> !score.isHighRisk())
+        .switchIfEmpty(Mono.error(new HighRiskTransferException()))
+        .flatMap(score -> accountClient.debit(req.fromAccountId(), req.amount(), userId))
+        .flatMap(debited -> accountClient.credit(req.toAccountId(), req.amount(), userId))
+        .flatMap(credited -> saveTransfer(req, userId));
+}
+```
+
+Downstream client'ta üç pattern birleşir — sıra bölüm 9'daki kurala uyar; debit critical olduğu için fallback fail-fast yapar:
+
+```java
+@CircuitBreaker(name = "accountService", fallbackMethod = "fallbackDebit")
+@Retry(name = "accountService")
+@Bulkhead(name = "accountService", type = Bulkhead.Type.SEMAPHORE)
+public Mono<Account> debit(UUID accountId, Money amount, String userToken) {
+    return accountServiceClient.post()
+        .uri("/accounts/{id}/debit", accountId)
+        .header("Idempotency-Key", UUID.randomUUID().toString())
+        .bodyValue(new DebitRequest(amount))
+        .retrieve()
+        .bodyToMono(Account.class)
+        .timeout(Duration.ofSeconds(5));
+}
+```
+
+Fraud client ise conservative default fallback kullanır — down'ken büyük tutarı HIGH_RISK sayar:
+
+```java
+public Mono<FraudScore> fallbackScoreTransfer(TransferRequest req, String userToken, Throwable t) {
+    log.warn("Fraud service unavailable — conservative default");
+    if (req.getAmount().compareTo(new BigDecimal("10000")) > 0) {
+        return Mono.just(FraudScore.HIGH_RISK);
+    }
+    return Mono.just(FraudScore.PROCEED_WITH_CAUTION);
+}
+```
+
+<details>
+<summary>Tam kod: TransferService + AccountServiceClient + FraudServiceClient (~85 satır)</summary>
 
 ```java
 @Service
 public class TransferService {
-    
+
     private final AccountServiceClient accountClient;
     private final FraudServiceClient fraudClient;
     private final NotificationServiceClient notificationClient;
-    
+
     @Transactional
     public Mono<Transfer> execute(TransferRequest req, UUID userId) {
         return validateRequest(req)
@@ -520,7 +643,7 @@ public class TransferService {
 
 @Service
 public class AccountServiceClient {
-    
+
     @CircuitBreaker(name = "accountService", fallbackMethod = "fallbackDebit")
     @Retry(name = "accountService")
     @Bulkhead(name = "accountService", type = Bulkhead.Type.SEMAPHORE)
@@ -531,12 +654,12 @@ public class AccountServiceClient {
             .header("Idempotency-Key", UUID.randomUUID().toString())
             .bodyValue(new DebitRequest(amount))
             .retrieve()
-            .onStatus(HttpStatusCode::is4xxClientError, response -> 
+            .onStatus(HttpStatusCode::is4xxClientError, response ->
                 Mono.error(new ClientErrorException(response.statusCode().value())))
             .bodyToMono(Account.class)
             .timeout(Duration.ofSeconds(5));
     }
-    
+
     public Mono<Account> fallbackDebit(UUID accountId, Money amount, String userToken, Throwable t) {
         if (t instanceof CallNotPermittedException) {
             log.error("Account service circuit OPEN, cannot debit: {}", accountId);
@@ -548,7 +671,7 @@ public class AccountServiceClient {
 
 @Service
 public class FraudServiceClient {
-    
+
     @CircuitBreaker(name = "fraudService", fallbackMethod = "fallbackScoreTransfer")
     @Retry(name = "fraudService")
     @TimeLimiter(name = "fraudService")
@@ -560,10 +683,9 @@ public class FraudServiceClient {
             .retrieve()
             .bodyToMono(FraudScore.class);
     }
-    
+
     public Mono<FraudScore> fallbackScoreTransfer(TransferRequest req, String userToken, Throwable t) {
         log.warn("Fraud service unavailable — conservative default");
-        
         if (req.getAmount().compareTo(new BigDecimal("10000")) > 0) {
             return Mono.just(FraudScore.HIGH_RISK);
         }
@@ -572,69 +694,46 @@ public class FraudServiceClient {
 }
 ```
 
-### 13. Metrics + monitoring
+</details>
 
-Resilience4j Micrometer ile entegre:
+### 13. Metrics, health ve event listener
+
+Pattern'leri ekledin ama görünürlük yoksa CB'nin ne zaman OPEN olduğunu fark edemezsin — Resilience4j Micrometer ile otomatik metric üretir.
 
 ```yaml
 management:
-  metrics:
-    tags:
-      application: transfer-service
   endpoints:
     web:
       exposure:
         include: health, metrics, prometheus, circuitbreakers
 ```
 
-Otomatik metric'ler:
+Önemli otomatik metric'ler (Grafana'da CB state, failure rate, retry count, bulkhead saturation panelleri kurulur):
 
 - `resilience4j_circuitbreaker_state` (gauge)
-- `resilience4j_circuitbreaker_calls` (counter, with tags: kind=successful/failed/ignored)
-- `resilience4j_circuitbreaker_failure_rate` (gauge)
-- `resilience4j_retry_calls` (counter, with: kind=successful_with_retry/successful_without_retry/failed_with_retry)
+- `resilience4j_circuitbreaker_calls` (counter, tags: kind=successful/failed/ignored)
+- `resilience4j_retry_calls` (counter, kind=successful_with_retry/...)
 - `resilience4j_bulkhead_available_concurrent_calls` (gauge)
 - `resilience4j_ratelimiter_available_permissions` (gauge)
 
-Grafana dashboard:
-- CB state (OPEN/CLOSED) over time
-- Failure rate per service
-- Retry count
-- Bulkhead saturation
-
-### 14. Event listeners
+CB OPEN'a geçince ops'a alert atmak için state transition listener kurulur:
 
 ```java
-@Configuration
-public class CircuitBreakerEventConfig {
-    
-    @Autowired CircuitBreakerRegistry registry;
-    @Autowired NotificationService notifier;
-    
-    @PostConstruct
-    public void setup() {
-        registry.getAllCircuitBreakers().forEach(cb -> {
-            cb.getEventPublisher()
-                .onStateTransition(event -> {
-                    log.warn("Circuit breaker {} state changed: {} → {}",
-                        cb.getName(), 
-                        event.getStateTransition().getFromState(),
-                        event.getStateTransition().getToState());
-                    
-                    if (event.getStateTransition().getToState() == State.OPEN) {
-                        notifier.alertOps("Circuit breaker OPEN: " + cb.getName());
-                    }
-                });
-        });
-    }
+@PostConstruct
+public void setup() {
+    registry.getAllCircuitBreakers().forEach(cb ->
+        cb.getEventPublisher().onStateTransition(event -> {
+            log.warn("CB {} state: {} → {}", cb.getName(),
+                event.getStateTransition().getFromState(),
+                event.getStateTransition().getToState());
+            if (event.getStateTransition().getToState() == State.OPEN) {
+                notifier.alertOps("Circuit breaker OPEN: " + cb.getName());
+            }
+        }));
 }
 ```
 
-Banking pratiği: CB state transition → ops alert. SRE pager.
-
-### 15. Health indicator
-
-Circuit breaker open → service "DOWN":
+Health indicator ile CB durumu `/actuator/health`'e yansır; OPEN olan bir CB instance'ı "DOWN" gösterebilir ve K8s readiness probe onu traffic'ten çıkarır:
 
 ```yaml
 management:
@@ -643,95 +742,25 @@ management:
       enabled: true
 ```
 
-`/actuator/health`:
+### 14. Banking anti-pattern'leri
 
-```json
-{
-  "status": "UP",
-  "components": {
-    "circuitBreakers": {
-      "status": "UP",
-      "details": {
-        "accountService": { "state": "CLOSED", "failureRate": "5.0%" },
-        "fraudService": { "state": "OPEN", "failureRate": "75.0%" }   // health DOWN olabilir
-      }
-    }
-  }
-}
-```
+Mülakatta "bu kodda ne yanlış?" cephaneliği — sekiz klasik.
 
-K8s readiness probe etkilenir — instance traffic'ten çıkarılabilir.
+**1. Aggressive retry:** `maxAttempts: 10`, `waitDuration: 0ms` → 10x yük, no backoff, backend ezilir. Doğrusu 3 attempt + exponential backoff.
 
-### 16. Banking anti-pattern'leri
+**2. Generic exception retry:** `retryExceptions: [Exception]` → business hatalar da retry edilir. `InsufficientFunds` retry etmek anlamsız, sonuç değişmez.
 
-**Anti-pattern 1: Aggressive retry → DDoS kendi DB'ne**
+**3. Critical path'te mock fallback:** `fallbackGetBalance` → `Money.of("0")` → yanlış bakiye → yanlış karar → müşteri kaybı.
 
-```yaml
-retry:
-  maxAttempts: 10
-  waitDuration: 0ms   # ❌
-```
+**4. CB olmadan downstream call:** Backend slow → tüm thread'ler tükenir → cascading failure. Her external call'da CB zorunlu.
 
-10x request rate, no backoff → backend ezildi. **3 attempt + exponential backoff** standart.
+**5. Bulkhead yok, shared pool:** Tek slow servis tüm app'ı yavaşlatır. Per-service bulkhead mandatory.
 
-**Anti-pattern 2: Generic exception retry**
+**6. TimeLimiter cascade yok:** DB → service → gateway hep 30s. Doğrusu bottom-up: DB 3s, service 5s, gateway 30s.
 
-```yaml
-retryExceptions:
-  - Exception   # ❌ everything retried
-```
+**7. Business exception CB tetikler:** `recordExceptions: [InsufficientFundsException]` → yetersiz bakiye "backend down" sayılır, CB gereksiz OPEN olur. `ignoreExceptions`'da olmalı.
 
-Business exception (InsufficientFunds, AccountNotFound) retry **anlamsız** — sonuç değişmez.
-
-**Anti-pattern 3: Fallback mock data critical path'te**
-
-```java
-public Mono<Money> fallbackGetBalance(UUID id, Throwable t) {
-    return Mono.just(Money.of("0", "TRY"));   // ❌ yanlış balance → yanlış decisions
-}
-```
-
-Banking transfer'da fallback mock = yanlış kararlar = customer kaybı.
-
-**Anti-pattern 4: CB olmadan downstream call**
-
-```java
-@Service
-public class AccountServiceClient {
-    public Mono<Money> getBalance(UUID id) {   // ❌ no CB
-        return webClient.get()...
-    }
-}
-```
-
-Backend slow → tüm thread'ler tükenir → cascading failure.
-
-**Anti-pattern 5: Bulkhead yok, shared pool**
-
-Tek slow service tüm app'ı yavaşlatır. Bulkhead per-service mandatory.
-
-**Anti-pattern 6: TimeLimiter cascade yok**
-
-DB → service → gateway timeout hep 30s. DB 35s'te döner → mantıksız layered timeout.
-
-Doğrusu: DB 3s, service 5s, gateway 30s. Bottom-up.
-
-**Anti-pattern 7: Business exception CB tetikler**
-
-```yaml
-recordExceptions:
-  - InsufficientFundsException   # ❌
-```
-
-Insufficient funds backend down değil. CB OPEN olmamalı.
-
-`ignoreExceptions` listesinde olmalı.
-
-**Anti-pattern 8: Retry ile non-idempotent POST**
-
-POST /transfers retry → duplicate transfer (Idempotency-Key olmadan).
-
-**Çözüm:** POST retry **sadece** Idempotency-Key ile + backend dedup.
+**8. Non-idempotent POST retry:** `POST /transfers` retry → duplicate transfer. Çözüm: yalnızca `Idempotency-Key` + backend dedup.
 
 ---
 
@@ -745,103 +774,179 @@ POST /transfers retry → duplicate transfer (Idempotency-Key olmadan).
 
 ---
 
-## Mini task'ler
+## Kendini Sına
 
-### Task 7.5.1 — Resilience4j setup (30 dk)
+Aşağıdaki soruları önce **cevaba bakmadan** kendi cümlelerinle yanıtlamayı dene — hepsi TR bank mülakatlarında karşına çıkabilecek tarzda. Takıldığın soruda ilgili Kavramlar başlığına dön, sonra tekrar dene.
 
-`pom.xml`, application.yml config. 4 instance: accountService, fraudService, notificationService, tcmbFxApi.
+**S1. Circuit Breaker'ın üç state'ini (CLOSED, OPEN, HALF_OPEN) ve aralarındaki geçiş koşullarını anlat.**
 
-### Task 7.5.2 — Circuit Breaker + fallback (60 dk)
+<details>
+<summary>Cevabı göster</summary>
 
-`AccountServiceClient.getBalance` ile CB + fallback. Test:
-- Backend up → normal
-- Backend down → 100 fail sonra CB OPEN
-- CB OPEN → instant fallback (latency düşer)
-- Wait duration sonrası → HALF_OPEN → trial request
-- Trial success → CLOSED
+CLOSED normal durumdur: request'ler geçer, failure rate izlenir. Failure rate `failureRateThreshold`'u aşınca CB OPEN'a geçer — bu state'te tüm çağrılar backend'e hiç gitmeden `CallNotPermittedException` ile anında fail eder, böylece düşen backend nefes alır.
 
-### Task 7.5.3 — Retry exponential backoff (45 dk)
+`waitDurationInOpenState` dolunca CB HALF_OPEN'a geçer ve sınırlı sayıda trial request'e izin verir. Bu trial'lar başarılıysa CB CLOSED'a döner; biri bile fail ederse tekrar OPEN'a döner ve wait duration yeniden başlar. Özet: CLOSED → OPEN (threshold) → HALF_OPEN (waitDuration) → CLOSED veya OPEN (trial sonucu).
 
-`@Retry` ile 3 attempt + 500ms, 1s, 2s backoff. Test:
-- Transient error (5xx) → 3 retry → fail
-- Business error (4xx) → 0 retry → fail immediately
-- 1. retry success → 2. attempt'ta dönüyor
+</details>
 
-### Task 7.5.4 — Bulkhead semaphore (45 dk)
+**S2. `@Retry @CircuitBreaker @TimeLimiter @Bulkhead` — bu composition order neden bu sırada? Retry içte olsaydı ne olurdu?**
 
-`maxConcurrentCalls: 50`. 100 concurrent request → 50 başarılı, 50 BulkheadFullException.
+<details>
+<summary>Cevabı göster</summary>
 
-Test: 100 paralel request, count success/fail.
+Sıra dıştan içe `Retry → CircuitBreaker → TimeLimiter → Bulkhead → call` olmalı. Retry en dışta olduğu için CB OPEN'ken retry no-op olur — boşuna backend'i dövmez, hemen fallback'e düşer. CB CLOSED'ken ise bir fail retry'ı tetikler. TimeLimiter bulkhead'in dışındadır ki timeout'lar CB tarafından failure olarak sayılabilsin.
 
-### Task 7.5.5 — TimeLimiter (30 dk)
+Retry CB'nin içinde olsaydı (`@CircuitBreaker` dışta, `@Retry` içte), her başarısız çağrı önce retry'larını tüketir, CB ancak retry'lar bittikten sonra tek bir fail görürdü. Bu, CB'nin failure rate'i doğru saymasını engeller ve retry storm'u CB koruması olmadan backend'e taşır.
 
-`timeoutDuration: 3s`. Backend kasten 5s sleep → timeout → fallback.
+</details>
 
-### Task 7.5.6 — RateLimiter outbound (30 dk)
+**S3. `recordExceptions` ile `ignoreExceptions` farkı nedir? `InsufficientFundsException` hangisinde olmalı ve neden?**
 
-TCMB FX API mock — 100 req/min limit. Aşımda cached value fallback.
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 7.5.7 — Multi-annotation composition (60 dk)
+`recordExceptions` CB'nin failure olarak saydığı teknik hatalardır (5xx, IOException, TimeoutException). `ignoreExceptions` ise CB'nin tamamen görmezden geldiği hatalardır — genelde business exception'lar. Bir çağrı ignore edilen bir exception fırlatırsa CB için ne başarı ne başarısızlık sayılır.
 
-```java
-@Retry(name = "x")
-@CircuitBreaker(name = "x", fallbackMethod = "fallback")
-@TimeLimiter(name = "x")
-@Bulkhead(name = "x")
-public CompletableFuture<Account> getAccount(UUID id) { ... }
-```
+`InsufficientFundsException` kesinlikle `ignoreExceptions`'da olmalı. Yetersiz bakiye backend'in down olduğu anlamına gelmez; backend gayet sağlıklı çalışıp doğru cevabı vermiştir. Eğer bunu record edersen, çok sayıda yetersiz-bakiye işlemi CB'yi OPEN'a düşürür ve sağlıklı servisi gereksiz yere devre dışı bırakırsın.
 
-Tüm pattern'leri birleştir. Test edge case'ler.
+</details>
 
-### Task 7.5.8 — Event listener + alert (30 dk)
+**S4. Bir servis down'ken "fail-open" ve "fail-closed" ne demek? Banking'de fraud-service down olursa hangisini seçersin?**
 
-CB state transition listener. OPEN'a geçtiğinde Slack alert.
+<details>
+<summary>Cevabı göster</summary>
 
-### Task 7.5.9 — Grafana dashboard (45 dk)
+Fail-open, koruma/kontrol servisi down'ken işlemi yine de geçirmektir; fail-closed ise emniyet tarafında kalıp reddetmek/kısıtlamaktır. Karar işin risk profiline bağlıdır: düşük riskli, kullanıcı deneyimi odaklı işlerde (display name) fail-open makuldür, cache veya "unknown" ile devam edersin.
 
-Prometheus + Grafana docker-compose. Resilience4j metrics scrape. Dashboard:
-- CB state per service (gauge)
-- Failure rate (gauge)
-- Retry count (counter)
-- Bulkhead saturation (gauge)
+Fraud-service için karar risk tutarına göre değişir ama ağırlık fail-closed'dadır. Küçük tutarlarda `PROCEED_WITH_CAUTION` ile fail-open yaklaşımı kabul edilebilir; büyük tutarlarda conservative default olarak `HIGH_RISK` döndürüp işlemi bloklarsın (fail-closed). Banking'de para riski arttıkça terazi fail-closed'a kayar — fraud kontrolsüz büyük transfer geçirmektense reddetmek yeğdir.
+
+</details>
+
+**S5. `failureRateThreshold` ve `waitDurationInOpenState` değerlerini nasıl belirlersin? "50 ve 30s" nereden geliyor?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Ezber değer yoktur; downstream'in gerçek hata dağılımından ve SLO'dan türetilir. `failureRateThreshold`'u normal baseline hata oranının belirgin üstüne koyarsın — sağlıklı bir servis %1-2 hata veriyorsa %50 makul bir "gerçekten bozuldu" sinyalidir. Çok düşük (örn. %10) tutarsan geçici dalgalanmalarda CB gereksiz açılır; çok yüksek tutarsan çökmeyi geç fark edersin. `minimumNumberOfCalls` de önemli: az call'da threshold hesaplama gürültülü olur.
+
+`waitDurationInOpenState` backend'in toparlanması için makul süredir. Çok kısa (birkaç saniye) tutarsan CB daha iyileşmemiş backend'e trial gönderip tekrar açılır (flapping); çok uzun (dakikalar) tutarsan iyileşmiş servisi gereksiz yere kapalı tutarsın. 15-60s tipik banking aralığıdır; fraud gibi non-critical'da threshold'u gevşetip (%70) daha toleranslı davranabilirsin.
+
+</details>
+
+**S6. POST bir çağrıyı neden gelişigüzel retry edemezsin? Banking'de doğru pattern nedir?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+POST idempotent değildir: aynı isteği iki kez göndermek iki ayrı kayıt/işlem yaratabilir. Network hatası çoğu zaman belirsizdir — istek backend'e ulaşıp işlendi ama cevap dönerken mi koptu, yoksa hiç ulaşmadı mı bilemezsin. Körlemesine retry edersen "cevabı kaybolmuş ama işlenmiş" bir transfer'i ikinci kez işlersin, müşteri iki kez borçlanır. GET/PUT/DELETE idempotent olduğu için bu risk onlarda yoktur.
+
+Doğru pattern: POST retry yalnızca `Idempotency-Key` ile yapılır. İstemci her mantıksal işlem için bir key üretir, header'da gönderir; backend bu key'i saklar ve aynı key ikinci kez gelirse işlemi tekrarlamadan ilk sonucu döner. Böylece retry güvenli hale gelir — dedup sorumluluğu backend'dedir.
+
+</details>
+
+**S7. Semaphore bulkhead ile threadpool bulkhead arasındaki fark nedir? Hangisini ne zaman kullanırsın?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Semaphore bulkhead sadece eşzamanlı çağrı sayısını sayan hafif bir sayaçtır; çağrı, çağıranın kendi thread'inde çalışır, ekstra thread yaratmaz. Reactive/async kod (WebClient, `Mono`/`Flux`) için doğru seçim budur — reactive dünyada zaten bloke eden thread yoktur, sadece concurrency'yi sınırlarsın.
+
+Threadpool bulkhead ise ayrı bir thread pool + queue tahsis eder ve çağrıyı o havuza offload eder. Blocking çağrılar için gereklidir (legacy CBS, blocking JDBC): çağrıyı çağıranın thread'inden izole eder, böylece yavaş bir blocking call ana thread'leri tüketmez. Bedeli ekstra thread'ler ve context-switch maliyetidir. Kural: reactive → semaphore, blocking → threadpool.
+
+</details>
+
+**S8. Banking timeout hierarchy neden "bottom-up" tasarlanır? Tüm katmanlar 30s olsaydı ne olurdu?**
+
+<details>
+<summary>Cevabı göster</summary>
+
+Her katmanın timeout'u bir altındakinden uzun olmalı: DB 3s, account-service 5s, gateway 30s, client 60s. Böylece hata her zaman en alttaki (soruna en yakın) katmandan başlar ve yukarı doğru temiz, anlamlı bir hata olarak propagate olur. Alt katman pes ederken üst katmanın hâlâ bekliyor olması garanti edilir.
+
+Tüm katmanlar 30s olsaydı timeout cascade yaşanırdı: DB tam 30s'te timeout verir ama account-service, gateway ve client de aynı anda 30s'lerini doldurmuş olur — kimse doğru anda pes edemez, herkes maksimum süreyi boşa harcar ve kullanıcı 30s+ bekledikten sonra belirsiz bir hata alır. Ayrıca DB 31s'te dönseydi account-service zaten timeout vermiş olacağı için o iş boşa gitmiş olurdu.
+
+</details>
 
 ---
 
-## Test yazma rehberi
+## Tamamlama kriterleri
+
+- [ ] Circuit Breaker 3 state'i ve geçiş koşullarını (CLOSED → OPEN → HALF_OPEN) 2 dakikada anlatabiliyorum
+- [ ] `recordExceptions` vs `ignoreExceptions` kararını banking business exception örneğiyle açıklayabiliyorum
+- [ ] Composition order'ı (Retry → CB → TimeLimiter → Bulkhead) ve neden Retry'ın en dışta olduğunu biliyorum
+- [ ] 4 fallback stratejisini (fail-fast, cached, queue, degraded) ve critical vs non-critical kararını sayabiliyorum
+- [ ] Banking timeout hierarchy'yi (DB < service < gateway) bottom-up gerekçesiyle çizebiliyorum
+- [ ] POST retry + Idempotency-Key kuralını ve neden gerekli olduğunu açıklayabiliyorum
+- [ ] Semaphore vs threadpool bulkhead farkını ve ne zaman hangisini kullanacağımı biliyorum
+- [ ] 8 anti-pattern'i tanıyıp her birinin neden yanlış olduğunu söyleyebiliyorum
+
+---
+
+## Defter notları
+
+1. "Cascading failure ve retry storm distributed sistem patolojileri: ____."
+2. "CircuitBreaker state machine (CLOSED → OPEN → HALF_OPEN): ____."
+3. "recordExceptions vs ignoreExceptions banking için karar: ____."
+4. "Retry exponential backoff banking için neden gerekli: ____."
+5. "Bulkhead semaphore vs ThreadPool farkı: ____."
+6. "Banking timeout hierarchy (DB → service → gateway): ____."
+7. "RateLimiter external API quota koruma (TCMB örneği): ____."
+8. "Composition order (Retry dışta) — neden: ____."
+9. "Fallback strategy decision (critical vs non-critical): ____."
+10. "Anti-pattern: business exception CB triggerlıyor — neden yanlış: ____."
+
+```admonish success title="Bölüm Özeti"
+- Circuit Breaker backend down'da fail-fast yapar: CLOSED → OPEN (failure threshold) → HALF_OPEN (waitDuration) → trial ile CLOSED veya OPEN
+- `ignoreExceptions` ile business hatalar (InsufficientFunds, AccountNotFound) CB'yi tetiklemez — yoksa her yetersiz bakiye "backend down" sayılır ve sistem gereksiz OPEN olur
+- Composition order `Retry → CircuitBreaker → TimeLimiter → Bulkhead → call`; Retry en dışta olmalı ki CB OPEN'ken retry no-op olsun
+- Retry yalnızca transient hatalarda + exponential backoff; POST retry sadece Idempotency-Key ile (backend dedup) — yoksa duplicate transfer
+- Fallback critical path'te fail-fast (mock yasak), non-critical'de cached/degraded; fraud down → conservative HIGH_RISK (fail-closed)
+- Timeout hierarchy bottom-up (DB < service < gateway) ve Bulkhead per-service — cascading failure'ı kesen iki temel kalkan
+```
+
+---
+
+## Pratik yapmak istersen
+
+Kavramları koda dökmek istersen aşağıdaki iki ek hazır: test yazma rehberi circuit breaker OPEN geçişi, business exception ayrımı, retry ve fallback davranışları için örnek testler içerir; Claude-verify prompt'u ile yazdığın resilience kodunu banking-grade perspektiften denetletebilirsin.
+
+<details>
+<summary>Test yazma rehberi</summary>
+
+Bu testleri yazmak istersen kabaca 1 saat ayır. Tamamlandığında şunları göstermiş olursun: CB failure sonrası OPEN'a geçiyor, business exception CB'yi tetiklemiyor, retry sadece transient hatada çalışıyor, CB OPEN'ken fallback devreye giriyor.
 
 ```java
 @SpringBootTest
 class AccountServiceClientResilienceTest {
-    
+
     @Autowired AccountServiceClient client;
     @Autowired CircuitBreakerRegistry cbRegistry;
-    
+
     @MockBean WebClient.Builder webClientBuilder;
-    
+
     @Test
     void shouldOpenCircuitBreakerAfterFailures() {
         when(webClient.get()).thenThrow(new RuntimeException("Service down"));
-        
+
         for (int i = 0; i < 100; i++) {
             assertThatThrownBy(() -> client.getBalance(UUID.randomUUID()).block());
         }
-        
+
         CircuitBreaker cb = cbRegistry.circuitBreaker("accountService");
         assertThat(cb.getState()).isEqualTo(CircuitBreaker.State.OPEN);
     }
-    
+
     @Test
     void shouldNotTriggerCBOnBusinessException() {
         when(webClient.get()).thenReturn(Mono.error(new InsufficientFundsException()));
-        
+
         for (int i = 0; i < 100; i++) {
             assertThatThrownBy(() -> client.getBalance(UUID.randomUUID()).block());
         }
-        
+
         CircuitBreaker cb = cbRegistry.circuitBreaker("accountService");
-        assertThat(cb.getState()).isEqualTo(CircuitBreaker.State.CLOSED);   // ignoreExceptions list'te
+        assertThat(cb.getState()).isEqualTo(CircuitBreaker.State.CLOSED);   // ignoreExceptions
     }
-    
+
     @Test
     void shouldRetryTransientErrorsThenFail() {
         AtomicInteger calls = new AtomicInteger();
@@ -849,33 +954,36 @@ class AccountServiceClientResilienceTest {
             calls.incrementAndGet();
             return Mono.error(new WebClientResponseException(503, "Service Unavailable", null, null, null));
         });
-        
+
         assertThatThrownBy(() -> client.getBalance(UUID.randomUUID()).block());
-        
+
         assertThat(calls.get()).isEqualTo(3);   // 3 retry attempts
     }
-    
+
     @Test
     void shouldFallbackWhenCBOpens() {
-        // Force CB to OPEN
         CircuitBreaker cb = cbRegistry.circuitBreaker("accountService");
-        cb.transitionToOpenState();
-        
-        Mono<Money> result = client.getBalance(UUID.randomUUID());
-        
-        StepVerifier.create(result)
+        cb.transitionToOpenState();   // force OPEN
+
+        StepVerifier.create(client.getBalance(UUID.randomUUID()))
             .expectError(ServiceUnavailableException.class)
             .verify();
     }
 }
 ```
 
----
+Bonus deneyler: (1) Bulkhead — `maxConcurrentCalls: 50` ile 100 paralel request gönder, 50 success + 50 `BulkheadFullException` say. (2) TimeLimiter — backend'i kasten 5s uyut, `timeoutDuration: 3s` ile timeout + fallback gözlemle. (3) Composition — dört annotation'ı birleştirip CB OPEN'ken retry'ın no-op olduğunu doğrula.
 
-## Claude-verify prompt
+</details>
+
+<details>
+<summary>Claude-verify prompt</summary>
+
+Yazdığın kodu bu prompt ile denetletebilirsin — her madde için PASS / FAIL / EKSIK işareti ister.
 
 ```
-Resilience4j implementation'ımı banking-grade kriterlere göre değerlendir:
+Resilience4j implementation'ımı banking-grade kriterlere göre değerlendir.
+Her madde için PASS / FAIL / EKSIK işaretle, kanıt göster, kod yazma:
 
 1. Circuit Breaker:
    - Her external call'da var mı?
@@ -906,7 +1014,7 @@ Resilience4j implementation'ımı banking-grade kriterlere göre değerlendir:
 
 6. Composition order:
    - Retry → CB → TimeLimiter → Bulkhead → call (en dıştan içe)?
-   - @Retry @CircuitBreaker @TimeLimiter @Bulkhead sıra doğru?
+   - Annotation sırası doğru?
 
 7. Fallback strategies:
    - Critical path (balance) → fail-fast (no mock)?
@@ -917,49 +1025,16 @@ Resilience4j implementation'ımı banking-grade kriterlere göre değerlendir:
 8. Metrics + monitoring:
    - Micrometer + Prometheus integration?
    - CB state Grafana dashboard?
-   - Event listener + Slack alert on OPEN?
+   - Event listener + alert on OPEN?
 
 9. Banking-specific:
    - Critical path identify edilmiş (transfer balance check)?
-   - Non-critical degradation tolerable?
    - Conservative defaults (high amount → HIGH_RISK)?
 
 10. Anti-pattern:
-    - Aggressive retry (10+)?
-    - Generic exception retry?
+    - Aggressive retry (10+)? Generic exception retry?
     - Mock data fallback critical path'te?
-    - CB olmadan downstream call?
-    - Business exception CB triggerlıyor?
-
-Her madde için PASS / FAIL / EKSIK işaretle.
+    - CB olmadan downstream call? Business exception CB triggerlıyor?
 ```
 
----
-
-## Tamamlama kriterleri
-
-- [ ] 4 instance config (accountService, fraudService, notificationService, tcmbFxApi)
-- [ ] CircuitBreaker + fallback her external call'da
-- [ ] Retry + exponential backoff + ignoreExceptions
-- [ ] Bulkhead semaphore per service
-- [ ] TimeLimiter banking hierarchy
-- [ ] RateLimiter outbound (TCMB)
-- [ ] Composition order doğru (Retry → CB → TL → Bulkhead)
-- [ ] Fallback strategies 4'ü (fail-fast, cached, queue, degraded)
-- [ ] Event listener + alert
-- [ ] Grafana dashboard
-
----
-
-## Defter notları (10 madde)
-
-1. "Cascading failure ve retry storm distributed sistem patolojileri: ____."
-2. "CircuitBreaker state machine (CLOSED → OPEN → HALF_OPEN): ____."
-3. "recordExceptions vs ignoreExceptions banking için karar: ____."
-4. "Retry exponential backoff banking için neden gerekli: ____."
-5. "Bulkhead semaphore vs ThreadPool farkı: ____."
-6. "Banking timeout hierarchy (DB → service → gateway): ____."
-7. "RateLimiter external API quota koruma (TCMB örneği): ____."
-8. "Composition order (Retry dışta) — neden: ____."
-9. "Fallback strategy decision (critical vs non-critical): ____."
-10. "Anti-pattern: business exception CB triggerlıyor — neden yanlış: ____."
+</details>

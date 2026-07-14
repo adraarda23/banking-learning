@@ -44,7 +44,10 @@
 ## Faz 3-4 yayılımı (2026-07-14)
 - [x] Faz 3 (Concurrency & JVM): 11 topic + mini proje, 45 diyagram, 66 kutu, 84 soru — commit e69c0d0
 - [x] Faz 4 (SQL & Oracle): 6 topic + mini proje, 29 diyagram, 44 kutu, 46 soru — commit 9b843ed
-- [ ] Kalan: Faz 5-12 (8 faz)
+- [x] Faz 5 (Spring Batch): 6 topic + mini proje, 29 diyagram, 40 kutu, 44 soru — commit 88ccbdc
+- [x] Faz 6 (Messaging/Kafka): 7 topic + mini proje, 33 diyagram, 48 kutu, 52 soru — commit 3692daf
+- [ ] Kalan: Faz 7-12 (6 faz)
+- Not: mdbook src="." nedeniyle _book/.git kopyalanıyor (bloat, zararsız — build sonrası rm -rf _book/.git ile temizle)
 
 ## Review
 - Faz 1 pilot tamam: 34 diyagram, ~70 kutu, 56 soru, 93 katlanır kutu; QA temiz

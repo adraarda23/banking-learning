@@ -1,4 +1,39 @@
+<div class="phase-cover-kicker">Yedinci Bölüm</div>
+
 # Faz 7 — Microservices: Monolitten Servis-Bazlı Mimariye Geçiş
+
+<div class="phase-cover-meta">
+<div><strong>Süre</strong> 4-5 hafta</div>
+<div><strong>Topic</strong> 7 konu + mini proje</div>
+<div><strong>Çıktı</strong> 4 microservice</div>
+<div><strong>Ön koşul</strong> Faz 1-6 tamamlandı</div>
+</div>
+
+```admonish info title="Bu fazda ne öğreneceksin?"
+`core-banking` monolitini **iş yetkinliği bazında 4 microservice'e** böleceksin
+(account, transfer, fraud, notification) ve dağıtık mimarinin yeni problemlerini çözeceksin:
+DDD bounded context, API Gateway, service discovery, Resilience4j (circuit breaker/retry/bulkhead),
+distributed tracing ve saga ile dağıtık transaction. Bu, junior'dan mid-level'a teknik kırılma noktası.
+```
+
+## Fazın haritası
+
+```mermaid
+flowchart TD
+    subgraph Strateji["Hafta 1 — Stratejik Tasarım"]
+        direction LR
+        A["7.1 DDD Strategic"] --> B["7.2 Service Decomposition"]
+    end
+    subgraph Baglanti["Hafta 2-3 — Bağlantı ve Dayanıklılık"]
+        direction LR
+        C["7.3 API Gateway"] --> D["7.4 Service Discovery"] --> E["7.5 Resilience4j"] --> F["7.6 Distributed Tracing"]
+    end
+    subgraph Tutarlilik["Hafta 4-5 — Dağıtık Tutarlılık"]
+        direction LR
+        G["7.7 Distributed Locks & Saga"]
+    end
+    Strateji --> Baglanti --> Tutarlilik --> MP(["Mini Proje: 4 Servise Bölme + Faz Testi"])
+```
 
 ## Hedef
 
@@ -86,29 +121,7 @@ Tahmini: 25-32 gün (günde 2-3 saat). Faz 1-6'ya göre **daha yavaş** gidebili
 
 ---
 
-## Faz 7'nin yapısı (klasör ve sıra)
-
-```
-07-microservices/
-├── README.md                              ← buradasın
-├── 01-ddd-strategic/
-│   └── README.md                          ← bounded context, context map, aggregate
-├── 02-service-decomposition/
-│   └── README.md                          ← monolit → 4 servis stratejisi
-├── 03-api-gateway/
-│   └── README.md                          ← Spring Cloud Gateway
-├── 04-service-discovery/
-│   └── README.md                          ← Eureka vs K8s DNS
-├── 05-resilience4j/
-│   └── README.md                          ← 6 pattern, composition
-├── 06-distributed-tracing/
-│   └── README.md                          ← OpenTelemetry + Jaeger
-├── 07-distributed-locks-transactions/
-│   └── README.md                          ← Redlock kritiği + Saga deep
-├── mini-project/
-│   └── README.md                          ← 4 servise bölme, kasten kırma
-└── PHASE_TEST.md                          ← faz sonu özdeğerlendirme
-```
+## Faz 7'nin sırası
 
 **Sıra önemli:** Önce stratejik (1-2), sonra connectivity (3-4), sonra resilience (5-6), sonra dağıtık tutarlılık (7), sonra proje. Atlama.
 
@@ -134,43 +147,19 @@ Faz 1-6 boyunca tek repo'da bulunan modüller şu şekilde paketlenecek:
 
 ## Mimari hedef diyagramı (yüksek seviye)
 
+```mermaid
+flowchart TD
+    C["Mobile / Web Client"] -->|"HTTPS"| GW["API Gateway<br/>rate limit + JWT + routing"]
+    GW -->|"/accounts"| AS["account-service<br/>own DB"]
+    GW -->|"/transfers"| TS["transfer-service<br/>own DB + saga"]
+    TS -->|"sync REST"| AS
+    TS -->|"sync REST"| FS["fraud-service<br/>own DB"]
+    TS -->|"async Kafka"| K[["Kafka<br/>transfer.events, fraud.*"]]
+    K --> NS["notification-service<br/>own DB"]
+    AS -->|"async events"| K
 ```
-                         ┌───────────────────┐
-                         │   Mobile / Web    │
-                         │      Client       │
-                         └─────────┬─────────┘
-                                   │ HTTPS
-                                   ↓
-                         ┌───────────────────┐
-                         │   API Gateway     │  ← rate limit, JWT validate, routing
-                         │ (Spring Cloud GW) │
-                         └─┬─────┬─────┬─────┘
-                  /accounts │     │ /transfers
-                            ↓     ↓
-              ┌─────────────────┐   ┌─────────────────┐
-              │ account-service │←──│ transfer-service│
-              │  (own DB)       │   │  (own DB + saga)│
-              └────────┬────────┘   └────┬─────┬──────┘
-                       │                 │     │
-                       │            sync REST  │ async (Kafka)
-                       │                 ↓     ↓
-                       │      ┌─────────────────┐    ┌──────────────────┐
-                       │      │  fraud-service  │    │notification-svc  │
-                       │      │   (own DB)      │    │   (own DB)       │
-                       │      └─────────────────┘    └──────────────────┘
-                       │
-                       │ async events (Kafka)
-                       ↓
-                  ┌─────────────────────────────────────┐
-                  │  Kafka (transfer.events, fraud.*)   │
-                  └─────────────────────────────────────┘
 
-           Cross-cutting:
-           - Service registry (Eureka veya K8s DNS)
-           - OpenTelemetry collector → Jaeger (tracing)
-           - Loki / ELK (logs, traceId ile join)
-           - Redis (distributed lock, idempotency cache)
-```
+Cross-cutting katmanlar: service registry (Eureka veya K8s DNS), OpenTelemetry collector → Jaeger (tracing), Loki/ELK (log'lar traceId ile join), Redis (distributed lock, idempotency cache).
 
 ---
 
@@ -238,6 +227,8 @@ Bu fazı bitirdiğinde aşağıdaki cümleleri **kendi kelimelerinle** doldurabi
 
 ---
 
-## Başla
-
-→ [01-ddd-strategic/](./01-ddd-strategic/index.md)
+```admonish success title="Başla"
+İlk durak: [Topic 7.1 — DDD Strategic](./01-ddd-strategic/index.md).
+Bu faz kavram yoğunluğu en yüksek fazlardan biri — sırayı atlama, her servisi bölmeden önce
+"neden ayrı servis?" sorusuna net cevap ver.
+```

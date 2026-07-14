@@ -1,29 +1,108 @@
 # Phase 7 Mini-Project — Microservices Split & Resilience
 
+```admonish info title="Bu projede"
+- `core-banking` monolitini **4 microservice'e** (account, transfer, fraud, notification) + bir **API Gateway**'e bölüyorsun
+- Resilience4j ile her backend'e circuit breaker + retry + bulkhead + timeout + fallback ekliyor, banking timeout hiyerarşisi kuruyorsun
+- OpenTelemetry ile Kafka dahil uçtan uca trace'i Jaeger'da **tek waterfall** olarak görüyorsun
+- Saga + TCC ile cross-bank transfer'i 3 fazlı (try → confirm/cancel) hale getiriyorsun
+- Toxiproxy ile 5 kasten kırma senaryosu üretip düzeltiyor, 25+ integration test + observability stack ile kanıtlıyorsun
+```
+
 ## Hedef
 
-`core-banking` monolitini **production-grade 4 microservice'e** böl. API Gateway + Service Discovery + Resilience4j + OpenTelemetry tracing + Saga + TCC pattern. Her bileşen banking-grade:
-- mTLS service-to-service
-- JWT propagation
-- Circuit breaker + fallback per backend
-- End-to-end trace Jaeger'da
-- Cross-bank Saga + TCC
+Phase 7'nin 7 topic'inde microservice teorisini çalıştın; bu projede hepsini tek platformda birleştirip Phase 1-6'nın `core-banking` monolitini **production-grade** bir dağıtık sisteme dönüştürüyorsun. Yeni teori yok, **uygulama** var — bir adımda takılırsan ilgili topic'e dön, oku, düzelt.
 
-Sonunda elinde: TR bank tech ekibinin **referans implementation** olarak alabileceği microservice platform.
+Projenin sonunda elinde bir TR bank tech ekibinin **referans implementation** olarak alabileceği microservice platform olacak: mTLS + JWT propagation + circuit breaker + Jaeger'da uçtan uca trace + Saga/TCC.
 
-## Süre
+```admonish tip title="Süre ve önbilgi"
+10-15 gün ayır (günde 2-3 saat). Başlamadan önce: Phase 7'nin 7 topic'i (7.1-7.7) bitmiş, defter notların yazılmış olmalı. Phase 1-6'dan `core-banking` monolit + outbox + Kafka hazır ve `mvn test` yeşil olmalı. Buradaki işin çoğu **birleştirme** + saga/TCC ve kasten kırma reprodüksiyonları.
+```
 
-10-15 gün (günde 2-3 saat).
+## Hedef mimari
 
-## Önbilgi
+Monolitten dört bağımsız servise geçiyorsun. Senkron çağrı sadece gateway → servis ve transfer → account arasında; fraud ve notification tamamen Kafka üzerinden asenkron besleniyor.
 
-Phase 7'nin 7 topic'i bitti. Phase 1-6'da `core-banking` monolit'i + outbox + Kafka hazır.
+```mermaid
+flowchart LR
+    Client["Istemci"] --> GW["API Gateway"]
+    GW --> ACC["account-service"]
+    GW --> TRF["transfer-service"]
+    TRF --> ACC
+    TRF --> KAFKA["Kafka outbox"]
+    KAFKA --> FRAUD["fraud-service"]
+    KAFKA --> NOTIF["notification-service"]
+```
+
+## Acceptance criteria (bitirme şartları)
+
+Başlamadan bir kez oku, bitince tek tek işaretle.
+
+- [ ] 4 microservice ayrı Maven module
+- [ ] Database per service (4 schema)
+- [ ] API Gateway + 5 route + JWT + rate limit + CB + IdempotencyKey
+- [ ] K8s Service discovery (veya Eureka)
+- [ ] Resilience4j: CB + Retry + Bulkhead + TimeLimiter + RateLimiter + Fallback per backend
+- [ ] OpenTelemetry end-to-end trace Jaeger'da görünür
+- [ ] Saga + TCC cross-bank transfer (Bank A hold → Bank B reserve → Confirm/Cancel)
+- [ ] Outbox pattern (Phase 6) tüm servislerde
+- [ ] Idempotency cross-service
+- [ ] 5 kasten kırma senaryosu reproduced + fixed
+- [ ] 25+ integration test passing
+- [ ] Observability stack (Prometheus + Grafana + Jaeger + Loki)
+- [ ] CB OPEN alert + p99 alert
+- [ ] CI/CD pipeline 4 service için ayrı build
 
 ---
 
-## Görev 1 — Maven multi-module split (1 gün)
+## Adım adım build plan
 
-### 1.1 Proje yapısı
+On görev var: ilk ikisi monoliti bölüyor, sonraki ikisi trafiği yönetiyor (gateway + discovery), beş-altı dayanıklılık ve gözlemlenebilirliği kuruyor, son dördü dağıtık işlemi (saga/TCC), kasten kırma kanıtlarını, testleri ve observability stack'i tamamlıyor.
+
+```mermaid
+flowchart LR
+    subgraph Split["Split ve veri"]
+        direction LR
+        G1["Gorev 1<br/>Multi-module split"] --> G2["Gorev 2<br/>Database per service"]
+    end
+    subgraph Edge["Gateway ve discovery"]
+        direction LR
+        G3["Gorev 3<br/>API Gateway"] --> G4["Gorev 4<br/>Service discovery"]
+    end
+    subgraph Resil["Dayaniklilik ve iz"]
+        direction LR
+        G5["Gorev 5<br/>Resilience4j"] --> G6["Gorev 6<br/>OpenTelemetry"]
+    end
+    subgraph Dist["Dagitik islem ve kanit"]
+        direction LR
+        G7["Gorev 7<br/>Saga ve TCC"] --> G8["Gorev 8<br/>Kasten kirma"] --> G9["Gorev 9<br/>Integration test"] --> G10["Gorev 10<br/>Observability"]
+    end
+    G2 --> G3
+    G4 --> G5
+    G6 --> G7
+```
+
+### Görev 1 — Maven multi-module split (1 gün)
+
+**Ne yapacaksın:** Monoliti 5 servis modülü (account, transfer, fraud, notification, gateway) + 2 kütüphane modülüne (banking-commons, banking-events) böleceksin. **Neden:** Bağımsız deploy edilebilirliğin ve **bounded context** izolasyonunun temeli modül sınırıdır; kod dağıtımını netleştirmeden dayanıklılık eklemek anlamsız.
+
+Parent POM'un kalbi modül listesi ve Spring Cloud BOM import'u; sürümleri tek yerden yönetmek zorundasın:
+
+```xml
+<modules>
+    <module>banking-commons</module>
+    <module>banking-events</module>
+    <module>account-service</module>
+    <module>transfer-service</module>
+    <module>fraud-service</module>
+    <module>notification-service</module>
+    <module>api-gateway</module>
+</modules>
+```
+
+`banking-commons` Phase 1 value object'lerini (`Money`, `Currency`, `AccountId`, `OwnerId`, `TransferId`) minimal bağımlılıkla taşır; `banking-events` ise Avro schema'ları (`.avsc`) tutar ve `xjc` ile Java class generate eder. Monolit sınıflarını hedef servislere dağıtırken haritayı defterine yaz.
+
+<details>
+<summary>Tam kod: parent POM + klasör ağacı + sınıf dağıtım haritası (~90 satır)</summary>
 
 ```
 core-banking-parent/
@@ -48,8 +127,6 @@ core-banking-parent/
 └── k8s/ (manifests)
 ```
 
-### 1.2 Parent POM
-
 ```xml
 <project>
     <modelVersion>4.0.0</modelVersion>
@@ -57,13 +134,13 @@ core-banking-parent/
     <artifactId>core-banking-parent</artifactId>
     <version>1.0.0-SNAPSHOT</version>
     <packaging>pom</packaging>
-    
+
     <properties>
         <java.version>21</java.version>
         <spring-cloud.version>2024.0.0</spring-cloud.version>
         <resilience4j.version>2.2.0</resilience4j.version>
     </properties>
-    
+
     <modules>
         <module>banking-commons</module>
         <module>banking-events</module>
@@ -73,7 +150,7 @@ core-banking-parent/
         <module>notification-service</module>
         <module>api-gateway</module>
     </modules>
-    
+
     <dependencyManagement>
         <dependencies>
             <dependency>
@@ -88,21 +165,6 @@ core-banking-parent/
 </project>
 ```
 
-### 1.3 banking-commons
-
-`Money`, `Currency`, `AccountId`, `OwnerId`, `TransferId` (Phase 1'den).
-
-```xml
-<artifactId>banking-commons</artifactId>
-<dependencies>
-    <!-- Sadece çok minimal — Phase 1 value objects -->
-</dependencies>
-```
-
-### 1.4 banking-events
-
-Avro schema'lar veya POJO event class'ları.
-
 ```
 banking-events/src/main/avro/
 ├── TransferCompletedEvent.avsc
@@ -110,12 +172,6 @@ banking-events/src/main/avro/
 ├── NotificationRequest.avsc
 └── FraudAlert.avsc
 ```
-
-`xjc` ile Java class generate.
-
-### 1.5 Code migration
-
-Mevcut `core-banking` monolit'inden 4 servise dağıt:
 
 ```
 Monolith                          →  Target service
@@ -144,45 +200,46 @@ SMS/Email gateway client          →  notification-service
 ApiGatewayApplication             →  api-gateway (new)
 ```
 
-### Deliverables
+</details>
 
-- [ ] Multi-module Maven structure
-- [ ] 5 service module (account, transfer, fraud, notification, gateway)
-- [ ] 2 library module (banking-commons, banking-events)
-- [ ] Mevcut monolit code 4 service'e taşındı
-- [ ] `mvn install` çalışıyor
-- [ ] Her servis kendi `application.yml`'inde
+**Kontrol noktası**
+
+- [ ] Multi-module Maven structure, `mvn install` çalışıyor
+- [ ] 5 service module + 2 library module (banking-commons, banking-events)
+- [ ] Mevcut monolit code 4 service'e taşındı, her servis kendi `application.yml`'inde
 - [ ] Defterimde: hangi sınıf hangi servise gitti, gerekçe
 
----
+### Görev 2 — Database per service (1 gün)
 
-## Görev 2 — Database per service (1 gün)
+**Ne yapacaksın:** Her servise kendi schema'sını, kendi DB user'ını ve kendi Flyway migration'larını vereceksin; ArchUnit ile servisler arası entity import'unu compile-time yasaklayacaksın. **Neden:** Ortak DB en yaygın distributed-monolith anti-pattern'i; veri sahipliği bölünmezse servisler bağımsız evrilemez.
 
-### 2.1 PostgreSQL schema split
+Lokal dev için tek DB içinde schema izolasyonu yeterli; production'da tamamen ayrı cluster'lar olur. Servis başına user + schema grant zorunlu:
 
 ```sql
--- Master DB
-CREATE DATABASE banking;
-
-\c banking
-
 CREATE SCHEMA account_db;
 CREATE SCHEMA transfer_db;
 CREATE SCHEMA fraud_db;
 CREATE SCHEMA notification_db;
 
--- Yeni user (servis başına) — RLS/role isolation
 CREATE USER account_service WITH PASSWORD '...';
 GRANT USAGE ON SCHEMA account_db TO account_service;
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA account_db TO account_service;
--- vs.
 ```
 
-Production: tamamen ayrı DB cluster'lar (account-db, transfer-db, vb.). Lokal dev için schema isolation yeterli.
+Mevcut `db/migration/` klasörünü servis bazlı böl — her servis kendi Flyway'i ile kendi schema'sını migrate eder. İzolasyonu bir ArchUnit test'i ile **kanıtla**; transfer paketi account'un persistence paketine bağımlı olamaz:
 
-### 2.2 Migration split
+```java
+@Test
+void servicesShouldNotShareData() {
+    noClasses().that().resideInAPackage("com.mavibank.transfer..")
+        .should().dependOnClassesThat()
+        .resideInAPackage("com.mavibank.account.adapter.out.persistence..")
+        .check(classes);
+}
+```
 
-Mevcut `db/migration/` klasörünü servis bazlı böl:
+<details>
+<summary>Tam referans: servis bazlı migration ağacı (~20 satır)</summary>
 
 ```
 account-service/src/main/resources/db/migration/
@@ -205,76 +262,51 @@ notification-service/src/main/resources/db/migration/
 ├── V2__create_processed_events.sql
 ```
 
-Her servis kendi Flyway'i ile kendi schema'sını migrate eder.
+</details>
 
-### 2.3 ArchUnit cross-service dependency rule
-
-```java
-@Test
-void servicesShouldNotShareData() {
-    // account-service entity'leri transfer-service'te kullanılmamalı
-    noClasses().that().resideInAPackage("com.mavibank.transfer..")
-        .should().dependOnClassesThat().resideInAPackage("com.mavibank.account.adapter.out.persistence..")
-        .check(classes);
-}
-```
-
-### Deliverables
+**Kontrol noktası**
 
 - [ ] 4 schema (account_db, transfer_db, fraud_db, notification_db)
-- [ ] Migration'lar her servis kendi içinde
+- [ ] Migration'lar her servis kendi içinde, kendi Flyway'i ile
 - [ ] Cross-service entity import YOK (ArchUnit kanıtı)
 - [ ] Her servis kendi DB user'ı (production-like isolation)
 
----
+### Görev 3 — API Gateway (1.5 gün)
 
-## Görev 3 — API Gateway (1.5 gün)
+**Ne yapacaksın:** Spring Cloud Gateway (reactive/Netty) ile tek giriş kapısı kuracaksın: 5 route, JWT doğrulama + header propagation, Redis rate limiter, per-backend circuit breaker + fallback, banking idempotency filter ve tracing. **Neden:** Auth, rate limit, CB ve logging gibi cross-cutting concern'leri her serviste tekrarlamak yerine kenarda tek yerde çözersin; downstream servisler saf iş mantığına odaklanır.
 
-### 3.1 Spring Cloud Gateway setup
+Topic 7.3 implementation'ını temel al. JwtAuthenticationFilter JWT'yi validate edip `X-User-Id`, `X-Tenant-Id`, `X-User-Roles` header'larını propagate eder; Redis rate limiter per-user (10 req/sec) + per-IP (5 req/min anonymous) + per-tenant çalışır. Her backend için circuit breaker, fallback URI'si ProblemDetail 503 döner. IdempotencyKeyFilter POST/PUT için `Idempotency-Key` header'ını zorunlu kılar.
 
-Topic 7.3'teki implementation. 5 route (account, transfer, auth, internal, admin).
+**Kontrol noktası**
 
-### 3.2 JwtAuthenticationFilter
-
-JWT validate + X-User-Id, X-Tenant-Id, X-User-Roles header propagate.
-
-### 3.3 Redis rate limiter
-
-Per-user (10 req/sec) + per-IP (5 req/min anonymous) + per-tenant.
-
-### 3.4 Circuit breaker + fallback
-
-Her backend için CB. Fallback URI ProblemDetail 503.
-
-### 3.5 IdempotencyKeyFilter (banking)
-
-POST/PUT için Idempotency-Key header zorunlu.
-
-### 3.6 OpenTelemetry tracing
-
-GlobalFilter + Micrometer Tracing.
-
-### Deliverables
-
-- [ ] Gateway Spring Boot project (Netty reactive)
-- [ ] 5 route YAML
-- [ ] JWT filter + header propagation
-- [ ] Redis rate limiter + per-user + per-IP
-- [ ] CB + fallback (her backend için)
-- [ ] IdempotencyKeyFilter
-- [ ] LoggingFilter + X-Request-Id
-- [ ] CORS banking domains
+- [ ] Gateway Spring Boot project (Netty reactive), 5 route YAML
+- [ ] JWT filter + header propagation (X-User-Id, X-Tenant-Id, X-User-Roles)
+- [ ] Redis rate limiter + per-user + per-IP + per-tenant
+- [ ] CB + fallback (her backend için), IdempotencyKeyFilter
+- [ ] LoggingFilter + X-Request-Id, CORS banking domains
 - [ ] 8+ integration test (WebTestClient)
 
----
+### Görev 4 — Service Discovery (1 gün)
 
-## Görev 4 — Service Discovery (1 gün)
+**Ne yapacaksın:** K8s Service (veya Eureka) ile servis keşfi kuracak, Actuator health probe'ları tanımlayacak ve servisler arası `@LoadBalanced` WebClient ile çağrı yapacaksın. **Neden:** Servisler dinamik olarak ölçeklenip yeniden başlar; sabit IP tutulamaz. İsimle çözümleme + sağlık kontrolü olmadan cross-service çağrı kırılgandır.
 
-### 4.1 Eureka veya K8s Service
+Banking için K8s native tercih (minikube/kind ile local cluster). Deployment 3 replica + Service ile cluster IP açar; K8s DNS `account-service` adını pod'a çözer. Servisler arası çağrı DNS adıyla WebClient üzerinden:
 
-Banking için K8s native tercih. minikube veya kind ile local cluster.
+```java
+@Bean
+public WebClient accountServiceClient(WebClient.Builder builder) {
+    return builder.baseUrl("http://account-service:8081").build();
+}
+```
 
-`account-service/k8s/deployment.yml`:
+Actuator ile liveness + readiness + startup probe tanımla ki K8s trafiği yalnızca hazır pod'lara yönlendirsin.
+
+```admonish tip title="K8s DNS mi Eureka mı"
+Banking'de K8s native service discovery genelde daha temizdir: ayrı bir Eureka cluster'ı işletmek, HA kurmak ve güncel tutmak operasyonel yük getirir. K8s zaten DNS + health + load balancing sağlıyorsa ikinci bir registry'yi çift bakım maliyeti olarak değerlendir. Kararını defterine gerekçesiyle yaz.
+```
+
+<details>
+<summary>Tam kod: K8s Deployment + Service manifest (~27 satır)</summary>
 
 ```yaml
 apiVersion: apps/v1
@@ -304,49 +336,24 @@ spec:
       targetPort: 8081
 ```
 
-### 4.2 Health endpoint + probes
+</details>
 
-Spring Boot Actuator. K8s liveness + readiness + startup probes.
-
-### 4.3 Service-to-service WebClient
-
-```java
-@Bean
-@LoadBalanced
-public WebClient.Builder webClientBuilder() {
-    return WebClient.builder();
-}
-
-@Bean
-public WebClient accountServiceClient(WebClient.Builder builder) {
-    return builder.baseUrl("http://account-service:8081").build();
-}
-```
-
-K8s DNS resolve: `account-service` → cluster IP → pod.
-
-### Deliverables
+**Kontrol noktası**
 
 - [ ] K8s manifests (Deployment + Service)
-- [ ] Spring Boot Actuator health + probes
-- [ ] Service-to-service WebClient
-- [ ] minikube'da deploy + test
-- [ ] Cross-service ping (transfer → account)
+- [ ] Spring Boot Actuator health + liveness/readiness/startup probes
+- [ ] Service-to-service @LoadBalanced WebClient
+- [ ] minikube'da deploy + cross-service ping (transfer → account)
 
----
+### Görev 5 — Resilience4j integration (1.5 gün)
 
-## Görev 5 — Resilience4j integration (1.5 gün)
+**Ne yapacaksın:** Her backend için circuit breaker + retry + bulkhead + timelimiter + outbound rate limiter tanımlayıp banking'e uygun 4 fallback stratejisi yazacaksın. **Neden:** Dağıtık sistemde her uzak çağrı başarısız olabilir; koruma katmanı olmadan bir servisin yavaşlaması tüm zinciri çökertir (cascading failure).
 
-### 5.1 Per-backend CB config
+Circuit breaker config'i per-backend ayarla: kritik business exception'ları `ignoreExceptions` ile dışarıda bırak — yetersiz bakiye bir arıza değil, normal iş sonucudur ve <mark>business exception'ları asla circuit breaker'a saydırma</mark>, yoksa CB gereksiz yere açılır:
 
 ```yaml
 resilience4j:
   circuitbreaker:
-    configs:
-      default:
-        slidingWindowSize: 100
-        failureRateThreshold: 50
-        waitDurationInOpenState: 30s
     instances:
       accountService:
         baseConfig: default
@@ -358,62 +365,28 @@ resilience4j:
         failureRateThreshold: 70   # daha gevşek
 ```
 
-### 5.2 Retry per backend
+Retry yalnızca transient exception'da (idempotent operasyonlarda) çalışsın. TimeLimiter'ı **bottom-up** banking hiyerarşisiyle kur — dıştaki her katman içtekinden gevşek: Client→Gateway 60s, Gateway→service 30s, service→service 5s, service→DB 3s. Outbound RateLimiter TCMB FX API'yi 100 req/min ile sınırlar (mock).
 
-Transient exception only. Business exception ignore. Idempotent operation retry.
+Fallback stratejileri iş kritikliğine göre ayrışır: balance gibi kritik veri **fail-fast**, display verisi **cached**, fraud **conservative default (HIGH_RISK)**, notification **queue + async retry**.
 
-### 5.3 Bulkhead semaphore
-
-Her backend için maxConcurrentCalls.
-
-### 5.4 TimeLimiter banking hierarchy
-
-```
-Client → Gateway: 60s
-Gateway → service: 30s
-service → service: 5s
-service → DB: 3s
+```admonish warning title="Composition sırası hayati"
+Resilience4j dekoratörlerinin sarma sırası davranışı değiştirir. Doğru sıra <mark>Retry → CircuitBreaker → TimeLimiter → Bulkhead</mark>'tir: retry en dışta olmalı ki timeout/CB sonrası tekrar denesin; ters sırada retry, açık devreyi hiç görmeden boşa çalışır. Sırayı yanlış kurarsan test'te sessizce yanlış davranış alırsın.
 ```
 
-Bottom-up timeout.
-
-### 5.5 RateLimiter outbound
-
-TCMB FX API: 100 req/min (mock).
-
-### 5.6 Fallback strategies
-
-- Critical (balance): fail-fast
-- Non-critical (display): cached
-- Fraud: conservative default (HIGH_RISK)
-- Notification: queue + async retry
-
-### Deliverables
+**Kontrol noktası**
 
 - [ ] 4 backend için CB + Retry + Bulkhead + TimeLimiter
-- [ ] Composition order doğru (Retry → CB → TL → Bulkhead)
-- [ ] Banking timeout hierarchy
-- [ ] Fallback strategies 4'ü implement
+- [ ] Composition order doğru (Retry → CB → TimeLimiter → Bulkhead)
+- [ ] Banking timeout hierarchy (DB → service → gateway) bottom-up
+- [ ] 4 fallback stratejisi implement (fail-fast / cached / conservative / queue)
 - [ ] Event listener + Slack alert on CB OPEN
 - [ ] Grafana dashboard Resilience4j metrics
 
----
+### Görev 6 — OpenTelemetry tracing (1 gün)
 
-## Görev 6 — OpenTelemetry tracing (1 gün)
+**Ne yapacaksın:** Tüm servislere Micrometer Tracing + OTLP exporter ekleyip Jaeger'a bağlayacak, kritik business operasyonlarına custom span koyacak ve bir transfer'i uçtan uca izleyeceksin. **Neden:** 4 servis + Kafka arasında dağılmış bir isteğin nerede yavaşladığını log'larla bulamazsın; **distributed trace** tek bir request'in tüm hop'larını waterfall olarak gösterir.
 
-### 6.1 Jaeger docker-compose
-
-```yaml
-jaeger:
-  image: jaegertracing/all-in-one:1.55
-  environment:
-    COLLECTOR_OTLP_ENABLED: "true"
-  ports:
-    - "16686:16686"
-    - "4318:4318"
-```
-
-### 6.2 Tüm servislerde Micrometer Tracing
+Jaeger'ı docker-compose'a ekle (OTLP enabled), tüm servislerde OTLP endpoint'i ve dev için `sampling.probability: 1.0` ayarla:
 
 ```yaml
 management:
@@ -424,88 +397,107 @@ management:
       endpoint: http://jaeger:4318/v1/traces
 ```
 
-### 6.3 End-to-end transfer trace
-
-User POST → Gateway → transfer-service → account-service (debit + credit) → outbox → notification-service (consume).
-
-Jaeger UI'da **tek trace** olarak görünmeli (Kafka propagation dahil).
-
-### 6.4 Custom span — business critical
+Kritik iş operasyonlarına `@Observed` ile custom span ekle ki trace'te iş adımları isimleriyle görünsün:
 
 ```java
 @Observed(name = "transfer.execute")
 public Mono<Transfer> execute(TransferRequest req) { ... }
-
-@Observed(name = "fraud.score")
-public Mono<FraudScore> scoreTransfer(TransferRequest req) { ... }
 ```
 
-### Deliverables
+Uçtan uca senaryo: User POST → Gateway → transfer-service → account-service (debit + credit) → outbox → notification-service (consume). Jaeger UI'da **tek trace** olarak, Kafka propagation dahil görünmeli. Log MDC'ye `traceId` bağla ki log ↔ trace korelasyonu kurulabilsin.
 
-- [ ] Jaeger docker-compose
-- [ ] 4 servis OTLP tracing enabled
-- [ ] End-to-end transfer trace UI'da görünür
-- [ ] Custom @Observed business operations
-- [ ] Kafka trace propagation
+**Kontrol noktası**
+
+- [ ] Jaeger docker-compose, 4 servis OTLP tracing enabled
+- [ ] End-to-end transfer trace UI'da tek waterfall olarak görünür
+- [ ] Custom @Observed business operations (transfer.execute, fraud.score)
+- [ ] Kafka trace propagation çalışıyor
 - [ ] Log MDC traceId entegrasyonu
 
----
+### Görev 7 — Saga + TCC cross-bank (2 gün)
 
-## Görev 7 — Saga + TCC cross-bank (2 gün)
+**Ne yapacaksın:** Phase 6'daki `CrossBankTransferSaga` orchestrator'a TCC (Try-Confirm-Cancel) pattern uygulayacak, mock bank-a/bank-b servisleri yazacak ve stuck saga recovery scheduler kuracaksın. **Neden:** İki farklı banka arasında dağıtık transaction'da 2PC ölçeklenmez; **saga + TCC** ile önce kaynakları rezerve edersin, hepsi başarılıysa confirm, biri düşerse tüm rezervasyonları cancel edersin — atomiklik yerine eventual tutarlılık.
 
-### 7.1 Phase 6 Topic 6.7 + Phase 7 Topic 7.7 birleştir
+Akış üç fazlı: her iki bankada da önce **try** (hold/reserve), hepsi başarılıysa **confirm**, herhangi biri başarısızsa **cancel**.
 
-Phase 6'da yazdığın `CrossBankTransferSaga` orchestrator'a TCC pattern uygula:
+```mermaid
+sequenceDiagram
+    participant S as Saga orchestrator
+    participant A as Bank A
+    participant B as Bank B
+    S->>A: try-hold
+    A-->>S: hold basarili
+    S->>B: try-reserve
+    B-->>S: reserve basarili
+    Note over S: Tum try basarili
+    S->>A: confirm-hold
+    S->>B: confirm-reserve
+    Note over S,B: Biri fail ederse cancel-hold ve cancel-reserve
+```
+
+Orchestrator saga'yı başlatıp Bank A hold ile try fazını açar; her event handler bir sonraki adımı tetikler:
+
+```java
+public UUID initiate(CrossBankTransferRequest req) {
+    UUID sagaId = UUID.randomUUID();
+    SagaState saga = sagaRepo.save(SagaState.init(sagaId, req));
+    kafka.send("bank-a.try-hold", sagaId.toString(),
+        new TryHoldRequest(sagaId, req.fromAccountId(), req.amount()));
+    return sagaId;
+}
+```
+
+Tüm try'lar başarılı olunca confirm fazına, herhangi biri fail edince compensation'a (cancel) geçilir. TCC'nin banking'de en kritik kuralı: <mark>Cancel her zaman idempotent olmalı</mark> — aynı cancel iki kez gelse tek etki üretmeli, yoksa bir rezervasyonu iki kez serbest bırakırsın. Ayrıca mock `bank-a-service` / `bank-b-service` her biri `/try-hold`, `/confirm-hold`, `/cancel-hold` endpoint'lerini sunar; scheduled bir task 5 dakikadan eski PENDING saga'ları bulup compensation tetikler.
+
+<details>
+<summary>Tam kod: CrossBankTransferSaga orchestrator + mock bank controller (~75 satır)</summary>
 
 ```java
 public class CrossBankTransferSaga {
-    
+
     public UUID initiate(CrossBankTransferRequest req) {
         UUID sagaId = UUID.randomUUID();
         SagaState saga = sagaRepo.save(SagaState.init(sagaId, req));
-        
-        // Phase 1: Try (TCC)
-        // Bank A hold
+
+        // Phase 1: Try (TCC) — Bank A hold
         kafka.send("bank-a.try-hold", sagaId.toString(),
             new TryHoldRequest(sagaId, req.fromAccountId(), req.amount()));
-        
+
         return sagaId;
     }
-    
+
     @KafkaListener(topics = "bank-a.try-hold.success")
     public void onBankAHoldSuccess(BankAHoldSuccessEvent event) {
         SagaState saga = sagaRepo.findById(event.getSagaId()).orElseThrow();
         saga.recordTry("BANK_A_HOLD", event.getHoldId());
-        
+
         // Phase 1 cont: FX rate + Bank B reserve
         kafka.send("fx.try-quote", saga.getSagaId().toString(),
             new TryFxQuoteRequest(saga.getSagaId(), ...));
     }
-    
-    // ... benzer event handler'lar
-    
+
     @KafkaListener(topics = "bank-b.reserve.success")
     public void onAllTrySuccess(BankBReserveSuccessEvent event) {
         SagaState saga = sagaRepo.findById(event.getSagaId()).orElseThrow();
         saga.recordTry("BANK_B_RESERVE", event.getReserveId());
-        
+
         // Phase 2: Confirm all
         kafka.send("bank-a.confirm-hold", saga.getSagaId().toString(),
             new ConfirmHoldRequest(saga.getResourceId("BANK_A_HOLD")));
         kafka.send("bank-b.confirm-reserve", saga.getSagaId().toString(),
             new ConfirmReserveRequest(saga.getResourceId("BANK_B_RESERVE")));
-        
+
         saga.setCurrentState("CONFIRMING");
         sagaRepo.save(saga);
     }
-    
+
     @KafkaListener(topics = "saga.any-try.failure")
     public void onAnyTryFailure(TryFailureEvent event) {
         SagaState saga = sagaRepo.findById(event.getSagaId()).orElseThrow();
         saga.setCurrentState("COMPENSATING");
         sagaRepo.save(saga);
-        
-        // Phase 3: Cancel all reservations
+
+        // Phase 3: Cancel all reservations (idempotent)
         saga.getTryRecords().forEach(record -> {
             kafka.send(record.getCancelTopic(), saga.getSagaId().toString(),
                 new CancelRequest(record.getResourceId()));
@@ -514,162 +506,114 @@ public class CrossBankTransferSaga {
 }
 ```
 
-### 7.2 Mock external bank services
-
-`bank-a-service` ve `bank-b-service` mock Spring Boot apps:
-
 ```java
 @RestController
 @RequestMapping("/internal/bank-a")
 public class BankAController {
-    
+
     @PostMapping("/try-hold")
     public Mono<HoldResponse> tryHold(@RequestBody HoldRequest req) {
         // TCC try implementation
     }
-    
+
     @PostMapping("/confirm-hold")
     public Mono<Void> confirmHold(@RequestBody ConfirmRequest req) { ... }
-    
+
     @PostMapping("/cancel-hold")
     public Mono<Void> cancelHold(@RequestBody CancelRequest req) { ... }
 }
 ```
 
-### 7.3 Stuck saga recovery
+</details>
 
-Scheduled task — 5 dakika eski PENDING saga → compensation trigger.
+```admonish warning title="PII servisler arası taşınmaz"
+Saga event'lerinde ve cross-service çağrılarda müşteri PII'ını (isim, TCKN, IBAN sahibi) taşıma — <mark>servisler arası yalnızca internal ID (accountId, sagaId) propagate et</mark>. PII'ın Kafka topic'lerinde ve trace span attribute'larında dolaşması hem KVKK riski hem de gereksiz coupling'dir.
+```
 
-### Deliverables
+**Kontrol noktası**
 
 - [ ] CrossBankTransferSaga orchestrator + TCC pattern
 - [ ] Mock bank-a-service + bank-b-service
 - [ ] Happy path test geçiyor
 - [ ] Compensation test geçiyor (Bank B reserve fail → Bank A cancel)
-- [ ] Stuck saga recovery scheduler
-- [ ] Async API + status polling
+- [ ] Cancel idempotent (aynı cancel 2 kez → tek etki)
+- [ ] Stuck saga recovery scheduler + async API (202) + status polling
 
----
+### Görev 8 — Kasten kırma reproduction (1 gün)
 
-## Görev 8 — Kasten kırma reproduction (1 gün)
+**Ne yapacaksın:** 5 arıza senaryosunu kontrollü ortamda üretip, teşhis edip, düzeltip dokümante edeceksin. **Neden:** Banking'de deneyim = arızayla dans; production'da göreceğin failure'ları önce burada reprodükte etmezsen dayanıklılık kodunun gerçekten çalışıp çalışmadığını asla bilemezsin.
 
-5 senaryo:
+Ana senaryo Toxiproxy ile network latency: transfer-service'i account-service'e proxy üzerinden bağla, 5000ms gecikme enjekte et — TimeLimiter aşılmalı, circuit breaker OPEN'a düşmeli, fallback tetiklenmeli.
 
-### 8.1 Network latency simulation (Toxiproxy)
+```mermaid
+flowchart LR
+    TRF["transfer-service"] --> TOXI["Toxiproxy 5000ms latency"]
+    TOXI --> ACC["account-service"]
+    TRF --> CB{"TimeLimiter asildi mi"}
+    CB -- "evet" --> OPEN["Circuit breaker OPEN"]
+    OPEN --> FB["Fallback cached bakiye"]
+```
+
+Toxiproxy'yi docker-compose'a ekle ve account-service'i proxy port'u üzerinden yönlendir:
 
 ```yaml
 toxiproxy:
   image: ghcr.io/shopify/toxiproxy:2.7.0
   ports:
     - "8474:8474"
-
-# Proxy account-service through Toxiproxy
-account-service-proxy: 8881 (toxiproxy port)
-account-service-real: 8081
 ```
 
-Transfer-service → account-service-proxy (8881). Toxiproxy:
-- latency 5000ms (timeout aşımı)
-- bandwidth limit
-- connection drop
+Beş senaryonun her biri için defterine before/after notu yaz:
 
-Test: CB OPEN'a düşmeli, fallback tetiklenmeli.
+1. **Network latency (Toxiproxy):** latency 5000ms / bandwidth limit / connection drop → CB OPEN + fallback.
+2. **Backend kasten patlat:** account-service crash → CB OPEN → HALF_OPEN → CLOSED (recovery cycle).
+3. **Saga compensation:** Bank B reserve fail → Bank A hold cancel; aynı cancel 2 kez → tek etki.
+4. **Lock split-brain:** Redis cluster 2-node partition → her partition kendi lock'unu veriyor mu? (Bu yüzden banking'de kritik op DB-level lock kullanır.)
+5. **Distributed trace gaps:** Async chain'de bir hop trace context propagate etmezse nasıl görünür? Manuel propagation'ı KAPAT, gör.
 
-### 8.2 Backend kasten patlat
-
-account-service crash. CB OPEN sonra HALF_OPEN sonra CLOSED (recovery).
-
-### 8.3 Saga compensation test
-
-Bank B reserve fail → Bank A hold cancel olmalı. Idempotency test: aynı cancel 2 kez → tek effect.
-
-### 8.4 Lock split-brain simulation
-
-Redis cluster 2-node partition → her partition kendi lock veriyor mu? (Banking için bu yüzden critical op DB-level lock.)
-
-### 8.5 Distributed trace gaps
-
-Async chain'de bir hop trace context propagate etmiyorsa nasıl görünür? Manuel context propagation'ı KAPAT, gör.
-
-### Deliverables
+**Kontrol noktası**
 
 - [ ] 5 kasten kırma senaryosu reproduced + fixed
-- [ ] Toxiproxy network simulation
+- [ ] Toxiproxy network simulation çalışıyor
 - [ ] Defterimde her senaryo için before/after notu
 
----
+### Görev 9 — Integration test suite (1 gün)
 
-## Görev 9 — Integration test suite (1 gün)
+**Ne yapacaksın:** `@SpringBootTest + TestContainers` ile 25+ integration test + contract test yazacaksın. **Neden:** Dağıtık sistemde tek servis unit test'i yetmez; asıl riskler servisler arası routing, resilience, trace propagation ve saga akışında — bunları ancak multi-container integration test yakalar.
 
-`@SpringBootTest + TestContainers + ContractTest`:
+Phase 1-6'dan gelen per-service unit test'leri koru. Integration test kapsamı: gateway → backend routing, service-to-service Resilience4j, end-to-end trace (Jaeger query), saga happy path + compensation, TCC try-confirm-cancel, cross-service idempotency, multi-instance ShedLock. Contract test'ler (Spring Cloud Contract, Phase 12'de detay): transfer-service consumer ↔ account-service provider, fraud-service contract.
 
-**Per-service unit tests:** Phase 1-6'dan korumalı.
+**Kontrol noktası**
 
-**Integration tests:**
-- API Gateway → backend routing test
-- Service-to-service Resilience4j test
-- End-to-end trace test (Jaeger query)
-- Saga happy path
-- Saga compensation
-- TCC try-confirm-cancel
-- Idempotency cross-service
-- Multi-instance ShedLock
+- [ ] Toplam 25+ integration test passing
+- [ ] TestContainers multi-container setup
+- [ ] Saga happy path + compensation + TCC test'leri
+- [ ] Cross-service idempotency + ShedLock test'leri
+- [ ] Contract test'ler (Phase 12 hazırlık)
 
-**Contract tests (Spring Cloud Contract — Phase 12'de detay):**
-- transfer-service consumer ↔ account-service provider
-- fraud-service contract
+### Görev 10 — Observability stack (yarım gün)
 
-Toplam 25+ integration test.
+**Ne yapacaksın:** docker-compose ile Prometheus + Grafana + Jaeger + Loki + AlertManager stack'i kurup RED-method dashboard'ları ve alert'leri tanımlayacaksın. **Neden:** Production'da "çalışıyor mu?" sorusunun cevabı metric, trace ve log'dur; gözlemlenemeyen dağıtık sistem kör uçuştur.
 
----
+Dashboard'lar: RED method per service (Rate, Errors, Duration), circuit breaker state per backend, saga success rate + p99 duration, rate limit 429 count, Kafka producer/consumer lag. Alert'ler: CB OPEN → Slack, p99 > 500ms → Slack, error rate > 1% → PagerDuty.
 
-## Görev 10 — Observability stack (yarım gün)
+**Kontrol noktası**
 
-docker-compose ile:
-
-- Prometheus
-- Grafana
-- Jaeger
-- Loki (log aggregation)
-- AlertManager
-
-Dashboard:
-- RED method per service (Rate, Errors, Duration)
-- Circuit breaker state per backend
-- Saga success rate + p99 duration
-- Rate limit 429 count
-- Kafka producer/consumer lag
-
-Alert:
-- CB OPEN → Slack
-- p99 > 500ms → Slack
-- Error rate > 1% → PagerDuty
+- [ ] Prometheus + Grafana + Jaeger + Loki + AlertManager stack
+- [ ] RED method dashboard per service + CB state + saga p99 panelleri
+- [ ] CB OPEN alert + p99 > 500ms alert + error rate alert
 
 ---
 
-## Acceptance criteria
+## Pratik desteği
 
-- [ ] 4 microservice ayrı Maven module
-- [ ] Database per service (4 schema)
-- [ ] API Gateway + 5 route + JWT + rate limit + CB + IdempotencyKey
-- [ ] K8s Service discovery (veya Eureka)
-- [ ] Resilience4j: CB + Retry + Bulkhead + TimeLimiter + RateLimiter + Fallback per backend
-- [ ] OpenTelemetry end-to-end trace Jaeger'da görünür
-- [ ] Saga + TCC cross-bank transfer (Bank A hold → Bank B reserve → Confirm/Cancel)
-- [ ] Outbox pattern (Phase 6) tüm servislerde
-- [ ] Idempotency cross-service
-- [ ] 5 kasten kırma senaryosu reproduced + fixed
-- [ ] 25+ integration test passing
-- [ ] Observability stack (Prometheus + Grafana + Jaeger + Loki)
-- [ ] CB OPEN alert + p99 alert
-- [ ] CI/CD pipeline 4 service için ayrı build
+Projeyi bitirdim dediğin an, aşağıdaki prompt'la Claude'a kapsamlı bir audit yaptır — kör noktalarını böyle yakalarsın. Her madde için PASS / FAIL / EKSIK işareti ve kanıt (file path + code reference) iste.
 
----
-
-## Claude-verify prompt
+<details>
+<summary>Claude-verify prompt (mini-project bütünü için)</summary>
 
 ```
-Phase 7 microservices mini-project'imi banking-grade kriterlere göre değerlendir 
+Phase 7 microservices mini-project'imi banking-grade kriterlere göre değerlendir
 kapsamlı olarak. Eksiklerimi söyle, kanıt göster:
 
 A. Architecture
@@ -746,9 +690,10 @@ K. Anti-pattern
 Her madde için PASS / FAIL / EKSIK işaretle, kanıt göster (file path + code reference).
 ```
 
----
+</details>
 
-## Defter notları (25 madde)
+<details>
+<summary>Defter notları (25 madde) — her biri için cevabını yaz</summary>
 
 1. "Monolith → 4 microservice split'in stratejik DDD bounded context rasyoneli: ____."
 2. "Database per service prensibi + cross-service data access stratejisi: ____."
@@ -775,3 +720,30 @@ Her madde için PASS / FAIL / EKSIK işaretle, kanıt göster (file path + code 
 23. "mTLS service-to-service banking için neden gerekli: ____."
 24. "Outbox pattern (Phase 6) tüm servislerde + Saga kombinasyon: ____."
 25. "TR bank tech ekibinin bu mimariyi kullanabilirliği — eksik gördüğüm 3 nokta: ____."
+
+</details>
+
+---
+
+## Tamamlama kriterleri (kendine sor)
+
+- [ ] Phase 7'nin 7 topic'inde öğrendiğim her şey bu projede uygulandı
+- [ ] 4 microservice ayrı Maven module + database per service çalışıyor
+- [ ] API Gateway JWT + rate limit + CB + IdempotencyKey ile trafiği yönetiyor
+- [ ] Resilience4j 4 backend'de CB + Retry + Bulkhead + TimeLimiter + Fallback ile aktif
+- [ ] Uçtan uca transfer trace'i Jaeger'da tek waterfall (Kafka dahil) görünüyor
+- [ ] Saga + TCC cross-bank transfer happy path + compensation test'leri geçiyor
+- [ ] 5 kasten kırma senaryosu reproduced + fixed, defterimde before/after notlarıyla
+- [ ] 25+ integration test passing, observability stack canlı dashboard gösteriyor
+- [ ] Cevabı **rahatça** verebileceğim sorular: "Circuit breaker'ı hangi exception'da açtırmadın?", "Cross-bank transfer'i nasıl atomik yaptın?", "Trace'i Kafka üzerinden nasıl bağladın?", "Distributed monolith'ten nasıl kaçındın?"
+
+Hepsi onaylı → Faz 7 PHASE_TEST'e geç → [PHASE_TEST.md](../PHASE_TEST.md)
+
+```admonish success title="Proje Tamamlama Kriterleri"
+- 4 microservice ayrı Maven module + database per service (4 schema, ArchUnit ile cross-service import kanıtı YOK)
+- API Gateway 5 route + JWT propagation + Redis rate limiter + per-backend CB + IdempotencyKey filter ile çalışıyor
+- Resilience4j her backend'de CB + Retry + Bulkhead + TimeLimiter + RateLimiter + 4 fallback stratejisi; composition sırası ve banking timeout hiyerarşisi doğru
+- OpenTelemetry ile uçtan uca transfer trace'i Jaeger'da tek waterfall (Kafka propagation dahil); PII span attribute'larda yok
+- Saga + TCC cross-bank transfer happy path + compensation + idempotent cancel test'leri geçiyor; stuck saga recovery scheduler aktif
+- 5 kasten kırma senaryosu (Toxiproxy dahil) reproduced + fixed; 25+ integration test passing; Prometheus + Grafana + Jaeger + Loki stack canlı, CB OPEN + p99 alert'leri kurulu
+```

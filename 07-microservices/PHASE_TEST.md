@@ -1,6 +1,10 @@
 # Faz 7 — PHASE TEST
 
-Faz 8'e geçmeden önce kendini sına.
+```admonish question title="Bu test ne işe yarar?"
+Faz 8'e geçmeden önce kendini sına. Bu bir sınav değil, **dürüstlük kontrolü**:
+işaretleyemediğin her madde, hangi topic'e geri döneceğini gösterir.
+Hepsine "evet" diyebiliyorsan hazırsın.
+```
 
 ## Pratik test
 
@@ -143,4 +147,8 @@ Phase 7 = **modern banking backend'in omurgası**. TR bankaları:
 
 Mid+ Java developer bu fazda öğrendiği **distributed system patterns**'i her gün kullanır. CV'de "Spring Cloud Gateway, Resilience4j, OpenTelemetry, Saga pattern, TCC, distributed tracing" bulundurmak TR bank mid+ pozisyonu için **rekabetçi profil**.
 
-Phase 8 (Security) bunun üstüne — gateway'in JWT'sini Keycloak ile bağlamak, mTLS, encryption, OWASP compliance. Phase 7 → Phase 8 doğal devam.
+```admonish success title="Sonraki durak: Faz 8"
+Phase 8 (Security) bunun üstüne kurulur — gateway'in JWT'sini Keycloak ile bağlamak, mTLS,
+encryption, OWASP compliance. Phase 7 → Phase 8 doğal devam.
+→ [Faz 8 — Security](../08-security/index.md)
+```
