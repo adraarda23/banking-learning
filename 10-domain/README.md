@@ -32,7 +32,11 @@ flowchart TD
         direction LR
         F["10.6 Regülasyon"] --> G["10.7 Reconciliation"]
     end
-    Defter --> Odeme --> Uyum --> MP(["Mini Proje: Multi-currency + ISO 8583 + KYC + Reconciliation"])
+    subgraph Urun["Bankacılık Ürünleri"]
+        direction LR
+        H["10.8 Lending & Credit"] --> I["10.9 Card Products"] --> J["10.10 Katılım Bankacılığı"]
+    end
+    Defter --> Odeme --> Uyum --> Urun --> MP(["Mini Proje: Multi-currency + ISO 8583 + KYC + Reconciliation"])
 ```
 
 ## Bu faz neden en kritik
@@ -75,10 +79,13 @@ Bu faz teorik gibi görünür ama:
 | 5 | FX & Faiz Hesapları | 6 | Önemli — multi-currency, mevduat |
 | 6 | Regülasyon (BDDK, MASAK, KVKK) | 5 | Önemli — compliance |
 | 7 | Reconciliation & Settlement | 5 | Önemli — operasyon ekibiyle çalışırken |
+| 8 | [Lending & Credit (Kredi Yaşam Döngüsü)](08-lending-credit/index.md) | 6 | Kritik — kredi her banking backend'inde var |
+| 9 | [Card Products (Ekstre, Taksit, Chargeback)](09-card-products/index.md) | 6 | Kritik — kart ürünü + TR taksit gerçeği |
+| 10 | [Participation Banking (Katılım/Faizsiz)](10-participation-banking/index.md) | 5 | TR farkı — katılım bankaları için |
 | MP | Mini-project (multi-currency + ISO 8583 + KYC + reconciliation) | 15–20 | Birleştirme |
 | TEST | PHASE_TEST | 1 | Self-assessment |
 
-**Toplam tahmin: 55–65 saat (~3 hafta günde 2–3 saatten)**
+**Toplam tahmin: 70–80 saat (~3-4 hafta günde 2–3 saatten)**
 
 ## Hangi sırayla?
 

@@ -131,6 +131,9 @@
   - [Topic 10.5 — FX & Interest Calculations](./10-domain/05-fx-interest/README.md)
   - [Topic 10.6 — Regulatory: BDDK, MASAK, KVKK, PCI-DSS, KKB, GDPR](./10-domain/06-regulatory/README.md)
   - [Topic 10.7 — Reconciliation & Settlement](./10-domain/07-reconciliation-settlement/README.md)
+  - [Topic 10.8 — Lending & Credit: Kredi Yaşam Döngüsü](./10-domain/08-lending-credit/README.md)
+  - [Topic 10.9 — Card Products: Ekstre, Taksit, Chargeback, Revolving](./10-domain/09-card-products/README.md)
+  - [Topic 10.10 — Participation (Faizsiz) Banking: Katılım Bankacılığı](./10-domain/10-participation-banking/README.md)
   - [Mini Proje: TR Banking Domain Integration](./10-domain/mini-project/README.md)
   - [Faz Testi](./10-domain/PHASE_TEST.md)
 
