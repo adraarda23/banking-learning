@@ -134,6 +134,7 @@
   - [Topic 10.8 — Lending & Credit: Kredi Yaşam Döngüsü](./10-domain/08-lending-credit/README.md)
   - [Topic 10.9 — Card Products: Ekstre, Taksit, Chargeback, Revolving](./10-domain/09-card-products/README.md)
   - [Topic 10.10 — Participation (Faizsiz) Banking: Katılım Bankacılığı](./10-domain/10-participation-banking/README.md)
+  - [Topic 10.11 — Fintech Ekosistemi (Fintech): Ödeme Kuruluşları, Açık Bankacılık, GİB e-Belge](./10-domain/11-fintech-ecosystem/README.md)
   - [Mini Proje: TR Banking Domain Integration](./10-domain/mini-project/README.md)
   - [Faz Testi](./10-domain/PHASE_TEST.md)
 

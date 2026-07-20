@@ -36,7 +36,11 @@ flowchart TD
         direction LR
         H["10.8 Lending & Credit"] --> I["10.9 Card Products"] --> J["10.10 Katılım Bankacılığı"]
     end
-    Defter --> Odeme --> Uyum --> Urun --> MP(["Mini Proje: Multi-currency + ISO 8583 + KYC + Reconciliation"])
+    subgraph Fintech["Fintech (banka dışı)"]
+        direction LR
+        K["10.11 Fintech Ekosistemi + GİB e-Belge"]
+    end
+    Defter --> Odeme --> Uyum --> Urun --> Fintech --> MP(["Mini Proje: Multi-currency + ISO 8583 + KYC + Reconciliation"])
 ```
 
 ## Bu faz neden en kritik
@@ -82,10 +86,13 @@ Bu faz teorik gibi görünür ama:
 | 8 | [Lending & Credit (Kredi Yaşam Döngüsü)](08-lending-credit/index.md) | 6 | Kritik — kredi her banking backend'inde var |
 | 9 | [Card Products (Ekstre, Taksit, Chargeback)](09-card-products/index.md) | 6 | Kritik — kart ürünü + TR taksit gerçeği |
 | 10 | [Participation Banking (Katılım/Faizsiz)](10-participation-banking/index.md) | 5 | TR farkı — katılım bankaları için |
+| 11 | [Fintech Ekosistemi **(Fintech)** — Ödeme Kuruluşları, Açık Bankacılık, GİB e-Belge](11-fintech-ecosystem/index.md) | 6 | Banka dışı — ödeme kuruluşu/fintech/e-ticaret tarafı |
 | MP | Mini-project (multi-currency + ISO 8583 + KYC + reconciliation) | 15–20 | Birleştirme |
 | TEST | PHASE_TEST | 1 | Self-assessment |
 
-**Toplam tahmin: 70–80 saat (~3-4 hafta günde 2–3 saatten)**
+**Toplam tahmin: 76–86 saat (~4 hafta günde 2–3 saatten)**
+
+> **(Fintech) etiketi:** Topic 10.11 çekirdek bankacılık değil, **fintech ekosistemini** (ödeme/e-para kuruluşları, açık bankacılık, merchant/POS, GİB e-fatura) kapsar. Sadece banka değil, ödeme kuruluşu / fintech / e-ticaret tarafına bakıyorsan bu bölüm senin için.
 
 ## Hangi sırayla?
 
